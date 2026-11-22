@@ -1,0 +1,14 @@
+Package: librt
+Version: 2.27-12
+Depends: libpthread
+Provides: librt-any
+Source: feeds/base/libs/toolchain
+SourceName: toolchain
+License: GPL-3.0-with-GCC-exception
+Section: libs
+SourceDateEpoch: 1793487135
+URL: http://www.gnu.org/software/libc/
+Maintainer: Felix Fietkau <nbd@nbd.name>
+Architecture: aarch64-3.10
+Installed-Size: 40960
+Description:  POSIX.1b RealTime extension library

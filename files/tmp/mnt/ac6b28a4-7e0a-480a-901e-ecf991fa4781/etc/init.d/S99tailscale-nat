@@ -1,0 +1,5 @@
+#!/bin/sh
+iptables -t nat -C POSTROUTING -s 100.64.0.0/10 -j MASQUERADE 2>/dev/null || \
+iptables -t nat -I POSTROUTING 1 -s 100.64.0.0/10 -j MASQUERADE
+iptables -C FORWARD -i tailscale0 -j ACCEPT 2>/dev/null || \
+iptables -I FORWARD 1 -i tailscale0 -j ACCEPT

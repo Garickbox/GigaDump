@@ -1,0 +1,3 @@
+/opt/etc/init.d/S06tailscaled
+/opt/bin/tailscaled
+/opt/bin/tailscale

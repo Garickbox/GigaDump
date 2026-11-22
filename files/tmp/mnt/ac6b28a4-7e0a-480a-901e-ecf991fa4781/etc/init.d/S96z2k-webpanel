@@ -1,0 +1,342 @@
+#!/bin/sh
+# /opt/etc/init.d/S96z2k-webpanel — Entware rc script for z2k webpanel.
+# Runs a dedicated lighttpd instance for the panel on its own port, using the
+# config at /opt/zapret2/webpanel/lighttpd.conf. Independent of any system
+# lighttpd that may also be installed.
+
+# At boot the rc runner runs this WITHOUT sourcing /opt/etc/profile, so the
+# dynamic linker has no Entware lib dir on its path and lighttpd dies on
+# libnettle.so.8 ("cannot open shared object") — while an interactive SSH start
+# works (profile already set LD_LIBRARY_PATH). And a split-opkg setup installs
+# libs under a SECONDARY dest (e.g. a USB volume: `dest ext /tmp/mnt/<uuid>`), so
+# the lib may not even be in /opt/lib. Derive the search path from EVERY opkg
+# destination. NB: no ndmc runs here, so a populated LD_LIBRARY_PATH is safe
+# (ndmc wants it empty). issue #21.
+export PATH="/opt/sbin:/opt/bin:/sbin:/usr/sbin:/bin:/usr/bin"
+
+# Echo a ':'-joined lib search path: /opt/lib + every `dest <name> <path>` from
+# opkg.conf as <path>/opt/lib. Existing dirs only — a not-yet-mounted volume is
+# skipped and picked up on retry once mounted.
+_z2k_libpath() {
+    local dirs="/opt/lib:/opt/usr/lib" kw dn dp rest
+    if [ -r /opt/etc/opkg.conf ]; then
+        while read -r kw dn dp rest; do
+            [ "$kw" = dest ] || continue
+            case "$dp" in /*) ;; *) continue ;; esac
+            dp="${dp%/}/opt/lib"
+            [ -d "$dp" ] || continue
+            case ":${dirs}:" in *":${dp}:"*) ;; *) dirs="${dirs}:${dp}" ;; esac
+        done < /opt/etc/opkg.conf
+    fi
+    printf '%s' "$dirs"
+}
+LD_LIBRARY_PATH="$(_z2k_libpath)${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH
+
+CONF="/opt/zapret2/webpanel/lighttpd.conf"
+PIDFILE="/var/run/z2k-webpanel.pid"          # пишет сам lighttpd (server.pid-file)
+SUP_PIDFILE="/var/run/z2k-webpanel-sup.pid"  # respawn-супервизор (подоболочка этого скрипта)
+WAIT_PIDFILE="/var/run/z2k-webpanel-wait.pid" # фоновый waiter недоступного тома/адреса
+SUP_LOG="/tmp/z2k-log/z2k-webpanel-sup.log"
+WWW_DIR="/opt/zapret2/www"
+
+# lighttpd может жить и в SECONDARY opkg dest (USB-том): opkg кладёт бинарь в
+# <dest>/opt/{sbin,bin}, а в /opt/{sbin,bin} его нет. Ищем по всем dest'ам из
+# opkg.conf — тем же способом, что _z2k_libpath ищет либы.
+_z2k_lighttpd_bin() {
+    local c kw dn dp rest
+    for c in /opt/sbin/lighttpd /opt/bin/lighttpd; do
+        [ -x "$c" ] && { printf '%s' "$c"; return 0; }
+    done
+    if [ -r /opt/etc/opkg.conf ]; then
+        while read -r kw dn dp rest; do
+            [ "$kw" = dest ] || continue
+            case "$dp" in /*) ;; *) continue ;; esac
+            for c in "${dp%/}/opt/sbin/lighttpd" "${dp%/}/opt/bin/lighttpd"; do
+                [ -x "$c" ] && { printf '%s' "$c"; return 0; }
+            done
+        done < /opt/etc/opkg.conf
+    fi
+    printf 'lighttpd'
+}
+BIN="$(_z2k_lighttpd_bin)"
+
+# Каталог procfs параметризован только ради тестов на не-Linux хостах.
+Z2K_PROC="${Z2K_PROC:-/proc}"
+
+# PID из pidfile обязан быть НАШИМ процессом. kill -0 доказывает лишь, что
+# какой-то процесс с таким PID существует: после unclean exit / OOM pidfile
+# остаётся, PID'ы врапаются на 32768 — и «живым» оказывался чужой процесс
+# (start отказывался поднимать панель, stop слал root'овый TERM неизвестно
+# кому). Нет записи в procfs — procfs недоступен (тестовый хост), доверяем
+# как раньше: на Linux /proc/<pid> существует для любого живого процесса.
+_pid_matches() {
+    local pid="$1" pat="$2"
+    [ -e "$Z2K_PROC/$pid" ] || return 0
+    case "$( { cat "$Z2K_PROC/$pid/comm"; tr '\0' ' ' < "$Z2K_PROC/$pid/cmdline"; } 2>/dev/null)" in
+        *"$pat"*) return 0 ;;
+    esac
+    return 1
+}
+
+_alive() {  # $1=pidfile $2=паттерн идентичности процесса
+    local pid
+    [ -f "$1" ] || return 1
+    pid=$(cat "$1" 2>/dev/null)
+    [ -n "$pid" ] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    _pid_matches "$pid" "$2"
+}
+
+is_alive()     { _alive "$PIDFILE" "$CONF"; }
+sup_alive()    { _alive "$SUP_PIDFILE" "S96z2k-webpanel"; }
+waiter_alive() { _alive "$WAIT_PIDFILE" "S96z2k-webpanel"; }
+
+# TERM → дождаться выхода → SIGKILL; pidfile убираем только после
+# подтверждённой смерти. Раньше stop удалял pidfile после фиксированного
+# sleep 1: медленно выходящий lighttpd терял pidfile, продолжая держать
+# порт, и restart поднимал второй инстанс в bind-fail.
+_kill_by_pidfile() {  # $1=pidfile $2=паттерн
+    local pid
+    pid=$(cat "$1" 2>/dev/null)
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && _pid_matches "$pid" "$2"; then
+        kill "$pid" 2>/dev/null
+        for _ in 1 2 3; do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 1
+        done
+        kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
+    fi
+    rm -f "$1"
+}
+
+# Respawn-супервизор — тот же паттерн, что S99z2k-scheduler / S96z2k-rt-proxy:
+# NDM OOM-kill длинноживущих процессов на этих коробках — норма, а панель без
+# respawn лежала до ручного restart. lighttpd под супервизором работает в
+# foreground (-D); свой pidfile он при этом пишет как и раньше.
+_launch_supervised() {
+    (
+        _delay=10
+        while :; do
+            _t0=$(date +%s 2>/dev/null || echo 0)
+            "$BIN" -D -f "$CONF" </dev/null >>"$SUP_LOG" 2>&1
+            _rc=$?
+            _t1=$(date +%s 2>/dev/null || echo 0)
+            # lighttpd при занятом порте выходит МГНОВЕННО (проверено: bind()
+            # Address already in use, rc 255). Без роста паузы цикл крутится
+            # вечно с частотой 6/мин; после удавшегося запуска пауза
+            # возвращается к 10с, чтобы respawn после OOM оставался быстрым.
+            if [ "$((_t1 - _t0))" -ge 60 ]; then
+                _delay=10
+            else
+                _delay=$((_delay * 2))
+                [ "$_delay" -gt 300 ] && _delay=300
+            fi
+            # Лог живёт в /tmp, то есть в ОЗУ (tmpfs 245 МБ при 500 МБ памяти).
+            # Мгновенно падающий lighttpd пишет сюда ~1.5 МБ в сутки, и без
+            # потолка это медленная утечка ровно на той коробке, ради выживания
+            # которой при OOM супервизор и заведён.
+            if [ "$(wc -c < "$SUP_LOG" 2>/dev/null || echo 0)" -gt 65536 ]; then
+                : > "$SUP_LOG"
+            fi
+            echo "$(date '+%Y-%m-%d %H:%M:%S') [supervisor] lighttpd exited (rc=$_rc) — respawn in ${_delay}s" >>"$SUP_LOG"
+            sleep "$_delay"
+        done
+    # ВАЖНО: подоболочка отвязывается от потоков init-скрипта явно. NDM читает
+    # вывод каждого init.d-скрипта до конца потока, и унаследованный фоновым
+    # процессом stdout держит поток открытым вечно — загрузка встаёт на этом
+    # скрипте (подробный разбор — в том же блоке S99z2k-scheduler).
+    ) >/dev/null 2>&1 </dev/null &
+    local sp
+    sp=$!
+    echo "$sp" > "$SUP_PIDFILE"
+    # Супервизор — единственное, что переподнимет панель после OOM; сам он
+    # обязан пережить OOM (крошечный shell-цикл, скор -1000 ничего не стоит).
+    echo -1000 > "$Z2K_PROC/$sp/oom_score_adj" 2>/dev/null || true
+}
+
+# A missing shared lib at boot usually means a secondary opkg dest (a USB volume
+# holding the lib) isn't mounted yet — recent Keenetic firmware can delay it a
+# minute+ via fsck. Poll (re-deriving the lib path, since the dir appears once
+# mounted) until lighttpd can load, then start it. Bounded so a genuinely-broken
+# box doesn't spin forever. Runs backgrounded — boot is not blocked. issue #21.
+# Свой pid waiter держит в WAIT_PIDFILE: stop обязан уметь его убить, иначе
+# панель «сама» поднималась через минуты после явного stop, а повторный start
+# плодил второго waiter'а.
+#
+# Сам сторож объявлен ниже, после разбора оборванной установки: его заголовок
+# однажды затёрли правкой, тело досталось функции start(), и с тех пор сторож
+# не существовал вовсе — при установке в журнал печаталось
+# «_z2k_webpanel_wait_#: not found», а панель, ждущая отложенного монтирования,
+# не поднималась. Проверку «каждая вызванная функция объявлена» держит
+# tests/test_webpanel_init_functions.sh.
+
+# Доделать то, что не доделал оборванный установщик.
+#
+# Установка панели атомарна: каталог отодвигается в .old, на его место встаёт
+# .new. Откат на случай обрыва в установщике есть, но висит на `trap ... EXIT`
+# и не срабатывает при потере питания, OOM или KILL — а обрыв случается ровно
+# там, где переезжает дерево /opt/zapret2, то есть в самый неудачный момент.
+# Роутер остаётся с работающим lighttpd и без каталога панели: меню показывает
+# «запущена, но не установлена», а настройки уезжают вместе с каталогом.
+#
+# Здесь мы делаем то же, что сделал бы откат, но независимо от него: init
+# запускается при загрузке, то есть первым же после обрыва питания.
+#
+# Разбор безопасен по построению: .old существует ТОЛЬКО между двумя mv внутри
+# установщика. Если он есть, а рабочего каталога нет — установка оборвалась
+# посередине, и вернуть прежнее состояние правильнее, чем стартовать без него.
+# Удаление панели чистит и .old, и .new, поэтому осознанный uninstall под это
+# условие не попадает.
+repair_interrupted_install() {
+    _wp="/opt/zapret2/webpanel"
+    _fixed=0
+    if [ ! -d "$_wp" ] && [ -d "${_wp}.old" ]; then
+        mv "${_wp}.old" "$_wp" 2>/dev/null && _fixed=1
+    fi
+    if [ ! -d "$WWW_DIR" ] && [ -d "${WWW_DIR}.old" ]; then
+        mv "${WWW_DIR}.old" "$WWW_DIR" 2>/dev/null && _fixed=1
+    fi
+    [ "$_fixed" = "1" ] && \
+        echo "восстановлено после оборванной установки панели (вернул .old на место)"
+    return 0
+}
+
+_z2k_webpanel_wait_start() {
+    # Шаг и число попыток вынесены в переменные: пять минут ожидания невозможно
+    # наблюдать в тесте иначе, чем гонкой — waiter успевал отработать цикл и
+    # прибрать свой pidfile раньше, чем проверка до него добиралась (на
+    # CI-раннере это воспроизводилось стабильно, на macOS нет). В бою значения
+    # прежние, менять их незачем.
+    local n=0 ld
+    local step="${Z2K_WAIT_INTERVAL:-5}" tries="${Z2K_WAIT_TRIES:-60}"
+    while [ "$n" -lt "$tries" ]; do
+        sleep "$step"
+        n=$((n + 1))
+        is_alive && { rm -f "$WAIT_PIDFILE"; return 0; }
+        ld="$(_z2k_libpath)"
+        if LD_LIBRARY_PATH="$ld" "$BIN" -tt -f "$CONF" >/tmp/z2k-log/z2k-webpanel-startcheck.log 2>&1; then
+            LD_LIBRARY_PATH="$ld"
+            _launch_supervised
+            sleep 1
+            if is_alive; then
+                echo "z2k-webpanel started after $((n * step))s wait (pid $(cat "$PIDFILE"))"
+            else
+                echo "z2k-webpanel: supervisor launched after $((n * step))s wait; lighttpd still coming up"
+            fi
+            rm -f "$WAIT_PIDFILE"
+            return 0
+        fi
+    done
+    echo "z2k-webpanel: start precondition still failing after $((tries * step))s wait — giving up" >&2
+    rm -f "$WAIT_PIDFILE"
+    return 1
+}
+
+start() {
+    if is_alive; then
+        echo "z2k-webpanel already running (pid $(cat "$PIDFILE"))"
+        return 0
+    fi
+    if sup_alive; then
+        echo "z2k-webpanel supervisor already running (pid $(cat "$SUP_PIDFILE")) — lighttpd is respawning"
+        return 0
+    fi
+    if waiter_alive; then
+        echo "z2k-webpanel start already pending (waiter pid $(cat "$WAIT_PIDFILE"))"
+        return 0
+    fi
+    repair_interrupted_install
+    [ -d "$WWW_DIR" ] || { echo "www dir missing: $WWW_DIR" >&2; return 1; }
+    [ -f "$CONF" ]    || { echo "lighttpd config missing: $CONF" >&2; return 1; }
+    # CWE-59: root-owned 0700 log dir (lighttpd opens errorlog at launch)
+    # CWE-59: /tmp/z2k-log должен быть чистым root-owned каталогом. symlink /
+    # не-каталог / чужой владелец = возможная подмена атакующим (с planted
+    # symlink'ами внутри) → снести и создать заново. busybox `stat -c` нет —
+    # владельца берём из `ls -ld`.
+    if [ -L /tmp/z2k-log ] || { [ -e /tmp/z2k-log ] && [ ! -d /tmp/z2k-log ]; } || \
+       { [ -d /tmp/z2k-log ] && [ "$(ls -ld /tmp/z2k-log 2>/dev/null | awk '{print $3}')" != root ]; }; then
+        rm -rf /tmp/z2k-log 2>/dev/null
+    fi
+    mkdir -p /tmp/z2k-log 2>/dev/null && chown root /tmp/z2k-log 2>/dev/null
+    chmod 700 /tmp/z2k-log 2>/dev/null
+    # Validate config first — lighttpd -tt exits non-zero on errors (incl. a
+    # missing shared library). Re-derive the lib path here in case a dest volume
+    # mounted after this script was sourced.
+    local ld why
+    ld="$(_z2k_libpath)"
+    if ! LD_LIBRARY_PATH="$ld" "$BIN" -tt -f "$CONF" >/tmp/z2k-log/z2k-webpanel-startcheck.log 2>&1; then
+        why=""
+        # Missing shared lib at boot = a secondary opkg volume isn't mounted yet
+        # (fsck can delay it). Don't give up: wait for it in the background so the
+        # panel comes up once the volume appears, without blocking boot.
+        if grep -qiE 'shared object|shared librar' /tmp/z2k-log/z2k-webpanel-startcheck.log 2>/dev/null; then
+            why="libs not ready (opkg volume not mounted yet?)"
+        # lighttpd -tt с 1.4.56 реально биндит сокеты, поэтому сюда прилетают и
+        # ТРАНЗИЕНТНЫЕ отказы: порт держит чужой/зависший процесс (EADDRINUSE)
+        # или адрес интерфейса ещё не поднялся на раннем буте (EADDRNOTAVAIL,
+        # musl пишет «Address not available»). Это не битый конфиг — ретраим в
+        # фоне так же, как недоступные либы.
+        elif grep -qiE 'address.* in use|cannot assign requested address|address not available' /tmp/z2k-log/z2k-webpanel-startcheck.log 2>/dev/null; then
+            why="listen address busy or not ready yet"
+        fi
+        if [ -n "$why" ]; then
+            echo "z2k-webpanel: $why — retrying in background (up to 5 min)"
+            _z2k_webpanel_wait_start </dev/null >>/tmp/z2k-log/z2k-webpanel-wait.log 2>&1 &
+            echo $! > "$WAIT_PIDFILE"
+            return 0
+        fi
+        echo "z2k-webpanel: lighttpd config invalid" >&2
+        cat /tmp/z2k-log/z2k-webpanel-startcheck.log >&2 2>/dev/null
+        return 1
+    fi
+    _launch_supervised
+    sleep 1
+    if is_alive; then
+        echo "z2k-webpanel started (pid $(cat "$PIDFILE"))"
+    else
+        # Супервизор оставляем: он ретраит каждые 10с и вытянет транзиентный
+        # сбой сам (тот же контракт, что у S99z2k-scheduler).
+        echo "z2k-webpanel failed to start (supervisor keeps retrying)" >&2
+        cat /tmp/z2k-log/z2k-webpanel-error.log 2>/dev/null >&2
+        return 1
+    fi
+}
+
+stop() {
+    # Порядок обязателен: сначала waiter и супервизор, потом lighttpd — иначе
+    # фоновые перезапускалы поднимут панель обратно вопреки явному stop.
+    _kill_by_pidfile "$WAIT_PIDFILE" "S96z2k-webpanel"
+    _kill_by_pidfile "$SUP_PIDFILE" "S96z2k-webpanel"
+    _kill_by_pidfile "$PIDFILE" "$CONF"
+    # Belt-and-suspenders: kill any lighttpd running with our config.
+    for _p in $(pidof lighttpd 2>/dev/null); do
+        _pid_matches "$_p" "$CONF" && kill "$_p" 2>/dev/null
+    done
+    echo "z2k-webpanel stopped"
+}
+
+status() {
+    if is_alive; then
+        echo "running (pid $(cat "$PIDFILE"))"
+        return 0
+    fi
+    if sup_alive; then
+        echo "supervisor up, lighttpd down (respawning)"
+        return 0
+    fi
+    if waiter_alive; then
+        echo "start pending (waiting for opkg volume / listen address, waiter pid $(cat "$WAIT_PIDFILE"))"
+        return 1
+    fi
+    echo "stopped"
+    return 1
+}
+
+case "${1:-}" in
+    start)   start ;;
+    stop)    stop ;;
+    restart) stop; sleep 1; start ;;
+    status)  status ;;
+    *) echo "Usage: $0 {start|stop|restart|status}"; exit 1 ;;
+esac

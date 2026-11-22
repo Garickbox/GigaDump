@@ -1,0 +1,3050 @@
+#!/bin/sh
+# lib/config_official.sh - Генерация официального config файла для zapret2
+# Адаптировано для z2k с multi-profile стратегиями
+
+# Окно перехвата UDP — сколько пакетов потока уходит в очередь.
+# Обоснование значений — у места, где они попадают в config (ищи
+# NFQWS2_UDP_PKT_OUT). Здесь они лежат на уровне файла, а не внутри функции,
+# потому что их читают две разные: одна строит стратегии и сверяет с ними
+# пороги детекторов, другая пишет config.
+Z2K_UDP_PKT_OUT="8"
+Z2K_UDP_PKT_IN="8"
+
+# Init должен работать и без lib/ (в том числе во время обновления), а
+# генератор загружают из WORK_DIR/lib или /opt/zapret2/lib. Держим функции
+# самодостаточными; tests/test_gvsub_ipfile.sh сверяет обе копии и Go.
+# Пустой include-ipset движок считает совпадением со всеми адресами.
+# Неопределённые адреса /32 и /128 не бывают реальными назначениями HTTPS.
+z2k_gvsub_ip_sentinels()
+{
+    printf '%s\n' '0.0.0.0/32' '::/128'
+}
+
+z2k_gvsub_ensure_ipfile()
+{
+    [ -n "$Z2K_GVSUB_IPS" ] || return 0
+    # Ошибка записи не должна завершать sh (гарантия 815603e9).
+    (
+        local tmp sentinel complete=1
+        while IFS= read -r sentinel; do
+            grep -qxF "$sentinel" "$Z2K_GVSUB_IPS" 2>/dev/null || complete=0
+        done <<EOF_SENTINELS
+$(z2k_gvsub_ip_sentinels)
+EOF_SENTINELS
+        [ "$complete" = 1 ] && exit 0
+        tmp=$(mktemp "${Z2K_GVSUB_IPS}.XXXXXX") || exit 1
+        # Старые адреса сохраняем; движок видит только целый снимок.
+        if { z2k_gvsub_ip_sentinels &&
+             { [ ! -f "$Z2K_GVSUB_IPS" ] || cat "$Z2K_GVSUB_IPS"; }
+           } > "$tmp" && chmod 644 "$tmp" && mv -f "$tmp" "$Z2K_GVSUB_IPS"; then
+            exit 0
+        fi
+        rm -f "$tmp"
+        exit 1
+    ) 2>/dev/null || :
+}
+
+# ==============================================================================
+# ГЕНЕРАЦИЯ NFQWS2_OPT ИЗ СТРАТЕГИЙ Z2K
+# ==============================================================================
+
+generate_nfqws2_opt_from_strategies() {
+    # Генерирует NFQWS2_OPT для config файла на основе текущих стратегий
+
+    # Pre-utils-safe path resolution. Original design hardcoded all three
+    # in case the function got called before utils.sh sourced; we now derive
+    # extra_strats_dir/lists_dir from ZAPRET2_DIR with the same /opt/zapret2
+    # fallback (parameter-expansion is evaluated lazily, so this stays a
+    # no-op in production where ZAPRET2_DIR is either unset or already set
+    # to /opt/zapret2 by utils.sh). Tests can mock these by exporting
+    # ZAPRET2_DIR before invocation. Третьей переменной, config_dir, здесь больше
+    # нет: /opt/etc/zapret2 нужен был только ветке Austerus, снятой 2026-08-04.
+    local extra_strats_dir="${ZAPRET2_DIR:-/opt/zapret2}/extra_strats"
+    local lists_dir="${ZAPRET2_DIR:-/opt/zapret2}/lists"
+    local category_youtube category_rkn category_voice
+    category_youtube=$(safe_config_read Z2K_CATEGORY_YOUTUBE "${ZAPRET2_DIR:-/opt/zapret2}/config" 1)
+    category_rkn=$(safe_config_read Z2K_CATEGORY_RKN "${ZAPRET2_DIR:-/opt/zapret2}/config" 1)
+    category_voice=$(safe_config_read Z2K_CATEGORY_DISCORD_VOICE "${ZAPRET2_DIR:-/opt/zapret2}/config" 1)
+
+
+    # Режим Austerusj (all_tcp443.conf) СНЯТ 2026-08-04. Пункт меню, которым его
+    # включали, убрали ещё 2026-04-15 (96c24a9), а ветку в генераторе оставили —
+    # получился режим, который нельзя включить, но который продолжал работать у
+    # всех, кто успел его включить до апреля. И работал он разрушительно: ветка
+    # закорачивала ВСЮ генерацию конфига через `return 0`, так что роутер получал
+    # три строки стратегий из Zapret1 вместо хостлистов, whitelist'а и circular —
+    # то есть единственное место в z2k, где --hostlist-exclude=whitelist.txt не
+    # действовал вообще (сюда же упирался вопрос «почему keenetic-домены не
+    # исключаются»). Выйти из режима было нельзя ничем: файл лежит в
+    # /opt/etc/zapret2, а reinstall меняет /opt/zapret2, и пересоздавался он
+    # только при отсутствии. Миграция, снимающая режим у затронутых, —
+    # migrate_drop_austerus_mode() в lib/install.sh.
+
+    # Загрузить текущие стратегии из категорий
+    local youtube_tcp=""
+    local youtube_gv_tcp=""
+    local rkn_tcp=""
+    local quic_udp=""
+    local discord_udp=""
+
+    # Variant-A refactor feature flags. Осталась одна фаза — остальные снялись
+    # вместе с профилями, которые они гейтили:
+    #   PHASE1 (webrtc_bypass) — профиль удалён, см. комментарий ниже по файлу;
+    #   PHASE2 (слияние game_udp + game_catchall) — игровой режим переехал на
+    #           WARP в r-61.1, профилей больше нет;
+    #   PHASE4 (cdn_tls) — снят 2026-04-27, см. ниже.
+    local Z2K_REFACTOR_PHASE3
+    # Phase 3 (YT+GV merge into google_tls) — DEFAULT OFF as of 2026-04-26.
+    # Field reports на enhanced (Сергей #2191, others) показали падение
+    # YouTube performance после merge; раздельные yt + googlevideo
+    # профили работают надёжнее. Pre-merge legacy code path (else
+    # branch ниже) теперь default. Юзеры могут опционально включить
+    # merge через `Z2K_REFACTOR_PHASE3=1` в config — оставлено для
+    # тестирования / возможного rollforward.
+    Z2K_REFACTOR_PHASE3=$(safe_config_read "Z2K_REFACTOR_PHASE3" "/opt/zapret2/config" "0")
+    # Phase 4 (cdn_tls) удалён 2026-04-27 — отдельный CF/OVH/Hetzner/DO
+    # профиль перехватывал non-RKN CF трафик и применял свой набор стратегий
+    # слабее проверенного 47-стратегий rkn_tcp rotator'а. CF возвращается
+    # под rkn_tcp как было до Variant A refactor'а.
+
+    # Пользовательские стратегии на пул — user-owned, переживают всё.
+    #
+    # Читается ПРИ КАЖДОЙ перегенерации конфига, а не запекается один раз: иначе
+    # первый же toggle в панели или auto-update молча вернул бы shipped-строку, и
+    # человек остался бы с чужой стратегией, думая, что работает его.
+    #
+    # Живёт отдельно от shipped Strategy.txt намеренно. Правки shipped-файлов у
+    # нас затираются обновлением by design («проект автоматизации»), поэтому
+    # редактор, пишущий туда, отдавал бы результат, исчезающий через релиз.
+    # Здесь же — тот же класс, что whitelist и extra-domains: install.sh
+    # сохраняет каталог при переустановке.
+    #
+    # Ротация для такого пула выключается сама собой: директива circular входит в
+    # саму строку стратегии, и строка пользователя заменяет её целиком. Не написал
+    # circular — не будет ротации, ровно как он и просил.
+    # Файл стратегий цел? USB-флешка умеет тихо отдавать вместо содержимого
+    # сплошные 0xFF (мёртвый блок NAND: размер и mtime целы, данных нет —
+    # полевой случай 2026-08-06, роутер владельца, два файла из трёх). Такой
+    # мусор, попав в обработку NFQWS2_OPT, вешает генерацию в бесконечный цикл
+    # и пишет на диск конфиг-мину, которая роняет nfqws2 на следующем рестарте.
+    #
+    # Сама проверка живёт в lib/utils.sh на верхнем уровне: её зовёт не только
+    # генерация конфига, но и диагностика, а две копии одной проверки расходятся
+    # молча. Вложенная копия была вдобавок недоступна снаружи вообще.
+    #
+    # Здесь остаётся гард на её отсутствие: вебпанель (webpanel/cgi/actions.sh,
+    # _gen_libs_source) сорсит utils.sh УСЛОВНО, и на обрезанном дереве сюда
+    # входят без него. Проверить нечем — но и отказывать в генерации нельзя:
+    # тогда недостающая библиотека гасила бы любой тумблер панели на исправном
+    # роутере. Смысловую валидность ниже по функции всё равно ловит nfqws2
+    # --dry-run.
+    _z2k_file_sane() {
+        command -v z2k_strategy_file_sane >/dev/null 2>&1 || return 0
+        z2k_strategy_file_sane "$1"
+    }
+
+    z2k_custom_strategy() {
+        # z2k_custom_strategy <pool> -> печатает строку пользователя, если она есть
+        local _cs_dir="${ZAPRET2_DIR:-/opt/zapret2}/lists/custom-strategies"
+        local _cs_file="$_cs_dir/$1.txt"
+        [ -s "$_cs_file" ] || return 1
+        # Комментарии и пустые строки выкинуть, остальное склеить в одну строку:
+        # nfqws2 принимает опции одной строкой, а человек может разложить их
+        # построчно для читаемости.
+        awk '{ sub(/\r$/,""); sub(/^[[:space:]]*#.*$/,"") } NF { printf "%s ", $0 }' "$_cs_file" \
+            | sed 's/[[:space:]]*$//'
+    }
+
+    # Порченый файл = генерация честно падает, старый конфиг и работающий
+    # сервис не тронуты (fail-closed).
+    z2k_read_pool_strategy() {
+        # z2k_read_pool_strategy <file> — содержимое в stdout, либо rc=1
+        local _f="$1"
+        if ! _z2k_file_sane "$_f"; then
+            print_error "Файл стратегий повреждён (бинарный мусор вместо опций): $_f"
+            print_error "Генерация конфига остановлена, старый конфиг сохранён. Лечится обновлением/переустановкой z2k."
+            return 1
+        fi
+        cat "$_f"
+    }
+
+    # Пользовательские стратегии лежат на ТОЙ ЖЕ флешке и ПЕРЕКРЫВАЮТ пуловые
+    # (см. присваивания ниже), поэтому одной проверки пуловых файлов мало: гнилой
+    # блок под custom-strategies вернул бы ровно то же зависание через чёрный ход.
+    # Проверяем их все разом ДО первого использования — так отказ один и тот же
+    # (fail-closed), а не «часть пулов подхватилась, часть нет».
+    for _cs_pool in yt_tcp gv_tcp rkn_tcp quic discord_udp; do
+        _cs_check="${ZAPRET2_DIR:-/opt/zapret2}/lists/custom-strategies/${_cs_pool}.txt"
+        [ -s "$_cs_check" ] || continue
+        if ! _z2k_file_sane "$_cs_check"; then
+            print_error "Пользовательский файл стратегий повреждён (бинарный мусор вместо опций): $_cs_check"
+            print_error "Генерация конфига остановлена, старый конфиг сохранён. Исправьте или удалите этот файл."
+            return 1
+        fi
+    done
+
+    # Прочитать стратегии из файлов категорий
+    if [ -f "${extra_strats_dir}/TCP/YT/Strategy.txt" ]; then
+        youtube_tcp=$(z2k_read_pool_strategy "${extra_strats_dir}/TCP/YT/Strategy.txt") || return 1
+    fi
+    _cs=$(z2k_custom_strategy yt_tcp) && [ -n "$_cs" ] && youtube_tcp="$_cs"
+
+    if [ -f "${extra_strats_dir}/TCP/YT_GV/Strategy.txt" ]; then
+        youtube_gv_tcp=$(z2k_read_pool_strategy "${extra_strats_dir}/TCP/YT_GV/Strategy.txt") || return 1
+    fi
+    _cs=$(z2k_custom_strategy gv_tcp) && [ -n "$_cs" ] && youtube_gv_tcp="$_cs"
+
+    if [ -f "${extra_strats_dir}/TCP/RKN/Strategy.txt" ]; then
+        rkn_tcp=$(z2k_read_pool_strategy "${extra_strats_dir}/TCP/RKN/Strategy.txt") || return 1
+    fi
+    _cs=$(z2k_custom_strategy rkn_tcp) && [ -n "$_cs" ] && rkn_tcp="$_cs"
+
+    # QUIC autocircular. Пул живёт в одном месте — quic_strats.ini, откуда
+    # установка кладёт extra_strats/UDP/YT/Strategy.txt (читается ниже). Без
+    # этого файла (холодный старт, обрыв установки) берётся аварийный пул —
+    # плечо того же набора на встроенном блобе, а не своя копия пула.
+    # key=quic stable key; nld=2 cuts CDN churn.
+    #
+    # ПУЛ ОБЩИЙ, А НЕ ЮТУБОВСКИЙ (16.09.2026). Раньше QUIC обходился только на
+    # доменах ютуба, и заблокированные сайты по HTTP/3 не обрабатывались НИ ОДНИМ
+    # профилем: браузер уходил в QUIC, получал тишину и откатывался на TCP — а
+    # приложения, которые так не умеют, просто не работали. Замер на роутере
+    # владельца: через минуты после включения ркн-списка в этот профиль в пуле
+    # появились facebook, instagram, cdninstagram, whatsapp — то есть трафик там
+    # был всегда, просто мимо нас. Ключ переименован yt_quic -> quic; старые
+    # строки состояния переносит init при первом старте нового кода.
+    # udp_in=1, udp_out=5. Детектор — штатный (решение Марка 10.09.2026).
+    #
+    # udp_in=1 — как в документации nfqws2: успех при втором входящем пакете,
+    # неудача при «принято <= 1». Замер 2026-08-19 по 1646 QUIC-потокам
+    # боевого роутера: входящие распределены бимодально — мёртвый поток
+    # получает 0, живой >= 3, полоса 1-2 пуста, — поэтому порог 1 разделяет
+    # классы так же, как измеренный тогда 3, и мы берём документированный.
+    # Июньский 8 держал успех недостижимым и давал 15 ротаций на 58 ложных
+    # провалов при 1 успехе на здоровом трафике.
+    #
+    # udp_out=5, а не документированные 4 — по тому же замеру: мёртвый QUIC
+    # шлёт МЕНЬШЕ пакетов, чем живой (браузер отправляет Initial, ждёт и
+    # уходит на TCP), и порог по исходящим классы не разделяет; 5 — компромисс,
+    # 21 %% отлова мёртвых против 5,5 %% у шестёрки при том же числе ложных
+    # срабатываний. Значение измерено, поэтому держим его, а не умолчание.
+    # Оба порога обязаны лежать ниже окна перехвата NFQWS2_UDP_PKT_IN/OUT —
+    # см. комментарий там же. Same change mirrored in quic_strats.ini.
+    quic_udp=$(z2k_emergency_quic_pool)
+
+    # If category strategy files exist, prefer them over hardcoded QUIC defaults.
+    # Имя файла сменилось вместе с ключом пула. Старый lists/custom-strategies/
+    # yt_quic.txt продолжаем читать: человек положил его руками, и молча
+    # перестать его применять — то же самое, что стереть его настройку.
+    # Форма «присваивание && проверка && присваивание» здесь обязательна: под
+    # `set -eu` (так генератор зовут тесты и установщик) отдельная строка
+    # `_cs=$(...) || _cs=$(...)` роняет весь запуск, когда своего файла нет
+    # НИ ПОД ОДНИМ именем — то есть у всех.
+    _cs=$(z2k_custom_strategy quic || z2k_custom_strategy yt_quic) && [ -n "$_cs" ] && quic_udp="$_cs"
+    if [ -z "$_cs" ] && [ -f "${extra_strats_dir}/UDP/YT/Strategy.txt" ]; then
+        quic_udp=$(z2k_read_pool_strategy "${extra_strats_dir}/UDP/YT/Strategy.txt") || return 1
+    fi
+    # Dedicated TCP Discord profile is disabled: no TCP-side Discord strategies in the pool.
+    local discord_tcp_block=""
+
+    # Discord UDP (z2k autocircular on the fake-blob primitive family).
+    # ПО КАНОНУ bol-van: голос+стрим пробиваются МАЛЕНЬКИМ cutoff на старте флоу
+    # + connbytes, а НЕ непрерывным фейком. --out-range=-d4 = фейк только на
+    # первые 4 data-пакета каждого флоу (#1267: "n2 или d2 лучше всего"; тугой
+    # cutoff = меньше пакетов под фейком = безопаснее для стрима). Ключевой
+    # принцип bol-van (#4450): "на linux нас спасёт connbytes" — высокобитрейтный
+    # медиапоток НЕЛЬЗЯ гнать через NFQUEUE целиком (keepalive это и делал →
+    # MIPS-CPU захлёбывался → пинг 5000 на стриме). Просадку голоса bol-van лечит
+    # НЕ расширением cutoff'а, а repeats/dup (#6915) — рычаг надёжности в repeats.
+    # --payload=discord_ip_discovery,stun — гейтим именно discovery/STUN-сигнатуры
+    # (не quic_initial — то для QUIC/443, не для голоса). БЕЗ keepalive (см.
+    # NFQWS2_PORTS_UDP_KEEPALIVE ниже — отключён по этой же причине).
+    # Пул — на блобе quic_initial_steamcommunity_com (QUIC Initial с SNI steamcommunity.com,
+    # 1200 байт): это голосовой фейк референсного набора с 22.07.2026, им же он
+    # глушит и STUN. 25.10.2026 пул переведён на него целиком по решению Марка:
+    # «у них работает сейчас — делаем как у них». Раньше (с 30.04.2026) пул стоял
+    # на quic_dbankcloud — это прежний фейк того же набора, от которого он сам
+    # отказался.
+    # strategy=1 = fake repeats=6 — голосовая строка референса один в один.
+    # 2-6 — прежние fallback'и пула (repeats 10/3/4/5 и 6 с autottl) на новом
+    # блобе, для circular-перебора, все под d4-cutoff. Прежнее плечо 3 (repeats=6)
+    # совпало с новым первым и слито с ним; номера в state.tsv переносит
+    # _z2k_migrate_pool_renumber_v1 в S99.
+    # hostkey=z2k_nohost_key — нативный hostkey-генератор (z2k-modern-core.lua,
+    # через bol-van automate_host_record arg.hostkey). Discord/STUN UDP без SNI
+    # → константа "nohost" → shared rotation state autostate[discord_udp][nohost]
+    # вместо per-IP фрагментации стокового host_ip fallback'а (иначе Discord
+    # voice холодно стартует на каждом новом DC-IP). Нативная замена archived
+    # allow_nohost (z2k-autocircular) — алгоритм ротации остаётся circular().
+    discord_udp="--filter-udp=50000-50100,1400,3478-3481,5349,19294-19344 --filter-l7=discord,stun --in-range=a --out-range=a --payload=all --lua-desync=circular:fails=3:time=60:udp_in=1:udp_out=4:key=discord_udp:hostkey=z2k_nohost_key --in-range=x --out-range=-d4 --payload=discord_ip_discovery,stun --lua-desync=fake:payload=all:blob=quic_initial_steamcommunity_com:repeats=6:strategy=1 --lua-desync=fake:payload=all:blob=quic_initial_steamcommunity_com:repeats=10:strategy=2 --lua-desync=fake:payload=all:blob=quic_initial_steamcommunity_com:repeats=3:strategy=3 --lua-desync=fake:payload=all:blob=quic_initial_steamcommunity_com:repeats=6:ip_autottl=-2,3-20:strategy=4 --lua-desync=fake:payload=all:blob=quic_initial_steamcommunity_com:repeats=4:strategy=5 --lua-desync=fake:payload=all:blob=quic_initial_steamcommunity_com:repeats=5:strategy=6"
+
+    # Дефолт для пула, чей Strategy.txt пуст или нечитаем.
+    #
+    # ВТОРАЯ ЛИНИЯ ОБОРОНЫ, И СРАБАТЫВАЕТ ОНА ЧАЩЕ ПЕРВОЙ.
+    # create_default_strategy_files (lib/strategies.sh) отрабатывает один раз, при
+    # установке. Этот путь — при КАЖДОЙ пересборке конфига, то есть при каждом
+    # применении стратегий. Сюда попадает роутер, у которого файл испортился уже
+    # ПОСЛЕ установки, а нули в Strategy.txt на этом железе случались.
+    #
+    # Раньше здесь стоял одиночный `fake:blob=fake_default_tls:repeats=6` без
+    # circular. Пул терял не только свою технику, но и саму способность перебирать
+    # запасные: один приём, и если он не проходит — всё.
+    #
+    # Аварийный набор берём из lib/utils.sh, чтобы определение было одно. Проверка
+    # доступности — на случай путей, где config_official сорсится в одиночку:
+    # вебпанель (webpanel/cgi/actions.sh, _gen_libs_source) сорсит utils.sh
+    # УСЛОВНО, и на роутере с обрезанным деревом сюда входят без него.
+    #
+    # ЗАПАСНОЙ ЛИТЕРАЛ — ТОЖЕ РОТИРУЮЩИЙ, И ЭТО НЕСУЩЕЕ. Здесь лежала
+    # дореформенная строка: один fake без circular и без key=. Достижима она
+    # ровно на том пути, который случается чаще всего — тумблер в панели, — и
+    # схлопывала ВСЕ ТРИ TCP-пула в статический фейк с общей ячейкой ротации.
+    # В панели такое состояние неотличимо от здорового, то есть человек видел
+    # «всё применилось», а обход оставался с одним приёмом без запасных.
+    # Строка — дословная копия z2k_emergency_tcp_pool (lib/utils.sh); при
+    # правке того набора править и здесь, иначе деградированные пути разъедутся.
+    _z2k_pool_default() {
+        if command -v z2k_emergency_tcp_pool >/dev/null 2>&1; then
+            z2k_emergency_tcp_pool "$1"
+        else
+            printf '%s' "--filter-tcp=443,2053,2083,2087,2096,8443 --filter-l7=tls --payload=tls_client_hello,http_req,http_reply,unknown,tls_server_hello --out-range=-s34228 --lua-desync=circular:fails=3:time=60:key=$1:nld=2 --lua-desync=tls_client_hello_clone:payload=tls_client_hello:dir=out:blob=z2k_real_www_google_com:sni_del:sni_first=www.google.com:sni_snt_new=0:fallback=fake_default_tls:strategy=1 --lua-desync=fake:payload=tls_client_hello:dir=out:blob=z2k_real_www_google_com:repeats=6:tls_mod=rnd,dupsid:strategy=1 --lua-desync=multisplit:payload=tls_client_hello:dir=out:pos=1,midsld:strategy=1 --lua-desync=multisplit:payload=tls_client_hello:dir=out:pos=1,sniext+1:seqovl=1:strategy=2 --lua-desync=tls_client_hello_clone:payload=tls_client_hello:dir=out:blob=z2k_real_www_microsoft_com:sni_del:sni_first=www.microsoft.com:sni_snt_new=0:fallback=fake_default_tls:strategy=3 --lua-desync=fake:payload=tls_client_hello:dir=out:blob=z2k_real_www_microsoft_com:repeats=6:tcp_ts=-1000:badsum:tls_mod=rnd,dupsid:strategy=3 --lua-desync=fakedsplit:payload=tls_client_hello:dir=out:pos=1:tcp_ts=-1000:badsum:strategy=3"
+        fi
+    }
+
+    # Использовать дефолт если стратегия пустая. Ключ circular обязан совпадать с
+    # боевым, иначе состояние ротации уедет в чужую ячейку.
+    [ -z "$youtube_tcp" ] && youtube_tcp=$(_z2k_pool_default yt_tcp)
+    [ -z "$youtube_gv_tcp" ] && youtube_gv_tcp=$(_z2k_pool_default gv_tcp)
+    [ -z "$rkn_tcp" ] && rkn_tcp=$(_z2k_pool_default rkn_tcp)
+
+
+    # Share rotation between subdomains using the native two-label scope.
+    # The fallback must use the same keys when the optional helper is absent.
+    ensure_circular_host_scope() {
+        local input="$1" out="" token="" opts="" part="" rest=""
+        local old_ifs="$IFS" explicit_hostkey=""
+        set -f
+        for token in $input; do
+            case "$token" in
+                --lua-desync=circular:*)
+                    opts="${token#--lua-desync=circular:}"
+                    rest=""; explicit_hostkey=""
+                    IFS=':'
+                    for part in $opts; do
+                        case "$part" in
+                            nld=*) ;;
+                            hostkey=*) explicit_hostkey=1; rest="${rest:+$rest:}$part" ;;
+                            *) rest="${rest:+$rest:}$part" ;;
+                        esac
+                    done
+                    IFS="$old_ifs"
+                    token=<REDACTED>
+                    if [ -z "$explicit_hostkey" ] && [ -f "${ZAPRET2_DIR:-/opt/zapret2}/lua/z2k-modern-core.lua" ]; then
+                        token=<REDACTED>
+                    fi
+                    ;;
+            esac
+            out="${out:+$out }$token"
+        done
+        set +f
+        IFS="$old_ifs"
+        printf '%s' "$out"
+    }
+
+    youtube_tcp=$(ensure_circular_host_scope "$youtube_tcp")
+    youtube_gv_tcp=$(ensure_circular_host_scope "$youtube_gv_tcp")
+    rkn_tcp=$(ensure_circular_host_scope "$rkn_tcp")
+    quic_udp=$(ensure_circular_host_scope "$quic_udp")
+
+    # ── Окно счётчика провалов (`time=`) ─────────────────────────────────────
+    #
+    # ЗАЧЕМ. `time` — это НЕ окно, в которое должны уложиться все три провала.
+    # Мануал: «время в секундах, после которого с момента ПРЕДЫДУЩЕЙ неудачи
+    # следующая неудача начинает счет заново». Зазор между соседними.
+    #
+    # Замер 25-26.08.2026 по одиннадцати дампам с LG webOS (пул yt_tcp, домен
+    # www.youtube.com есть в TCP/YT/List.txt). Все десять содержательных
+    # потоков — один сценарий: ClientHello, восемь повторов, НОЛЬ входящих
+    # байт. Провал детектируется штатно на втором повторе, через 224 мс.
+    # Зазоры между попытками телевизора:
+    #
+    #     151, 135, 129, 69, 235, 188, 108, 72, 116 сек
+    #     мин 69   медиана 129   макс 235
+    #
+    # Годных зазоров при time=60 — НОЛЬ из девяти. Счётчик обнуляется после
+    # каждого провала и до fails=3 не доходит никогда. Сквозной прогон
+    # настоящего automate_failure_counter по этим зазорам:
+    #
+    #     time=60  fails=3 -> 0 ротаций      time=180 fails=3 -> 2
+    #     time=60  fails=2 -> 0 ротаций      time=300 fails=3 -> 3
+    #
+    # Снижение fails не даёт НИЧЕГО: при time=60 каждый зазор больше окна.
+    # Единственный рычаг — time.
+    #
+    # ПОЧЕМУ НЕ ВСЕМ ПУЛАМ. Замер распределения потоков (488 штук с боевого
+    # роутера) показал: порог успеха защёлкивается на 5% соединений при наших
+    # порогах. То есть документированная защита от ложной ротации — «при удаче
+    # счетчик сбрасывается» — в поле почти не работает, и реально от неё
+    # защищает как раз `time`. Расширяя его, мы ослабляем единственную
+    # работающую защиту, поэтому расширяем ТОЛЬКО там, где выигрыш измерен:
+    # на пулах видео, где сидят телевизоры и приставки. На rkn/cf/http клиенты
+    # это браузеры с плотными попытками, там 60 хватает.
+    Z2K_CIRCULAR_TIME_SLOW=300
+    ensure_circular_time() {
+        local input="$1"
+        local target="${2:?ensure_circular_time: значение обязательно}"
+        local out="" token="" opts="" part="" rest=""
+        local old_ifs="$IFS"
+
+        set -f  # без глоба: токены могут нести *,?,[ ] из правленого Strategy.txt
+        for token in $input; do
+            case "$token" in
+                --lua-desync=circular:*)
+                    opts="${token#--lua-desync=circular:}"
+                    rest=""
+                    IFS=':'
+                    for part in $opts; do
+                        case "$part" in
+                            time=*) ;;
+                            *) rest="${rest:+$rest:}$part" ;;
+                        esac
+                    done
+                    IFS="$old_ifs"
+                    if [ -n "$rest" ]; then
+                        token=<REDACTED>
+                    else
+                        token=<REDACTED>
+                    fi
+                    ;;
+            esac
+            out="${out:+$out }$token"
+        done
+        set +f
+        printf '%s' "$out"
+    }
+
+    # ── Детекторы TCP-пулов: штатные, с параметрами из документации ──────────
+    #
+    # Базовые пороги штатного детектора. Узкие TLS/HTTP-поправки подключаются
+    # ниже, после нормализации профилей.
+    #
+    #   retrans=2   экспериментальный порог: клиент может закончить попытку
+    #               после двух повторов. Это не фиксированная задержка в секундах.
+    #   maxseq=32768 / inseq=4096 — штатные границы байтового наблюдения.
+    #   reset       RST после принятой неудачи по двум повторам; opt-out:
+    #               Z2K_CIRCULAR_RESET=0. Кворум fails=3 остаётся прежним.
+    #
+    # Проход снимает и любой :failure_detector= / :success_detector= из
+    # правленого руками Strategy.txt: имя функции, которой нет на диске,
+    # роняет движок в error() на каждом пакете профиля.
+    #
+    # Только TCP-пулы: у UDP свои пороги udp_in/udp_out.
+    local Z2K_CIRCULAR_RESET
+    Z2K_CIRCULAR_RESET=$(safe_config_read "Z2K_CIRCULAR_RESET" "${ZAPRET2_DIR:-/opt/zapret2}/config" "1")
+
+    ensure_circular_doc_args() {
+        local input="$1"
+        local out="" token="" opts="" part="" rest=""
+        local old_ifs="$IFS"
+
+        set -f  # без глоба: токены могут нести *,?,[ ] из правленого Strategy.txt
+        for token in $input; do
+            case "$token" in
+                --lua-desync=circular:*)
+                    opts="${token#--lua-desync=circular:}"
+                    rest=""
+                    IFS=':'
+                    for part in $opts; do
+                        case "$part" in
+                            # silence= — токен снятого 11.09.2026 детектора
+                            # молчания. Строка остаётся в списке снимаемых:
+                            # ручной Strategy.txt, скопированный из той версии,
+                            # иначе довёз бы её до движка.
+                            retrans=*|maxseq=*|inseq=*|reset|no_rst|no_http_redirect|silence=*) ;;
+                            failure_detector=*|success_detector=*) ;;
+                            *) rest="${rest:+$rest:}$part" ;;
+                        esac
+                    done
+                    IFS="$old_ifs"
+                    token=<REDACTED>
+                    [ "$Z2K_CIRCULAR_RESET" != "0" ] && token="${token}:reset"
+                    ;;
+            esac
+            out="${out:+$out }$token"
+        done
+        set +f
+        IFS="$old_ifs"
+        printf '%s' "$out"
+    }
+
+    # Окно счётчика на пулах видео — см. обоснование у ensure_circular_time.
+    youtube_tcp=$(ensure_circular_time "$youtube_tcp" "$Z2K_CIRCULAR_TIME_SLOW")
+    youtube_gv_tcp=$(ensure_circular_time "$youtube_gv_tcp" "$Z2K_CIRCULAR_TIME_SLOW")
+    youtube_tcp=$(ensure_circular_doc_args "$youtube_tcp")
+    youtube_gv_tcp=$(ensure_circular_doc_args "$youtube_gv_tcp")
+    rkn_tcp=$(ensure_circular_doc_args "$rkn_tcp")
+
+    # ensure_circular_in_range: окно входящих обязано быть ВЫШЕ порога inseq.
+    #
+    # ЗАЧЕМ. Порог inseq задаётся здесь, а окно `--in-range` живёт в файле
+    # стратегий — два разных места, и никто их не сверял. Замерено 2026-08-14:
+    #
+    #   rkn_tcp  окно -s20000  порог 26000  -> полоса (26000, 20000] пуста
+    #   yt_tcp   окно -s5556   порог 18000  -> полоса (18000, 5556]  пуста
+    #
+    # Успех по входящим срабатывает строго при `начальный rseq > inseq`, а за
+    # верхней границей окна nfqws2 выключает Lua по потоку (lua cutoff). Полоса
+    # пуста -> путь мёртв, и порог, посаженный за верхнюю границу TLS-затыка
+    # (ntc.party 22516: тихий обрыв стрима на 14-30 KB без RST/FIN/alert),
+    # не срабатывает ни разу. Ровно от этого уходили 21.05, когда подняли
+    # `bytes_in_handshake_done` 3072 -> 16384: голый ServerHello ложно
+    # закрепляет страту, которая проходит TLS и ломает потоки HTTP/2 внутри
+    # мультиплекса.
+    #
+    # Инвариант держим ЗДЕСЬ, а не правкой файла стратегий: порог тоже ставится
+    # здесь, и только так они больше не разъедутся. Правленный руками
+    # Strategy.txt лечится этим же проходом.
+    #
+    # Запас 1500 байт (у bol-van 1460 = максимум данных в TCP-пакете): нужно,
+    # чтобы в полосу успел попасть реальный пакет, а не только её граница.
+    # Стоимость невелика: iptables и так отдаёт в очередь первые 30 входящих
+    # пакетов потока, так что лишних переходов через ядро нет — прибавляются
+    # только вызовы Lua.
+    ensure_circular_in_range() {
+        local input="$1"
+        local inseq="" want="" cur="" out="" token=""
+
+        set -f
+        for token in $input; do
+            case "$token" in
+                --lua-desync=circular:*)
+                    case "$token" in
+                        *:inseq=*) inseq="${token##*:inseq=}"; inseq="${inseq%%:*}" ;;
+                    esac
+                    ;;
+            esac
+        done
+        case "$inseq" in ''|*[!0-9]*) set +f; printf '%s' "$input"; return 0 ;; esac
+        want=$((inseq + 1500))
+
+        for token in $input; do
+            case "$token" in
+                --in-range=-s*)
+                    cur="${token#--in-range=-s}"
+                    case "$cur" in
+                        ''|*[!0-9]*) ;;
+                        *) [ "$cur" -le "$inseq" ] && token="--in-range=-s${want}" ;;
+                    esac
+                    ;;
+            esac
+            out="${out:+$out }$token"
+        done
+        set +f
+        printf '%s' "$out"
+    }
+
+    # Соединения без SNI движок помечает l7proto=unknown. Профиль с
+    # --filter-l7=tls их не берёт — и они уходят в no_action мимо обхода.
+    # Ровно так пропадал телевизор: адрес известен через ipcache, а протокол
+    # для фильтра «не тот». Пулы видео обязаны брать и unknown. РКН намеренно
+    # не трогаем — там на тех же портах живёт слишком много чужого.
+    # Токен переписываем перебором, а не регуляркой.
+    #
+    # Было: sed 's/--filter-l7=tls\([^,a-z_]\|$\)/.../g'. У GNU sed \| это
+    # альтернатива, у BSD — литерал, поэтому на макбуке подстановка МОЛЧА не
+    # выполнялась. Локальные тесты были зелёными, а в CI на Linux — красными,
+    # и разошлось это только на релизе r-77.1. Перебор токенов ведёт себя
+    # одинаково везде и заодно точнее: правим ровно тот токен, а не подстроку.
+    ensure_l7_unknown() {
+        local _t _out=""
+        set -f
+        for _t in $1; do
+            [ "$_t" = "--filter-l7=tls" ] && _t="--filter-l7=tls,unknown"
+            _out="${_out:+$_out }$_t"
+        done
+        set +f
+        printf '%s' "$_out"
+    }
+    youtube_tcp=$(ensure_l7_unknown "$youtube_tcp")
+    youtube_gv_tcp=$(ensure_l7_unknown "$youtube_gv_tcp")
+
+    # Инвариант для UDP: пороги детекторов обязаны лежать НИЖЕ окна перехвата.
+    #
+    # Для TCP такая сверка есть с самого начала (ensure_circular_in_range ниже
+    # держит --in-range выше inseq). На UDP её не распространили, и это стоило
+    # нам двух месяцев ротации по шуму: udp_in=8 при окне в 3 входящих пакета
+    # означает, что успех недостижим, счётчик неудач нечем сбросить, и страта
+    # уезжает на полностью здоровом трафике.
+    #
+    # Мануал, «Обслуживание позиций»: «Счетчик не может и не будет считать то,
+    # что не перехватывается». Ошибка молчаливая — ни в логе, ни в статусе она
+    # никак не видна, поэтому проверяем на этапе генерации.
+    check_udp_thresholds() {
+        local pool="$1" tok in_thr out_thr
+        # no glob: токены приходят в том числе из Strategy.txt и custom-strategy,
+        # где законно встречаются *,?,[ ] — без этого сторож молча слепнет на
+        # раскрытом по каталогу токене. Так же обёрнуты все прочие циклы разбора
+        # в этом файле.
+        set -f
+        for tok in $2; do
+            case "$tok" in
+                --lua-desync=circular:*)
+                    case "$tok" in *:udp_in=*) in_thr="${tok##*:udp_in=}"; in_thr="${in_thr%%:*}" ;; *) in_thr="" ;; esac
+                    case "$tok" in *:udp_out=*) out_thr="${tok##*:udp_out=}"; out_thr="${out_thr%%:*}" ;; *) out_thr="" ;; esac
+                    # Успех срабатывает на пакете udp_in+1 — окно должно его застать.
+                    if [ -n "$in_thr" ] && [ "$in_thr" -ge "$Z2K_UDP_PKT_IN" ] 2>/dev/null; then
+                        echo "WARN: $pool: udp_in=$in_thr не ниже окна NFQWS2_UDP_PKT_IN=$Z2K_UDP_PKT_IN — успех недостижим, ротация пойдёт по шуму" 1>&2
+                    fi
+                    if [ -n "$out_thr" ] && [ "$out_thr" -gt "$Z2K_UDP_PKT_OUT" ] 2>/dev/null; then
+                        echo "WARN: $pool: udp_out=$out_thr выше окна NFQWS2_UDP_PKT_OUT=$Z2K_UDP_PKT_OUT — провал недостижим" 1>&2
+                    fi
+                    ;;
+            esac
+        done
+        set +f
+    }
+    check_udp_thresholds quic "$quic_udp"
+    # Своя строка человека перекрывает наш набор — так же, как у остальных
+    # пулов. Подставляем ДО проверки порогов: проверять надо то, что реально
+    # уедет в движок, а не то, что мы предлагали по умолчанию.
+    _cs=$(z2k_custom_strategy discord_udp) && [ -n "$_cs" ] && discord_udp="$_cs"
+
+    check_udp_thresholds discord_udp "$discord_udp"
+
+    youtube_tcp=$(ensure_circular_in_range "$youtube_tcp")
+    youtube_gv_tcp=$(ensure_circular_in_range "$youtube_gv_tcp")
+    rkn_tcp=$(ensure_circular_in_range "$rkn_tcp")
+
+    # ensure_circular_fails: force `fails=N` on circular tokens (strip any existing
+    # fails=, re-add at front). Normalizes pools to bol-van's documented default 3.
+    ensure_circular_fails() {
+        local input="$1"
+        local target="${2:-3}"
+        local out=""
+        local token=""
+        local opts=""
+        local part=""
+        local rest=""
+        local old_ifs="$IFS"
+
+        for token in $input; do
+            case "$token" in
+                --lua-desync=circular:*)
+                    opts="${token#--lua-desync=circular:}"
+                    rest=""
+                    IFS=':'
+                    for part in $opts; do
+                        case "$part" in
+                            fails=*) ;;
+                            *) rest="${rest:+$rest:}$part" ;;
+                        esac
+                    done
+                    IFS="$old_ifs"
+                    if [ -n "$rest" ]; then
+                        token=<REDACTED>
+                    else
+                        token=<REDACTED>
+                    fi
+                    ;;
+            esac
+            out="${out:+$out }$token"
+        done
+        IFS="$old_ifs"
+        printf '%s' "$out"
+    }
+
+    # PPE-разгрузка (правило файрвола в S99) остаётся как
+    # есть: она не детектор, а видимость — снимает поток с аппаратного NAT,
+    # чтобы штатный детектор вообще видел ретрансмиссии. Планку retrans к ней
+    # больше не привязываем: она задаётся выше, по документации.
+
+
+    # Детекторы: штатные bol-van ПЛЮС наши поправки к ним — проводка ниже,
+    # после всех правок профилей (ищи ensure_rkn_failure_detector).
+    #
+    # TCP-обёртка ограничивает ретрансмиссии первым запросом, разбирает
+    # ранний TLS alert и явные HTTP-заглушки. RST проверяет штатный детектор.
+    # Обрыв на 16 КБ обслуживается отдельно (z2k-tcp16.lua).
+
+    # Phase 6A: auto-inject fool=z2k_dynamic_ttl into every
+    # --lua-desync=fake:*  (and fakedsplit/fakeddisorder/hostfakesplit) that
+    # doesn't already pin an explicit TTL via ip_ttl=/ip6_ttl=/ip_autottl=/
+    # ip6_autottl=/fool=. The z2k_dynamic_ttl fool hook (files/lua/z2k-fooling-ext.lua)
+    # clamps the fake packet TTL to real_egress_ttl-1, making fakes look
+    # identical to real client packets from a ТСПУ fingerprint standpoint.
+    # Explicit TTL setters are respected — the override is opt-out on a
+    # per-strategy basis by adding any of the above args to a strategy.
+    #
+    # Applied only to TCP profiles (rkn_tcp, yt_tcp, gv_tcp). UDP profiles
+    # (quic, discord, game) don't use the fake/fakedsplit family the same
+    # way and have their own tuning.
+    inject_z2k_dynamic_ttl() {
+        local input="$1"
+        local token=""
+        local out=""
+        local skip=""
+        set -f  # no glob: $input tokens may contain *,?,[ ] from hand-edited Strategy.txt
+        for token in $input; do
+            case "$token" in
+                --lua-desync=fake:*|\
+                --lua-desync=fakedsplit:*|\
+                --lua-desync=fakeddisorder:*|\
+                --lua-desync=hostfakesplit:*)
+                    # Check if the token already pins TTL in any form.
+                    skip=""
+                    case "$token" in
+                        *:ip_ttl=*|*:ip6_ttl=*|*:ip_autottl=*|*:ip6_autottl=*|*:fool=*) skip="1" ;;
+                    esac
+                    # Плечи гугловой строки референсного набора помечены
+                    # ip_id=zero и приведены к ней один в один: свой TTL фейка
+                    # разводит плечо с первоисточником.
+                    case "$token" in *:ip_id=zero*) skip="1" ;; esac
+                    if [ -z "$skip" ]; then
+                        token=<REDACTED>
+                    fi
+                    ;;
+            esac
+            out="${out:+$out }$token"
+        done
+        set +f
+        printf '%s' "$out"
+    }
+
+    # Z2K_DYNAMIC_TTL=0 opt-out: на сетапах с принудительным NDM-TTL-fix
+    # (`ip ttl-fix` на Keenetic, чаще всего на мобильных операторах с
+    # запретом раздачи — телефонная симка + IMEI-маскировка) NDM
+    # перебивает TTL всех исходящих на фиксированное значение независимо
+    # от того что наш hook поставил. В этой топологии inject избыточен,
+    # а в редких случаях мешает downstream примитивам — даём опт-аут.
+    local Z2K_DYNAMIC_TTL
+    Z2K_DYNAMIC_TTL=$(safe_config_read "Z2K_DYNAMIC_TTL" "${ZAPRET2_DIR:-/opt/zapret2}/config" "1")
+    # rkn_tcp сюда не идёт: пул rkn — референсные наборы один в один
+    # (30.10.2026), динамический TTL меняет их фейки.
+    if [ "$Z2K_DYNAMIC_TTL" != "0" ]; then
+        youtube_tcp=$(inject_z2k_dynamic_ttl "$youtube_tcp")
+        youtube_gv_tcp=$(inject_z2k_dynamic_ttl "$youtube_gv_tcp")
+    fi
+
+    # Phase 8: auto-inject z2k JA3 fingerprint breakers (grease, alpn,
+    # psk, keyshare) into every --lua-desync=fake:... token that already
+    # carries a tls_mod= list. We only extend existing tls_mod arguments;
+    # strategies without tls_mod are left alone (they are either non-TLS
+    # or intentionally avoid any ClientHello munging). Idempotent — if
+    # z2k_grease/etc are already present, the token passes through
+    # unchanged so repeated runs of create_official_config don't stack
+    # duplicates.
+    #
+    # Depends on the fork nfqws2 build >= v0.9.4.7-z2k-r3 which
+    # introduces the z2k_tls_mod.c dispatcher and the z2k_* mode names.
+    # If an older upstream binary is running, parsing these tokens will
+    # fail at nfqws2 startup.
+    # $2 — `1` means also append `padencap` (Phase 1.4 Z2K_PADENCAP=1
+    # default 1 = padencap включён всегда). При =0 padencap не добавляется.
+    inject_z2k_tls_mods() {
+        local input="$1"
+        local with_padencap="${2:-0}"
+        local token=""
+        local out=""
+        # r2 (2026-05-03): z2k_alpn / psk / keyshare после dup-skip fix'а
+        # silently skipped на современных blob'ах (где соответствующие
+        # extensions уже есть). Добавлены 4 редко-присутствующих
+        # extensions для real JA3 distortion: earlydata / pha / sct /
+        # delegcred. Требуется fork v0.9.5.2-z2k-r2+.
+        local extra="z2k_grease,z2k_alpn,z2k_psk,z2k_keyshare,z2k_earlydata,z2k_pha,z2k_sct,z2k_delegcred"
+        if [ "$with_padencap" = "1" ]; then
+            extra="${extra},padencap"
+        fi
+        set -f  # no glob: $input tokens may contain *,?,[ ] from hand-edited Strategy.txt
+        for token in $input; do
+            case "$token" in
+                *:tls_mod=*)
+                    case "$token" in
+                        *z2k_grease*|*z2k_alpn*|*z2k_psk*|*z2k_keyshare*|*z2k_earlydata*|*z2k_pha*|*z2k_sct*|*z2k_delegcred*)
+                            # Already extended once. If padencap requested
+                            # but missing on this token, splice it in.
+                            if [ "$with_padencap" = "1" ]; then
+                                case "$token" in
+                                    *padencap*) : ;;
+                                    *)
+                                        token=<REDACTED>
+                                        ;;
+                                esac
+                            fi
+                            ;;
+                        *)
+                            # Append z2k modes (and optionally padencap) to
+                            # the tls_mod list. tls_mod= is comma-separated;
+                            # we insert right after the existing value by
+                            # rewriting the first `:tls_mod=VALUE` chunk so
+                            # the new modes sit adjacent to upstream modes.
+                            # Sed is enough because the value cannot
+                            # contain a ':' (would terminate the token).
+                            token=<REDACTED>
+                            ;;
+                    esac
+                    ;;
+            esac
+            out="${out:+$out }$token"
+        done
+        set +f
+        printf '%s' "$out"
+    }
+
+    # 2026-05-03: auto-injection z2k_grease/alpn/psk/keyshare/earlydata/
+    # pha/sct/delegcred/padencap отключена. Field-проверка показала net
+    # negative: на 7+/8 хостов наши TLS-extension'ы либо ломали handshake
+    # (r0 — duplicate ALPN/PSK/key_share без skip-check), либо после r2
+    # fix давали слабый JA3 distortion который autocircular не выбирал
+    # (простой multisplit пробивает чище). На cloudflare.com fix r2 заработал,
+    # но это починка бага r0, не реальный wins. Большинство хостов
+    # pin'ятся на не-fake strategies (multisplit/hostfakesplit) у которых
+    # tls_mod= вообще нет, инъекция к ним не применяется.
+    #
+    # Функции `inject_z2k_tls_mods` оставлены в файле и tokens z2k_*
+    # доступны через --lua-desync=fake:tls_mod=...,z2k_grease,... — если
+    # юзер хочет вручную в strats. Auto-инъекция отключена. Включить
+    # обратно: вернуть три строки `inject_z2k_tls_mods` ниже.
+    #
+    # Z2K_PADENCAP / Z2K_INJECT_TLS_MODS флаги остаются для возможного
+    # opt-in возврата, но default — НЕ инжектить ничего.
+    local Z2K_INJECT_TLS_MODS
+    Z2K_INJECT_TLS_MODS=$(safe_config_read "Z2K_INJECT_TLS_MODS" "${ZAPRET2_DIR:-/opt/zapret2}/config" "0")
+    if [ "$Z2K_INJECT_TLS_MODS" = "1" ]; then
+        local Z2K_PADENCAP
+        Z2K_PADENCAP=$(safe_config_read "Z2K_PADENCAP" "${ZAPRET2_DIR:-/opt/zapret2}/config" "1")
+        rkn_tcp=$(inject_z2k_tls_mods "$rkn_tcp" "$Z2K_PADENCAP")
+        youtube_tcp=$(inject_z2k_tls_mods "$youtube_tcp")
+        youtube_gv_tcp=$(inject_z2k_tls_mods "$youtube_gv_tcp")
+    fi
+
+    # Ротация tcp_ts по слотам СНЯТА: значения теперь записаны прямо в пуле
+    # (strats_new2.txt, строка манифеста rkn) и приезжают в Strategy.txt как
+    # есть. Раньше генератор переписывал `tcp_ts=-1000` по НОМЕРУ стратегии по
+    # таблице из четырнадцати слотов — и это была мина: любая вставка или
+    # перестановка стратегии в пуле молча уводила чужие значения на чужие
+    # стратегии. Ровно так однажды и вышло (случай со strategy=37 и ozon.ru,
+    # прикусившим браузер). Плюс к моменту снятия пять слотов таблицы уже
+    # указывали в пустоту — в пуле не осталось токенов с такими номерами.
+    #
+    # Значения не изменились: сгенерированный NFQWS2_OPT до и после снятия
+    # совпадает побайтно (tests/test_tcp_ts_baked.sh стережёт, что в пуле нет
+    # выгоревшего -1000 на тех слотах и что генератор его больше не трогает).
+
+    # Phase 14: bol-van badseq alias expansion.
+    #
+    # Upstream bol-van/zapret has `--dpi-desync-fooling=badseq` with
+    # integer defaults -10000 for tcp_seq and -66000 for tcp_ack (the
+    # -66000 value is specifically chosen to drift past Linux conntrack's
+    # window-scaled tolerance introduced in 2.6.18; see GoodbyeDPI
+    # fakepackets.c:218 for the reference). The flag, when set, just
+    # does `th_seq += increment` and `th_ack += ack_increment` inside
+    # fill_tcphdr() on fake/decoy packets only, never on real data.
+    #
+    # Our zapret2 fork dropped FOOL_BADSEQ from C-side fooling bits
+    # (the whole fooling machinery was rewritten to Lua standard-fooling),
+    # so tokens like `:badseq:badseq_increment=N:badseq_ack_increment=M:`
+    # written in the spirit of bol-van get silently ignored by the Lua
+    # argument parser — they're dead noise in 8 of our rkn_tcp strategies
+    # and 6 yt/gv variants. The functional equivalent in our code is
+    # `tcp_seq=N:tcp_ack=M` inside standard fooling, which does land in
+    # apply_fooling() → reconstructed fake packet, matching bol-van's
+    # fill_tcphdr() behavior bit-for-bit.
+    #
+    # This preprocessor transparently rewrites the bol-van syntax into
+    # our tcp_seq/tcp_ack syntax:
+    #   `:badseq:`                        → `:tcp_seq=-10000:tcp_ack=-66000:`
+    #   `:badseq_increment=N:`            → `:tcp_seq=N:tcp_ack=-66000:`
+    #   `:badseq_increment=N:badseq_ack_increment=M:` → `:tcp_seq=N:tcp_ack=M:`
+    #
+    # Existing explicit `tcp_seq=` / `tcp_ack=` on the same token win
+    # (we never override an explicit user setting). The badseq tokens
+    # themselves are dropped from the output so there's no residual
+    # dead syntax in NFQWS2_OPT. Applied to fake-family tokens (fake,
+    # fakedsplit, fakeddisorder, hostfakesplit, rst, rstack, syndata,
+    # synack) — strictly mirroring bol-van's "fake/decoy only" invariant.
+    expand_badseq_aliases() {
+        local input="$1"
+        local token=""
+        local out=""
+        set -f  # no glob: $input tokens may contain *,?,[ ] from hand-edited Strategy.txt
+        for token in $input; do
+            case "$token" in
+                --lua-desync=fake:*|\
+                --lua-desync=fakedsplit:*|\
+                --lua-desync=fakeddisorder:*|\
+                --lua-desync=hostfakesplit:*|\
+                --lua-desync=rst:*|\
+                --lua-desync=rstack:*|\
+                --lua-desync=syndata:*|\
+                --lua-desync=synack:*)
+                    case "$token" in
+                        # The literal `:` chars in `*:badseq:*` act as
+                        # left+right word boundaries — tokens like
+                        # `:fakebadseq:` or `:badseq_extra:` cannot match
+                        # (the second `:` would require `badseq` followed
+                        # by `:`). The other two patterns target
+                        # `:badseq_increment=<N>:` / `:badseq_ack_increment=<N>:`
+                        # explicitly, with no ambiguity.
+                        *:badseq:*|*:badseq_increment=*|*:badseq_ack_increment=*)
+                            token=<REDACTED>
+                                BEGIN { FS = ":"; OFS = ":"; DEF_SEQ = -10000; DEF_ACK = -66000 }
+                                {
+                                    has = 0
+                                    seq_set = 0; seq_val = DEF_SEQ
+                                    ack_set = 0; ack_val = DEF_ACK
+                                    ex_seq = 0; ex_ack = 0
+                                    out = ""
+                                    for (i = 1; i <= NF; i++) {
+                                        p = $i
+                                        if (p == "badseq") { has = 1; continue }
+                                        if (index(p, "badseq_increment=") == 1) {
+                                            has = 1; seq_set = 1
+                                            seq_val = substr(p, length("badseq_increment=") + 1)
+                                            continue
+                                        }
+                                        if (index(p, "badseq_ack_increment=") == 1) {
+                                            has = 1; ack_set = 1
+                                            ack_val = substr(p, length("badseq_ack_increment=") + 1)
+                                            continue
+                                        }
+                                        if (index(p, "tcp_seq=") == 1) ex_seq = 1
+                                        if (index(p, "tcp_ack=") == 1) ex_ack = 1
+                                        out = (out == "" ? p : out ":" p)
+                                    }
+                                    if (has) {
+                                        if (!ex_seq) out = out ":tcp_seq=" seq_val
+                                        if (!ex_ack) out = out ":tcp_ack=" ack_val
+                                    }
+                                    print out
+                                }
+                            ')
+                            ;;
+                    esac
+                    ;;
+            esac
+            out="${out:+$out }$token"
+        done
+        set +f
+        printf '%s' "$out"
+    }
+
+    rkn_tcp=$(expand_badseq_aliases "$rkn_tcp")
+    youtube_tcp=$(expand_badseq_aliases "$youtube_tcp")
+    youtube_gv_tcp=$(expand_badseq_aliases "$youtube_gv_tcp")
+
+    # Phase 14b: strip dead :out_range=*: / :in_range=*: tokens from
+    # inside --lua-desync=... args.
+    #
+    # These live as CLI-level in-profile filters (--out-range / --in-range
+    # per docs/manual.en.md:696, nfqws.c:2147-2148), NOT as per-strategy
+    # Lua args. When someone writes `:out_range=-n2:` inside a lua-desync
+    # token (a common mistake copied from bol-van syntax where
+    # --dpi-desync-cutoff=n2 lives on the command line), the Lua arg
+    # parser happily stores it in desync.arg.out_range and no Lua
+    # function ever reads it — silent no-op. blockcheck-generated
+    # Strategy.txt files from older z2k versions are full of these
+    # tokens, and they clutter the generated NFQWS2_OPT without
+    # doing anything. This preprocessor scrubs them.
+    #
+    # Applied to every strategy string that might have been hand-edited
+    # or imported from older Strategy.txt blockcheck output.
+    strip_dead_range_args() {
+        local input="$1"
+        local token=""
+        local out=""
+        set -f  # no glob: $input tokens may contain *,?,[ ] from hand-edited Strategy.txt
+        for token in $input; do
+            case "$token" in
+                --lua-desync=*)
+                    case "$token" in
+                        *:out_range=*|*:in_range=*)
+                            token=<REDACTED>
+                                BEGIN { FS = ":"; OFS = ":" }
+                                {
+                                    out = ""
+                                    for (i = 1; i <= NF; i++) {
+                                        p = $i
+                                        if (index(p, "out_range=") == 1) continue
+                                        if (index(p, "in_range=") == 1) continue
+                                        out = (out == "" ? p : out ":" p)
+                                    }
+                                    print out
+                                }
+                            ')
+                            ;;
+                    esac
+                    ;;
+            esac
+            out="${out:+$out }$token"
+        done
+        set +f
+        printf '%s' "$out"
+    }
+
+    rkn_tcp=$(strip_dead_range_args "$rkn_tcp")
+    youtube_tcp=$(strip_dead_range_args "$youtube_tcp")
+    youtube_gv_tcp=$(strip_dead_range_args "$youtube_gv_tcp")
+    quic_udp=$(strip_dead_range_args "$quic_udp")
+
+    # z2k_dynamic_strategy slot removed in r-15 Phase 1 (
+    # detection stack cleanup). The slot existed only to be filled by
+    # the z2k-classify generator, which produced the
+    # /opt/zapret2/lists/z2k-classify-*.tsv DBs and
+    # /tmp/z2k-classify-dynparams transient params. classify is gone,
+    # producer DBs are not written by anyone, and the handler quietly
+    # no-op'd every flow. The experimental discovery daemon is also retired.
+
+    discord_udp=$(strip_dead_range_args "$discord_udp")
+
+    # Phase 3 helper: rebase every `:strategy=N` inside a strategy string
+    # by a fixed offset. Used to shift GV strategies (1..22) to (23..44)
+    # so they don't collide with youtube_tcp's 1..22 when the two
+    # profiles are merged into google_tls. Not applied unconditionally —
+    # only invoked inside the Phase 3 emit guard.
+    rebase_strategy_ids() {
+        local input="$1"
+        local offset="$2"
+        # Consume $0 by moving past each rewritten `:strategy=N` — naïve
+        # `while match` loops forever because the new (N+off) value is
+        # itself a :strategy=[0-9]+ match at the same position.
+        printf '%s' "$input" | awk -v off="$offset" '
+            {
+                result = ""
+                # Match :strategy=<int> with optional leading whitespace
+                # and optional sign so future Strategy.txt formats
+                # (negative IDs, indented keys) survive a rebase.
+                while (match($0, /:strategy=[[:space:]]*-?[0-9]+/)) {
+                    result = result substr($0, 1, RSTART - 1)
+                    raw = substr($0, RSTART + 10, RLENGTH - 10)
+                    gsub(/[[:space:]]/, "", raw)
+                    sid = (raw + 0) + off
+                    result = result ":strategy=" sid
+                    $0 = substr($0, RSTART + RLENGTH)
+                }
+                result = result $0
+                print result
+            }'
+    }
+
+    # Phase 7: convert fixed `repeats=N` on fake-family actions to the
+    # range syntax `repeats=max(1,N-2)-(N+2)`. The z2k-range-rand.lua
+    # wrapper picks a sticky random integer per flow from this range,
+    # breaking per-flow DPI fingerprints that hash on fake-packet count.
+    # Midpoint matches the original value, so average behaviour is
+    # unchanged and there's no performance hit.
+    #
+    # Idempotency: awk регексп `^repeats=[0-9]+$` строго точечный —
+    # part'ы вида `repeats=N-M` (уже диапазон) не матчатся, проходят
+    # через awk без изменений. Этот же регексп служит фильтром на
+    # пользовательские хитрости вроде `repeats=4-8` — мы их не трогаем.
+    #
+    # 2026-05-01 fix: убран outer glob `case "$token" in *:repeats=*-*) : ;;`
+    # — он давал false-positive на любом токене где после `:repeats=N`
+    # встречался `-` (например `tcp_ts=-1000`, `tcp_seq=-66000`,
+    # `ip_autottl=-2,3-20`). Из-за этого 39 fake-токенов с tcp_ts
+    # никогда не получали randomization — TSPU видела предсказуемый
+    # repeat count для fingerprint'а. awk внутри сам корректно
+    # идемпотентен на per-part уровне, outer глоб был избыточен и багован.
+    inject_z2k_range_rand() {
+        local input="$1"
+        local token=""
+        local out=""
+        set -f  # no glob: $input tokens may contain *,?,[ ] from hand-edited Strategy.txt
+        for token in $input; do
+            case "$token" in
+                --lua-desync=fake:*|\
+                --lua-desync=fakedsplit:*|\
+                --lua-desync=fakeddisorder:*|\
+                --lua-desync=hostfakesplit:*|\
+                --lua-desync=syndata:*)
+                    # Плечи референсного набора (ip_id=zero) — без диапазона:
+                    # число фейков у них задано первоисточником.
+                    case "$token" in
+                        *:ip_id=zero*) out="${out:+$out }$token"; continue ;;
+                    esac
+                    case "$token" in
+                        *:repeats=*)
+                            token=<REDACTED>
+                                {
+                                    n = split($0, parts, ":")
+                                    for (i = 1; i <= n; i++) {
+                                        if (parts[i] ~ /^repeats=[0-9]+$/) {
+                                            v = substr(parts[i], 9) + 0
+                                            lo = (v - 2 < 1) ? 1 : v - 2
+                                            hi = v + 2
+                                            parts[i] = "repeats=" lo "-" hi
+                                        }
+                                    }
+                                    out = parts[1]
+                                    for (i = 2; i <= n; i++) out = out ":" parts[i]
+                                    print out
+                                }
+                            ')
+                            ;;
+                    esac
+                    ;;
+            esac
+            out="${out:+$out }$token"
+        done
+        set +f
+        printf '%s' "$out"
+    }
+
+    # rkn_tcp — нет: число повторов референсного плеча меняет его пакеты.
+    youtube_tcp=$(inject_z2k_range_rand "$youtube_tcp")
+    youtube_gv_tcp=$(inject_z2k_range_rand "$youtube_gv_tcp")
+
+
+    # Let YouTube TLS circular operate exactly as in the upstream manual.
+    # For LG webOS the orchestrator must see incoming packets on the circular
+    # stage itself (`--in-range=-sN`), while actual desync instances must
+    # still stay limited by `--payload=tls_client_hello...`.
+    #
+    # This requires moving the top-level `--payload=` after circular and
+    # closing the incoming window right after circular with `--in-range=x`.
+    # Keeping payload before circular makes YouTube TCP/GV fail detection too
+    # blind and prevents real sequential rotation on TV clients.
+    #
+    # $2 is the byte cap for the inserted `--in-range=-sN`; default 5556
+    # matches the master-compatible layout. rkn_tcp passes 20000 when the
+    # mid-stream-detector bundle flag is on, so its lua failure_detector
+    # can observe the [8K, 18K] CF stall window.
+    ensure_youtube_tls_circular_manual_layout() {
+        local input="$1"
+        local in_range_bytes="${2:-5556}"
+        local token=""
+        local has_tls="0"
+        local has_circular="0"
+        local has_in_range=""
+        local before_circular=""
+        local circular_token=""
+        local after_circular=""
+        local saved_payload=""
+        local phase="before"
+
+        set -f  # no glob: $input tokens may contain *,?,[ ] from hand-edited Strategy.txt
+        for token in $input; do
+            case "$token" in
+                # tls ИЛИ tls с довесками: пул видео ходит с
+                # --filter-l7=tls,unknown, чтобы забирать соединения без SNI.
+                # Жёсткое сравнение здесь означало, что раскладка с --in-range
+                # молча не применялась и окно наблюдения оставалось пустым.
+                --filter-l7=tls|--filter-l7=tls,*) has_tls="1" ;;
+                --lua-desync=circular:*) has_circular="1" ;;
+                --in-range=*) has_in_range="1" ;;
+            esac
+        done
+        set +f
+
+        if [ "$has_tls" != "1" ] || [ "$has_circular" != "1" ]; then
+            printf '%s' "$input"
+            return 0
+        fi
+
+        # If a profile already has an explicit in-range, leave it alone.
+        [ -n "$has_in_range" ] && {
+            printf '%s' "$input"
+            return 0
+        }
+
+        set -f  # no glob: $input tokens may contain *,?,[ ] from hand-edited Strategy.txt
+        for token in $input; do
+            case "$phase" in
+                before)
+                    case "$token" in
+                        --payload=*)
+                            saved_payload="$token"
+                            ;;
+                        --lua-desync=circular:*)
+                            circular_token="$token"
+                            phase="after"
+                            ;;
+                        *)
+                            before_circular="${before_circular:+$before_circular }$token"
+                            ;;
+                    esac
+                    ;;
+                after)
+                    after_circular="${after_circular:+$after_circular }$token"
+                    ;;
+            esac
+        done
+        set +f
+
+        [ -z "$circular_token" ] && {
+            printf '%s' "$input"
+            return 0
+        }
+
+        # Fallback for malformed legacy inputs with no payload token.
+        [ -z "$saved_payload" ] && saved_payload="--payload=tls_client_hello"
+
+        printf '%s --in-range=-s%s %s --in-range=x %s%s%s' \
+            "$before_circular" \
+            "$in_range_bytes" \
+            "$circular_token" \
+            "$saved_payload" \
+            "${after_circular:+ }" \
+            "$after_circular"
+    }
+
+    # YouTube TCP on LG webOS often fails as a silent TCP blackhole:
+    # repeated ClientHello attempts with no visible response_state/success_state.
+    # Manual payload reordering alone is not sufficient in that mode.
+    #
+    # Conservative TCP failure path:
+    # - expose incoming packets to circular via --in-range=-sN
+    # - expose empty packets / retrans context via --payload=tls_client_hello,empty
+    # - keep desync strategy instances restricted to the original TLS payload
+    # - prevent successes from other devices on the same domain from resetting
+    #   failure counters via success_detector=z2k_success_no_reset
+    #
+    # Используется только youtube_tcp. Тумблер RKN_SILENT_FALLBACK, водивший
+    # сюда же rkn_tcp, снят 2026-08-17: замер генератора показал, что вся его
+    # разница — добавленный `--payload=tls_client_hello,empty` перед circular,
+    # тогда как в дефолтном пути payload переносится ЗА circular и тот идёт с
+    # `--payload=all` (дефолт движка). all ⊃ {tls_client_hello, empty}, то есть
+    # тумблер обзор не расширял, а сужал. Детектор z2k_silent_drop_detector,
+    # ради которого он назывался silent, в конфиг не попадал ни при ON, ни при
+    # OFF: его срезал проход, включённый по умолчанию. С 2026-08-26 нет ни
+    # детектора, ни прохода — файл z2k-detectors.lua удалён как недостижимый.
+    #
+    # $2 is the byte cap for the inserted `--in-range=-sN`; default 5556
+    # matches the master-compatible layout that youtube_tcp keeps.
+    ensure_youtube_tls_failure_detection() {
+        local input="$1"
+        local in_range_bytes="${2:-5556}"
+        local token=""
+        local has_tls="0"
+        local has_circular="0"
+        local has_in_range=""
+        local saved_payload=""
+        local out=""
+        local circular_seen="0"
+
+        for token in $input; do
+            case "$token" in
+                # tls ИЛИ tls с довесками: пул видео ходит с
+                # --filter-l7=tls,unknown, чтобы забирать соединения без SNI.
+                # Жёсткое сравнение здесь означало, что раскладка с --in-range
+                # молча не применялась и окно наблюдения оставалось пустым.
+                --filter-l7=tls|--filter-l7=tls,*) has_tls="1" ;;
+                --lua-desync=circular:*) has_circular="1" ;;
+                --in-range=*) has_in_range="1" ;;
+            esac
+        done
+
+        if [ "$has_tls" != "1" ] || [ "$has_circular" != "1" ]; then
+            printf '%s' "$input"
+            return 0
+        fi
+
+        # If a profile already has an explicit in-range, leave it alone.
+        [ -n "$has_in_range" ] && {
+            printf '%s' "$input"
+            return 0
+        }
+
+        [ -z "$saved_payload" ] && saved_payload="--payload=tls_client_hello"
+
+        for token in $input; do
+            case "$token" in
+                --payload=*)
+                    saved_payload="$token"
+                    token=<REDACTED>
+                    ;;
+                --lua-desync=circular:*)
+                    out="${out:+$out }--in-range=-s${in_range_bytes}"
+                    # native rollback 2026-05-28: НЕ инжектим success_detector=z2k_*
+                    # — нативный circular использует standard_success_detector по
+                    # умолчанию. Layout (in-range/payload-gate) сохраняется.
+                    circular_seen="1"
+                    ;;
+            esac
+
+            if [ "$circular_seen" = "1" ]; then
+                case "$token" in
+                    --lua-desync=circular:*) ;;
+                    --lua-desync=*)
+                        out="${out:+$out }--in-range=x $saved_payload"
+                        circular_seen="2"
+                        ;;
+                esac
+            fi
+
+            out="${out:+$out }$token"
+        done
+
+        printf '%s' "$out"
+    }
+
+    # circular должен видеть данные обоих направлений, включая продолжения
+    # ClientHello и ответа с l7payload=unknown. Фильтры самих стратегий остаются.
+    youtube_tcp=$(ensure_youtube_tls_circular_manual_layout "$youtube_tcp" "5556")
+    youtube_gv_tcp=$(ensure_youtube_tls_circular_manual_layout "$youtube_gv_tcp" "5556")
+
+    # Окно входящих у всех TCP-пулов одно и берётся из документации: circular
+    # «требует начальные входящие пакеты потока… детектор успеха реагирует на
+    # s4096, добавлен ещё 1 пакет макс 1460 байт» → -s5556. Прежние 19500/26000
+    # кормили сторож обрыва на 16 КБ, которого больше нет.
+    local rkn_in_range_bytes="5556"
+    rkn_tcp=$(ensure_youtube_tls_circular_manual_layout "$rkn_tcp" "$rkn_in_range_bytes")
+
+    # Окно входящих обязано быть выше порога inseq — второй проход.
+    #
+    # Инвариант заведён выше (ensure_circular_in_range, вызовы у объявления
+    # порогов). Тот проход правит только УЖЕ существующий в стратегии токен
+    # `--in-range=-sN`, а в дефолтной поставке его там нет вовсе: окно
+    # вставляют раскладчики (ensure_youtube_tls_*) ниже по коду, и вставляют
+    # константу, ничего не зная про inseq. Гейт оказывался позади события,
+    # которое сторожит.
+    #
+    # Замерено на боевом роутере 2026-08-17 (конфиг сгенерирован кодом, где
+    # первый проход уже был):
+    #   rkn_tcp  --in-range=-s20000  inseq=26000  -> полоса пуста
+    #   yt_tcp   --in-range=-s5556   inseq=18000  -> полоса пуста
+    #   gv_tcp   --in-range=-s26000  inseq=24000  -> ок (константа совпала)
+    #
+    # Прогон после раскладчиков чинит все три разом и держит единственный
+    # источник правды — сам ensure_circular_in_range с его запасом 1500.
+    youtube_tcp=$(ensure_circular_in_range "$youtube_tcp")
+    youtube_gv_tcp=$(ensure_circular_in_range "$youtube_gv_tcp")
+    rkn_tcp=$(ensure_circular_in_range "$rkn_tcp")
+
+    # ---- Поправки к штатному детектору (files/lua/z2k-alert.lua) -------------
+    #
+    # ПОРЯДОК ЗНАЧИМ: проводка идёт ПОСЛЕ всех правок профилей. Выше по файлу
+    # ensure_circular_doc_args вырезает из circular любой failure_detector= и
+    # success_detector= (чтобы ручной Strategy.txt не довёз до движка имя
+    # функции, которой нет на диске), и проводка, поставленная раньше, была бы
+    # им же и съедена — молча.
+    #
+    # Обёртка использует штатные RST/ретрансмиссии и добавляет разбор раннего
+    # TLS alert и HTTP-заглушек. TTL, соседние потоки и входящие повторы не
+    # считаются доказательством успеха/блокировки. Привязка к стратегии и
+    # поколению, терминальные исходы и reset принадлежат ядру circular.
+    #
+    # Проводка ставится ТОЛЬКО если файл лежит на диске: движок резолвит имя
+    # детектора по _G и на неизвестном валится в error() НА КАЖДОМ ПАКЕТЕ
+    # профиля. Это не «детектор не работает», это профиль-пустышка при зелёном
+    # статусе службы.
+    ensure_rkn_failure_detector() {
+        local input="$1"
+        # Имя детектора обязательно: умолчания здесь нет намеренно, чтобы
+        # опечатка не превратилась в тихую проводку несуществующего имени.
+        local detector_name="${2:?ensure_rkn_failure_detector: имя детектора обязательно}"
+        local out=""
+        local token=""
+        for token in $input; do
+            case "$token" in
+                --lua-desync=circular:*)
+                    case "$token" in
+                        *failure_detector=*) ;;
+                        *) token="${token}:failure_detector=${detector_name}" ;;
+                    esac
+                    ;;
+            esac
+            out="${out:+$out }$token"
+        done
+        printf '%s' "$out"
+    }
+
+    if [ -f "${ZAPRET2_DIR:-/opt/zapret2}/lua/z2k-alert.lua" ]; then
+        local discord_tls_detector="z2k_fail_tls_alert"
+        if [ "$(safe_config_read "Z2K_DISCORD_UPDATE_TLS_TIMEOUT" "${ZAPRET2_DIR:-/opt/zapret2}/config" "1")" = "1" ]; then
+            discord_tls_detector="${discord_tls_detector}:discord_tls_timeout=1:discord_tls_in_limit=$(z2k_reply_pkt_cap):discord_tls_out_limit=20"
+        fi
+        rkn_tcp=$(ensure_rkn_failure_detector "$rkn_tcp" "$discord_tls_detector")
+        youtube_tcp=$(ensure_rkn_failure_detector "$youtube_tcp" "z2k_fail_tls_alert")
+        youtube_gv_tcp=$(ensure_rkn_failure_detector "$youtube_gv_tcp" "z2k_fail_tls_alert")
+    else
+        echo "WARN: lua/z2k-alert.lua отсутствует — детекторы остаются чисто штатными" 1>&2
+    fi
+
+    # QUIC v1/v2: таймер прогресса рукопожатия, общий предел ожидания и
+    # нейтральный исход при исчерпании окна перехвата. Пределы передаём из
+    # тех же констант, которыми ниже настраивается NFQUEUE.
+    if [ -f "${ZAPRET2_DIR:-/opt/zapret2}/lua/z2k-quic-silence.lua" ]; then
+        quic_udp=$(ensure_rkn_failure_detector "$quic_udp" "z2k_fail_quic_silence:quic_in_limit=${Z2K_UDP_PKT_IN}:quic_out_limit=${Z2K_UDP_PKT_OUT}")
+    else
+        echo "WARN: lua/z2k-quic-silence.lua отсутствует — QUIC остаётся на штатном детекторе" 1>&2
+    fi
+
+    # Генерировать NFQWS2_OPT в формате официального config
+    local nfqws2_opt_lines=""
+
+    # Helper: проверить наличие и непустоту hostlist-файлов
+    add_hostlist_line() {
+        local list_path="$1"
+        shift
+        case "$list_path" in
+            */TCP/YT/List.txt|*/TCP/YT_GV/List.txt) [ "$category_youtube" != 0 ] || return 0 ;;
+            */TCP/RKN/List.txt|*/TCP_Discord.txt) [ "$category_rkn" != 0 ] || return 0 ;;
+        esac
+        if [ -s "$list_path" ]; then
+            nfqws2_opt_lines="$nfqws2_opt_lines$*\\n"
+        else
+            echo "WARN: hostlist file missing or empty: $list_path (skip profile)" 1>&2
+            print_warning "Hostlist missing or empty: $list_path — profile skipped"
+        fi
+    }
+
+
+    # Общее для профилей объявляем ОДИН раз.
+    #
+    # Исключения по whitelist повторялись восемью литералами в восьми строках,
+    # а РКН-триада хостлистов собиралась двумя независимыми блоками кода — и
+    # они уже разъехались: TCP_Discord.txt попал только в один из них. Любое
+    # изменение общего условия требовало правки во всех местах сразу, и
+    # промах был бы виден не в тестах, а у людей.
+    local wl_excl="--hostlist-exclude=${lists_dir}/whitelist.txt"
+    # Keep disabled YouTube out of broad RKN/auto lists as well.
+    if [ "$category_youtube" = 0 ]; then
+        local excluded
+        for excluded in "$extra_strats_dir/TCP/YT/List.txt" "$extra_strats_dir/TCP/YT_GV/List.txt" "$extra_strats_dir/UDP/YT/List.txt"; do
+            [ ! -s "$excluded" ] || wl_excl="$wl_excl --hostlist-exclude=$excluded"
+        done
+    fi
+
+
+    # --------------------------------------------------------------------------
+    # ШАБЛОН ДВИЖКА: арсенал РКН объявляется один раз
+    # --------------------------------------------------------------------------
+    #
+    # Keep the established template/flat contract for the RKN arsenal.
+    # The former second consumer (cf_extra) has been retired.
+    #
+    # Движок умеет объявить набор один раз (--template=имя) и подставить его в
+    # профиль (--import=имя). Правила слияния (проверены прогоном движка):
+    #   • инстансы шаблона ДОПИСЫВАЮТСЯ в хвост списка профиля — поэтому
+    #     circular обязан быть объявлен ДО --import, иначе оркестратор не
+    #     увидит ни одной своей стратегии (план строится только из инстансов,
+    #     идущих ПОСЛЕ него) и упадёт;
+    #   • --payload/--in-range/--out-range — это состояние разборщика, оно
+    #     снимается в момент объявления инстанса и переезжает вместе с ним;
+    #     поэтому в шаблон переносится и состояние из головы профиля;
+    #   • шаблон обязан быть объявлен РАНЬШЕ первого --import: ссылка вперёд
+    #     не работает, движок падает с «template not found».
+    #
+    # Аварийный выключатель: Z2K_NFQWS2_TEMPLATES=0 возвращает прежнюю плоскую
+    # сборку. Пробу бинарника не делаем: --template/--import есть во всех
+    # сборках движка, которые z2k когда-либо ставил (проверено strings по
+    # релизным бинарникам и по тегам форка), а лишний запуск движка на каждую
+    # генерацию конфига — это ещё один fork+exec на каждый щелчок тумблера.
+    local z2k_templates rkn_tpl rkn_head rkn_circ rkn_tail rkn_tpl_line=""
+    z2k_templates=$(safe_config_read "Z2K_NFQWS2_TEMPLATES" "${ZAPRET2_DIR:-/opt/zapret2}/config" "1")
+    rkn_tpl="z2k_rkn_arsenal"
+    rkn_head=""; rkn_circ=""; rkn_tail=""
+    if [ "$z2k_templates" != "0" ] && [ -n "$rkn_tcp" ]; then
+        local _t _state=""
+        for _t in $rkn_tcp; do
+            case "$_t" in
+                --lua-desync=circular:*)
+                    if [ -z "$rkn_circ" ]; then rkn_circ="$_t"; continue; fi
+                    ;;
+            esac
+            if [ -z "$rkn_circ" ]; then
+                rkn_head="${rkn_head:+$rkn_head }$_t"
+                # Состояние разборщика из головы действует и на инстансы,
+                # уезжающие в шаблон. Не перенести его — значит отдать им
+                # дефолтные диапазоны вместо -s34228.
+                case "$_t" in
+                    --payload=*|--in-range=*|--out-range=*) _state="${_state:+$_state }$_t" ;;
+                esac
+            else
+                rkn_tail="${rkn_tail:+$rkn_tail }$_t"
+            fi
+        done
+        if [ -n "$rkn_circ" ] && [ -n "$rkn_tail" ]; then
+            rkn_tpl_line="--template=$rkn_tpl${_state:+ $_state} $rkn_tail --new"
+        else
+            # Пул без circular (или без стратегий после него) шаблоном не
+            # выражается — собираем как раньше.
+            rkn_head=""; rkn_circ=""; rkn_tail=""
+        fi
+    fi
+
+    # Хостлисты РКН-домена собираются ОДИН раз на два профиля — TLS (443) и
+    # HTTP (80). Раньше их собирали два независимых блока кода, и они уже
+    # разошлись: Discord-список попал только в первый. Теперь расхождение
+    # выражено явно — общая часть в одной переменной, отличие ровно одно и
+    # прокомментировано.
+    local rkn_lists_head="--hostlist=${extra_strats_dir}/TCP/RKN/List.txt"
+    local rkn_lists_tail=""
+    # Shipped extras curated on top of runetfreedom RKN — domains users
+    # reported missing (fast-torrent.ru etc). Refreshed on every install.
+    [ -s "${lists_dir}/extra-domains.txt" ] && rkn_lists_tail="$rkn_lists_tail --hostlist=${lists_dir}/extra-domains.txt"
+    # Автохостлист (Z2K_AUTOHOSTLIST=1): домены, которые движок нашёл сам,
+    # подхватываются ЭТИМИ профилями — со всем арсеналом и ротацией РКН.
+    # Профиль-детектор (в хвосте, см. ниже) только НАХОДИТ и дописывает имя в
+    # файл; обходит уже rkn_tcp, потому что файл объявлен здесь обычным
+    # хостлистом. Движок перечитывает списки по mtime, то есть обход для
+    # найденного домена включается через секунды и без рестарта.
+    local z2k_autohostlist autohostlist_file
+    z2k_autohostlist=$(safe_config_read "Z2K_AUTOHOSTLIST" "${ZAPRET2_DIR:-/opt/zapret2}/config" "0")
+    autohostlist_file="${ZAPRET2_DIR:-/opt/zapret2}/ipset/zapret-hosts-auto.txt"
+    if [ "$z2k_autohostlist" = "1" ] && [ "$category_rkn" != 0 ]; then
+        # Файл обязан существовать К МОМЕНТУ СТАРТА демона: путь объявлен в
+        # аргументах, а движок резолвит его при разборе и без файла не
+        # стартует вовсе — это была бы не «автолист не работает», а «обход не
+        # поднялся». Создаём здесь же, где объявляем, чтобы порядок вызовов в
+        # init-скрипте не был единственной гарантией.
+        mkdir -p "${ZAPRET2_DIR:-/opt/zapret2}/ipset" 2>/dev/null
+        [ -e "$autohostlist_file" ] || : > "$autohostlist_file"
+        rkn_lists_tail="$rkn_lists_tail --hostlist=${autohostlist_file}"
+    fi
+    # Единственное отличие TLS-профиля: Discord-домены живут на 443 и на 80-м
+    # порту не встречаются.
+    local rkn_hostlists="$rkn_lists_head"
+    [ -s "${extra_strats_dir}/TCP_Discord.txt" ] && rkn_hostlists="$rkn_hostlists --hostlist=${extra_strats_dir}/TCP_Discord.txt"
+    rkn_hostlists="$rkn_hostlists$rkn_lists_tail"
+    # Независимый обход объёмного блока. Имя берётся из измеренной карты,
+    # компактный отправитель ограничивает окончательный пакет бюджетом MSS.
+    # Плечи пула не меняются, собранный ClientHello в фейк не копируется.
+    local Z2K_SNI_STALL sni_pick="" _sp_circ="" _t2
+    Z2K_SNI_STALL=$(safe_config_read "Z2K_SNI_STALL" "${ZAPRET2_DIR:-/opt/zapret2}/config" "1")
+    if [ -n "$rkn_circ" ]; then
+        _sp_circ="$rkn_circ"
+    else
+        for _t2 in $rkn_tcp; do
+            case "$_t2" in --lua-desync=circular:*) _sp_circ="$_t2"; break ;; esac
+        done
+    fi
+    local _sp_flag=""
+    [ -r "${ZAPRET2_DIR:-/opt/zapret2}/state/tcp16.flag" ] &&
+        _sp_flag=$(cat "${ZAPRET2_DIR:-/opt/zapret2}/state/tcp16.flag" 2>/dev/null)
+    if [ "$Z2K_SNI_STALL" = "1" ] && [ "$_sp_flag" = "1" ] && [ -n "$_sp_circ" ] \
+       && [ -f "${ZAPRET2_DIR:-/opt/zapret2}/lua/z2k-tcp16.lua" ]; then
+        sni_pick="--lua-desync=z2k_sni_fake:payload=tls_client_hello:dir=out:repeats=8:tcp_ts=-1000:tcp_md5"
+    fi
+
+    if [ -n "$rkn_circ" ]; then
+        add_hostlist_line "${extra_strats_dir}/TCP/RKN/List.txt" \
+            "$wl_excl $rkn_hostlists $rkn_head $sni_pick $rkn_circ --import=$rkn_tpl --new"
+    else
+        # Плоская форма: тот же блок ставим перед первым circular. Позиция
+        # обязательна — инстанс без strategy=N исполняет линейный оркестратор,
+        # а он до аргументов ЗА ротатором не доходит.
+        local rkn_flat="" _sp_done=0
+        for _t2 in $rkn_tcp; do
+            case "$_t2" in
+                --lua-desync=circular:*)
+                    if [ "$_sp_done" = "0" ] && [ -n "$sni_pick" ]; then
+                        rkn_flat="${rkn_flat:+$rkn_flat }$sni_pick"
+                        _sp_done=1
+                    fi
+                    ;;
+            esac
+            rkn_flat="${rkn_flat:+$rkn_flat }$_t2"
+        done
+        add_hostlist_line "${extra_strats_dir}/TCP/RKN/List.txt" "$wl_excl $rkn_hostlists $rkn_flat --new"
+    fi
+
+    # cdn_tls профиль удалён 2026-04-27. Был добавлен в Variant A refactor
+    # (b7f7ae6) для перехвата non-RKN CF/OVH/Hetzner/DO трафика, но на field
+    # ломал то что и так работало через rkn_tcp (47-стратегий rotator
+    # из Strategy.txt пробивал CF лучше чем 8 curated cdn_tls strategies).
+    # CF возвращается под rkn_tcp как было до Variant A.
+
+    # Retired cf_extra: subnet-wide interception must not bypass domain lists.
+    # Legacy Z2K_CF_EXTRA_CHECK values are intentionally ignored. TCP16 uses
+    # the measured-line gate and z2k_sni_pick above, independently of this.
+
+    # Проверка DPI отдельным соединением перед настоящим (lua/z2k-preflight.lua).
+    #
+    # Зачем отдельный шаг. С конца октября 2026 часть зарубежных адресов
+    # googlevideo режется ПО ОТВЕТУ СЕРВЕРА: соединение встаёт, ClientHello
+    # уходит, ServerHello не приходит. Плечи тут бессильны — подделывать и
+    # расщеплять нечего, DPI смотрит не на запрос клиента. Движок проходит
+    # проверку своим соединением и отдаёт клиенту чистое; плечи остаются на
+    # своих местах и работают после передачи, потому что блок по ИМЕНИ
+    # (например play.google.com) шаг не снимает.
+    #
+    # Значения — те, с которыми шаг прошёл проверку на живой линии 06–07.11.2026
+    # (19 из 19 соединений с ответом сервера, медиана передачи клиенту 0,42 с).
+    # На одной линии: подбор на других не проводился.
+    #
+    # Шаг ставится ПЕРВЫМ инстансом профиля и ДО его позиционных --in-range/
+    # --out-range: своего окна перехвата (a/a — весь поток) ему нужно ровно на
+    # время пробы, а дальше идут родные диапазоны пула, и ротатор с плечами
+    # получает их неизменными.
+    inject_z2k_preflight() {
+        local _t _out="" _done=0
+        # Выключатель или отсутствующий файл: строка профиля остаётся ровно
+        # такой, какой была до появления шага.
+        [ -n "$Z2K_PREFLIGHT_STEP" ] || { printf '%s' "$1"; return 0; }
+        set -f
+        for _t in $1; do
+            if [ "$_done" = "0" ]; then
+                case "$_t" in
+                    --in-range=*|--out-range=*|--payload=*|--lua-desync=*)
+                        _out="${_out:+$_out }$Z2K_PREFLIGHT_STEP"
+                        _done=1
+                        ;;
+                esac
+            fi
+            _out="${_out:+$_out }$_t"
+        done
+        set +f
+        # Профиль без единого позиционного аргумента: шаг всё равно обязан
+        # попасть в строку, иначе выключатель включён, а механизма нет.
+        [ "$_done" = "1" ] || _out="${_out:+$_out }$Z2K_PREFLIGHT_STEP"
+        printf '%s' "$_out"
+    }
+    local Z2K_GV_SERVER_REPLY2 Z2K_PREFLIGHT_STEP=""
+    Z2K_GV_SERVER_REPLY2=$(safe_config_read "Z2K_GV_SERVER_REPLY2" "${ZAPRET2_DIR:-/opt/zapret2}/config" "1")
+    # Файл проверяем на существование так же, как у z2k_sni_pick: инстанс,
+    # чьей функции нет в движке, валит его в error() на каждом пакете профиля.
+    if [ "$Z2K_GV_SERVER_REPLY2" = "1" ] \
+       && [ -f "${ZAPRET2_DIR:-/opt/zapret2}/lua/z2k-preflight.lua" ]; then
+        # v6 — шаг и на IPv6. init снимает его при старте, если увидит NAT
+        # для IPv6 (S99zapret2, z2k_preflight_v6_gate): за NAT повторный SYN
+        # ушёл бы с внутренним адресом.
+        # Обрыв начала в 58983 был на разрезанной пробе; посылаем ClientHello целиком.
+        Z2K_PREFLIGHT_STEP="--in-range=a --out-range=a --payload=all --lua-desync=z2k_preflight:pos=none:pieces=1:keepts:sni=www.google.com:timeout=4:v6"
+    fi
+
+    # DNS addresses identify Google video/Play in either profile layout.
+    local gv_ip_tcp
+    gv_ip_tcp=$(inject_z2k_preflight "$youtube_gv_tcp")
+        # Тот же профиль по адресам из ответов DNS (служба DNS-наблюдения пишет их в
+        # файл до того, как отпустить ответ; движок перечитывает файл сам).
+        # Имя хоста движок узнаёт только из самого соединения, и первое
+        # соединение к новому адресу шло мимо профиля — без пробы: плохой
+        # сервер молчал, браузер ждал ~2,5 с и уходил на другой (Safari,
+        # шортс 11,8 с, 10.11.2026). Стоит ПЕРЕД профилем по списку имён.
+        # Без $wl_excl: любой hostlist, включая exclude, при неизвестном
+        # имени отвергает профиль до IpsetCheck (nfq2/desync.c:269).
+        # При сохранённом IP повторный поиск на ClientHello снова выбирает A:
+        # whitelist профиля B его не исключит. Поэтому gvsub проверяет whitelist
+        # по имени DNS-вопроса до публикации IP. Уже опубликованные
+        # адреса сохраняются до перезагрузки: удаление может оборвать пробу A.
+        # Новый whitelist не отменяет их охват A (в том числе при общих IP).
+        if [ -n "$Z2K_PREFLIGHT_STEP" ]; then
+            # validate-config идёт ДО S99 start, а после reboot /tmp пуст.
+            # Подготовить файл при самой генерации, до публикации --ipset.
+            local Z2K_GVSUB_IPS="${Z2K_GVSUB_IPS:-/tmp/z2k-gv-ips.txt}"
+            z2k_gvsub_ensure_ipfile
+            if [ -f "$Z2K_GVSUB_IPS" ] && [ -s "$Z2K_GVSUB_IPS" ] && [ -r "$Z2K_GVSUB_IPS" ]; then
+                add_hostlist_line "${extra_strats_dir}/TCP/YT_GV/List.txt" "--ipset=$Z2K_GVSUB_IPS $gv_ip_tcp --new"
+            else
+                # Как в 815603e9: ошибка /tmp не убивает генерацию. Профиль
+                # по hostlist ниже остаётся; не публикуем нерабочий ipset.
+                echo "WARNING: cannot prepare gvsub ipset $Z2K_GVSUB_IPS; skipping IP profile" >&2
+            fi
+        fi
+    # Phase 3 merge: YouTube + googlevideo collapsed to a single google_tls
+    # profile. Hostlist triggers OR — hostlist=YT/List.txt ∪ hostlist-domains=
+    # googlevideo.com (confirmed by hostlist.c:262-281). Circular pins per-SLD
+    # thanks to nld=2, so youtube.com and googlevideo.com maintain independent
+    # strategy picks even though they share the key=google_tls state.
+    # GV strategies are renumbered past YT's last slot so the two sets do not
+    # collide. The offset is READ from the YT pool, not hardcoded: it was a
+    # literal 22 until 23.10.2026, and the pools grew to 30 that day — a stale
+    # literal would have overlapped YT 23..30 with GV 1..8 in the shared key.
+    # Pre-Phase-3 else path keeps the legacy two-profile layout for rollback.
+    if [ "$Z2K_REFACTOR_PHASE3" = "1" ]; then
+        local youtube_gv_rebased yt_last_slot
+        yt_last_slot=$(printf '%s' "$youtube_tcp" | grep -o ':strategy=[0-9]*' | sed 's/.*=//' | sort -n | tail -1)
+        [ -n "$yt_last_slot" ] || yt_last_slot=33
+        youtube_gv_rebased=$(rebase_strategy_ids "$youtube_gv_tcp" "$yt_last_slot")
+        # Extract ONLY non-circular --lua-desync=* tokens from GV.
+        # Global options (--filter-tcp, --filter-l7, --payload, --out-range,
+        # --in-range) are dropped — youtube_tcp's own globals govern the
+        # merged profile. Keeping GV globals would emit duplicate flags
+        # (e.g. --filter-tcp=443 after --filter-tcp=443,2053,...) which
+        # nfqws2 silently reinterprets as "last wins", shrinking the
+        # effective port coverage of the merged profile.
+        local gv_strategies_only=""
+        local _tok
+        for _tok in $youtube_gv_rebased; do
+            case "$_tok" in
+                --lua-desync=circular:*) ;;
+                --lua-desync=*) gv_strategies_only="${gv_strategies_only:+$gv_strategies_only }$_tok" ;;
+                *) ;;
+            esac
+        done
+        local merged_google_tls
+        merged_google_tls=$(printf '%s' "$youtube_tcp" | sed 's/key=yt_tcp/key=google_tls/')
+        merged_google_tls="$merged_google_tls $gv_strategies_only"
+        add_hostlist_line "${extra_strats_dir}/TCP/YT/List.txt" "$wl_excl --hostlist=${extra_strats_dir}/TCP/YT/List.txt --hostlist=${extra_strats_dir}/TCP/YT_GV/List.txt $merged_google_tls --new"
+    else
+        # YouTube GV — dedicated hostlist (extra_strats/TCP/YT_GV/List.txt,
+        # содержит googlevideo.com и c.youtube.com → match поддоменов: rr1-rr9,
+        # manifest, и т.д.). Расширяется добавлением строк в файл.
+        #
+        # Проверка DPI отдельным соединением (lua/z2k-preflight.lua) — ТОЛЬКО
+        # здесь. Класс блока свой: адрес режется по ОТВЕТУ сервера, плечи на него
+        # не действуют (все 39 плеч пула дали 0 на таких адресах, замер
+        # 06.11.2026). В merge-режиме (Z2K_REFACTOR_PHASE3=1) шага нет: там
+        # googlevideo живёт одним профилем с остальным ютубом, и шаг применялся
+        # бы к именам, которым он не нужен.
+        youtube_gv_tcp=$(inject_z2k_preflight "$youtube_gv_tcp")
+        # First match wins: c.youtube.com is nested under YT's youtube.com.
+        # Inline suffix also covers existing installations with an old GV list.
+        add_hostlist_line "${extra_strats_dir}/TCP/YT_GV/List.txt" "$wl_excl --hostlist=${extra_strats_dir}/TCP/YT_GV/List.txt --hostlist-domains=c.youtube.com $youtube_gv_tcp --new"
+        add_hostlist_line "${extra_strats_dir}/TCP/YT/List.txt" "$wl_excl --hostlist-exclude=${extra_strats_dir}/TCP/YT_GV/List.txt --hostlist=${extra_strats_dir}/TCP/YT/List.txt $youtube_tcp --new"
+    fi
+
+    # QUIC — общий профиль: ютуб плюс весь набор списков РКН и список Discord.
+    #
+    # Набор ТОТ ЖЕ, что у TCP-профиля (rkn_lists_head + rkn_lists_tail): основной
+    # список, дополнительные домены, найденное детектором и автохостлист, если он
+    # включён. Discord-список добавлен 25.10.2026: cdn.discordapp.com и
+    # media.discordapp.net объявляют HTTP/3 (alt-svc h3), и без него попытки
+    # QUIC к ним резались, а клиент откатывался на TCP с задержкой. Референсный
+    # набор для winws держит домены Discord в общем списке своего QUIC-профиля.
+    # Голос Discord сюда не попадает: он на других портах, профиль discord_udp.
+    #
+    # Порядок списков значения не имеет (движок объединяет), но ютубовский стоит
+    # первым намеренно: так видно, что профиль вырос из него, а не появился из
+    # ниоткуда.
+    # QUIC мимо обхода: тумблеры «YouTube без QUIC» (Z2K_YT_QUIC_OFF) и «Весь
+    # QUIC через TCP» (Z2K_QUIC_OFF). Initial к серверу не уходит, а клиент
+    # получает отказ (lua/z2k-quic-reject.lua: ICMP «порт недоступен» от имени
+    # сервера) и сразу идёт по TCP, где работают плечи и обход видео. Тихий drop
+    # здесь стоял до 16.11.2026 и ничего не давал: для клиента он неотличим от
+    # блокировки QUIC провайдером — клиент так же ждёт и повторяет Initial, а
+    # повторы после окна очереди уходили мимо движка. Без lua-файла (патч ещё не
+    # доехал) остаётся прежний drop. Профиль стоит ПЕРЕД профилем QUIC: движок
+    # берёт первый подходящий. Исключения (whitelist, выключенный YouTube) не
+    # трогаем — wl_excl. Оба по умолчанию выключены.
+    local quic_off yt_quic_off
+    quic_off=$(safe_config_read "Z2K_QUIC_OFF" "${ZAPRET2_DIR:-/opt/zapret2}/config" "0")
+    yt_quic_off=$(safe_config_read "Z2K_YT_QUIC_OFF" "${ZAPRET2_DIR:-/opt/zapret2}/config" "0")
+    local quic_refuse="drop"
+    if [ -f "${ZAPRET2_DIR:-/opt/zapret2}/lua/z2k-quic-reject.lua" ]; then
+        quic_refuse="z2k_quic_reject"
+    elif [ "$quic_off" = "1" ] || [ "$yt_quic_off" = "1" ]; then
+        echo "WARN: lua/z2k-quic-reject.lua отсутствует — QUIC выкидывается без отказа" 1>&2
+    fi
+    local quic_drop="--filter-udp=443 --filter-l7=quic --payload=quic_initial --lua-desync=$quic_refuse --new"
+    if [ "$quic_off" = "1" ]; then
+        nfqws2_opt_lines="$nfqws2_opt_lines$wl_excl $quic_drop\\n"
+    elif [ "$yt_quic_off" = "1" ] && [ "$category_youtube" != 0 ] \
+         && [ -s "${extra_strats_dir}/UDP/YT/List.txt" ]; then
+        nfqws2_opt_lines="$nfqws2_opt_lines$wl_excl --hostlist=${extra_strats_dir}/UDP/YT/List.txt $quic_drop\\n"
+    fi
+
+    local quic_lists="" quic_anchor=""
+    if [ "$category_youtube" != 0 ] && [ -s "${extra_strats_dir}/UDP/YT/List.txt" ]; then
+        quic_anchor="${extra_strats_dir}/UDP/YT/List.txt"
+        quic_lists="--hostlist=$quic_anchor"
+    fi
+    if [ "$category_rkn" != 0 ]; then
+        quic_lists="$quic_lists $rkn_lists_head$rkn_lists_tail"
+        [ -s "${extra_strats_dir}/TCP_Discord.txt" ] && quic_lists="$quic_lists --hostlist=${extra_strats_dir}/TCP_Discord.txt"
+        [ -n "$quic_anchor" ] || quic_anchor="${extra_strats_dir}/TCP/RKN/List.txt"
+    fi
+    if [ -n "$quic_anchor" ]; then
+        add_hostlist_line "$quic_anchor" "$wl_excl $quic_lists $quic_udp --new"
+    fi
+
+    # Discord TCP: currently disabled for autocircular profile set.
+    if [ -n "$discord_tcp_block" ]; then
+        add_hostlist_line "${extra_strats_dir}/TCP_Discord.txt" "$discord_tcp_block"
+    fi
+
+    # STUN/Discord can have a hostname learned by the engine's cache. Honor
+    # whitelist names before the voice profile. A separate
+    # no-action profile is essential: hostlist-exclude on a hostless handler
+    # would make that handler reject ALL flows whose hostname is unknown.
+    # Keep the file attached even when empty so live whitelist edits work.
+    nfqws2_opt_lines="$nfqws2_opt_lines--filter-udp=1-65535 --hostlist=${lists_dir}/whitelist.txt --new\\n"
+
+    # Discord UDP (no hostlist - STUN has no hostname, uses filter-l7=discord,stun
+    # + hostkey=z2k_nohost_key for stable hostless rotation keying)
+    [ "$category_voice" = 0 ] || nfqws2_opt_lines="$nfqws2_opt_lines$discord_udp --new\\n"
+
+    # Здесь стоял webrtc_bypass — пустой профиль udp/1024-65535 × l7=stun,
+    # который ничего не десинкал и служил щитом: он ловил P2P-STUN (WebRTC в
+    # браузере, peer-to-peer голос Discord) РАНЬШЕ широкого профиля game_udp,
+    # чтобы тот не выстрелил по нему фейками. Тот же класс проблемы, из-за
+    # которого до него откатывали TCP-catchall игрового режима (2203de2:
+    # фейки прилетали ответам LAN-клиентам и ядро рвало соединение RST'ом).
+    #
+    # Удалён: game_udp больше нет — игровой режим переехал на туннель WARP в
+    # r-61.1 (d078a60), игры с IP-блоком маршрутизируются через Cloudflare, а
+    # не десинкаются. Щит пережил то, от чего защищал: после discord_udp не
+    # осталось ни одного широкого UDP-профиля, а в очередь и так заворачиваются
+    # только порты из NFQWS2_PORTS_UDP (443 + диапазоны Discord).
+    #
+    # ЕСЛИ когда-нибудь снова появится широкий UDP-профиль после discord_udp
+    # или NFQWS2_PORTS_UDP расширят на большой диапазон — щит нужно вернуть,
+    # иначе P2P-голос и WebRTC поймают чужие фейки.
+
+    # HTTP RKN (port 80): autocircular bypass of ISP DPI redirect (302 → block page).
+    # 7 strategies from blockcheck2 results, ordered by simplicity.
+    # standard_failure_detector detects HTTP 302 redirects natively.
+    # --in-range=-s5556: let circular see HTTP response for failure detection.
+    # Strategy 1: http_methodeol (simplest HTTP manipulation)
+    # Strategy 2: syndata + multisplit
+    # Strategy 3: hostfakesplit with TTL=2
+    # Strategy 4: fake with badsum
+    # Strategy 5: fakedsplit at method+2 with badsum
+    # Strategy 6: reference original (fake 0x0E + tcp_md5 + multisplit host+1)
+    # Strategy 7: fake badsum + multisplit method+2
+    # Тот же набор списков, что у TLS-профиля, минус Discord (см. сборку выше).
+    # Отдельного второго сборщика здесь больше нет — именно он и разъезжался.
+    local rkn_http_extras="$rkn_lists_tail"
+    # Детектору нужны также продолжения HTTP-заголовков/тела (unknown).
+    # Изменяющие пакеты стратегии по-прежнему ограничены исходящим http_req.
+    http_rkn="--filter-tcp=80 $wl_excl --hostlist=${extra_strats_dir}/TCP/RKN/List.txt${rkn_http_extras} --in-range=-s5556 --payload=all --lua-desync=circular:fails=3:time=60:key=http_rkn:nld=2 --lua-desync=http_methodeol:payload=http_req:dir=out:strategy=1 --lua-desync=syndata:payload=http_req:dir=out:strategy=2 --lua-desync=multisplit:payload=http_req:dir=out:strategy=2 --lua-desync=hostfakesplit:payload=http_req:dir=out:ip_ttl=2:repeats=1:strategy=3 --lua-desync=fake:payload=http_req:dir=out:blob=fake_default_http:badsum:repeats=1:strategy=4 --lua-desync=fakedsplit:payload=http_req:dir=out:pos=method+2:badsum:strategy=5 --lua-desync=fake:payload=http_req:dir=out:blob=0x0E0E0F0E:tcp_md5:strategy=6 --lua-desync=multisplit:payload=http_req:dir=out:pos=host+1:seqovl=2:strategy=6 --lua-desync=fake:payload=http_req:dir=out:blob=fake_default_http:badsum:repeats=1:strategy=7 --lua-desync=multisplit:payload=http_req:dir=out:pos=method+2:strategy=7 --lua-desync=fake:payload=http_req:dir=out:blob=fake_default_http:badsum:repeats=1:strategy=8 --lua-desync=fakedsplit:payload=http_req:dir=out:pos=method+2:ip_autottl=2,1-64:badsum:strategy=8 --in-range=x --new"
+
+    # HTTP shares the same retrans/reset policy as TLS.
+    http_rkn=$(ensure_circular_doc_args "$http_rkn")
+    # HTTP-пул создаётся после общей проводки: подключаем обёртку здесь.
+    if [ -f "${ZAPRET2_DIR:-/opt/zapret2}/lua/z2k-alert.lua" ]; then
+        http_rkn=$(ensure_rkn_failure_detector "$http_rkn" "z2k_fail_tls_alert")
+    fi
+    add_hostlist_line "${extra_strats_dir}/TCP/RKN/List.txt" "$http_rkn"
+
+    # --------------------------------------------------------------------------
+    # WHATSAPP NOISE (TCP/5222) — расщепление первого пакета рукопожатия
+    # --------------------------------------------------------------------------
+    # Настольный WhatsApp связывается со шлюзом g.whatsapp.net своим протоколом
+    # Noise, а не TLS: ни ClientHello, ни SNI, ни имени хоста в пакете нет.
+    # Первые четыре байта — открытая сигнатура "WA\x06\x03", и ровно по ней
+    # ТСПУ дропает первый пакет с данными: TCP-рукопожатие проходит, сорок байт
+    # уходят, ответа ноль, клиент через десять секунд аннулирует QR-код и
+    # заходит по кругу. В его собственном журнале это видно дословно:
+    #   handshake_manager/timeout [timeout=10s, bytesSent=40, bytesReceived=0]
+    #
+    # Замер 2026-08-28 на живой линии, настоящим прологом из дампа, по три
+    # повтора на точку разреза (и по шесть на pos=1,2 через релей):
+    #   целиком        — тишина
+    #   pos=1,2,3      — ответ 350 байт, 21 из 21
+    #   pos=4,5,6,8,12 — тишина
+    # Сигнатура ровно в первых четырёх байтах: разрез ВНУТРИ них её ломает,
+    # разрез после — нет. Отсюда pos=1.
+    #
+    # Хостлиста тут быть не может — имени в протоколе нет вовсе, поэтому фильтр
+    # только по порту. Ротации тоже нет: плечо одно и оно доказано, а перебор
+    # недоказанных плеч на рукопожатии, которое клиент повторяет раз в две
+    # минуты, стоил бы человеку четверти часа ожидания вместо связи.
+    #
+    # --out-range=-s64 держит в очереди только само рукопожатие: дальше поток
+    # уже зашифрован и трогать его незачем.
+    # Профиль намеренно голый. Первая редакция несла ещё --hostlist-exclude
+    # и --out-range=-s64 — и не выбиралась движком вовсе: в отладке стояло
+    # «desync profile 0 (no_action) matches», решение кэшировалось на
+    # ip:port, и расщепление не выполнялось ни разу. Ограничивать поток тут
+    # нечем и незачем: в очередь и так попадают только первые 20 исходящих
+    # пакетов соединения (connbytes в правиле NFQUEUE), а хостлист без
+    # имени хоста бессмыслен.
+    wa_noise="--filter-tcp=5222 --payload=unknown --lua-desync=multisplit:payload=unknown:dir=out:pos=1 --new"
+    nfqws2_opt_lines="$nfqws2_opt_lines$wa_noise\\n"
+
+    # --------------------------------------------------------------------------
+    # АВТОХОСТЛИСТ: профиль-детектор (только при Z2K_AUTOHOSTLIST=1)
+    # --------------------------------------------------------------------------
+    #
+    # Тумблер «Автохостлист» существовал с r-45 и до сих пор не доходил до
+    # движка вовсе: апстрим подставляет --hostlist-auto только заменой
+    # плейсхолдера <HOSTLIST> (common/list.sh), а мы генерируем профили с
+    # явными путями и плейсхолдеров не используем. Аргументы демона в обоих
+    # положениях тумблера были байт в байт одинаковы — человеку при этом в
+    # трёх местах обещано, что «движок сам находит заблокированные домены».
+    #
+    # ПОЧЕМУ ОТДЕЛЬНЫЙ ПРОФИЛЬ И ПОЧЕМУ В ХВОСТЕ. Профиль с --hostlist-auto
+    # выигрывает подбор при ЛЮБОМ известном имени хоста, независимо от своих
+    # списков (nfq2/desync.c: «autohostlist profile ... always win if we have a
+    # hostname»), а подбор останавливается на первом совпадении. Повесить флаг
+    # на rkn_tcp — значит отдать ему youtube.com и googlevideo.com: профили
+    # yt_tcp/gv_tcp стоят ниже с тем же фильтром портов и живут только за счёт
+    # непересекающихся хостлистов. Поэтому детектор — последний профиль:
+    # ему достаётся ровно то, что не разобрали профили выше.
+    #
+    # ПОЧЕМУ БЕЗ СТРАТЕГИЙ. К хосту вне списков десинк не применяется в любом
+    # случае (движок помнит отрицательный результат проверки списков), поэтому
+    # инстансы здесь были бы мёртвым грузом: детектор считает неудачи, пишет
+    # имя в файл, а обходит уже rkn_tcp — файл подключён к нему хостлистом
+    # выше. Заодно не дублируется 13 КБ арсенала в командной строке.
+    if [ "$z2k_autohostlist" = "1" ] && [ "$category_rkn" != 0 ]; then
+        # Порты берём из самого rkn_tcp, а не литералом: набор задаётся в
+        # lib/strategies.sh и уже расходился с копиями в других местах.
+        local ah_ports
+        ah_ports=$(printf '%s' "$rkn_tcp" | sed -n 's/.*--filter-tcp=\([0-9,-]*\).*/\1/p' | head -1)
+        [ -n "$ah_ports" ] || ah_ports="443,2053,2083,2087,2096,8443"
+
+        # Пороги детектора. Пустое значение = дефолт движка (3 неудачи за 60 с
+        # и т.д.), поэтому каждый флаг добавляется ТОЛЬКО если человек задал
+        # его в config — командная строка не растёт зря, а дефолты остаются
+        # там, где их сопровождает автор движка.
+        local ah_tune="" ah_key ah_val ah_flag
+        for ah_key in FAIL_THRESHOLD:fail-threshold FAIL_TIME:fail-time \
+                      RETRANS_THRESHOLD:retrans-threshold RETRANS_RESET:retrans-reset \
+                      RETRANS_MAXSEQ:retrans-maxseq INCOMING_MAXSEQ:incoming-maxseq \
+                      UDP_IN:udp-in UDP_OUT:udp-out; do
+            ah_val=$(safe_config_read "AUTOHOSTLIST_${ah_key%%:*}" "${ZAPRET2_DIR:-/opt/zapret2}/config" "")
+            [ -n "$ah_val" ] || continue
+            ah_flag="${ah_key#*:}"
+            ah_tune="$ah_tune --hostlist-auto-${ah_flag}=${ah_val}"
+        done
+        # Отладочный лог движка — параметр глобальный, не профильный. Наружу
+        # не выставлен намеренно: включаем его мы, разбирая конкретный тикет.
+        if [ "$(safe_config_read "AUTOHOSTLIST_DEBUGLOG" "${ZAPRET2_DIR:-/opt/zapret2}/config" "0")" = "1" ]; then
+            ah_tune="$ah_tune --hostlist-auto-debug=${ZAPRET2_DIR:-/opt/zapret2}/ipset/zapret-hosts-auto-debug.log"
+        fi
+
+        nfqws2_opt_lines="$nfqws2_opt_lines--filter-tcp=${ah_ports} --filter-l7=tls $wl_excl --hostlist-auto=${autohostlist_file}${ah_tune} --new\\n"
+    fi
+
+    # Шаблон ставится В ГОЛОВУ и только если его кто-то импортирует: ссылка
+    # вперёд движком не поддерживается, а объявленный и никем не использованный
+    # шаблон — это просто мусор в конфиге, который человек читает при разборе
+    # тикетов.
+    if [ -n "$rkn_tpl_line" ]; then
+        case "$nfqws2_opt_lines" in
+            *"--import=$rkn_tpl"*)
+                nfqws2_opt_lines="$rkn_tpl_line\\n$nfqws2_opt_lines" ;;
+        esac
+    fi
+
+    local nfqws2_opt_value
+    nfqws2_opt_value=$(printf "%b" "$nfqws2_opt_lines" | sed '/^$/d')
+    # Each profile-line ends with --new (separator before the next profile).
+    # The very last --new has no profile after it — nfqws2 parses it as an
+    # empty trailing profile (no filter, no hostlist, no desync). Strip it.
+    nfqws2_opt_value=$(printf '%s' "$nfqws2_opt_value" | sed '$ s/[[:space:]]*--new[[:space:]]*$//')
+    cat <<NFQWS2_OPT
+NFQWS2_OPT="
+$nfqws2_opt_value
+"
+NFQWS2_OPT
+}
+
+# ==============================================================================
+# СОЗДАНИЕ ОФИЦИАЛЬНОГО CONFIG ФАЙЛА
+# ==============================================================================
+
+# Потолок видимости входящего потока В ПАКЕТАХ: сколько ответных пакетов
+# iptables отдаёт в очередь (NFQWS2_TCP_PKT_IN, `--connbytes 1:N ... dir reply`).
+#
+# 10 — master-совместимое значение: детектору успеха нужно inseq=4096 байт
+# (manual, standard_success_detector) плюс один пакет, это четыре полных
+# пакета; десять — двойной запас на мелкие записи рукопожатия. Прежние 50
+# кормили сторож обрыва на 16 КБ (+28 %% пакетов в очередь, +9 %% CPU по
+# замеру 18.08.2026); сторожа больше нет.
+z2k_reply_pkt_cap() {
+    echo 10
+}
+
+# Снять «Защиту DNS» (25.10–07.11.2026): заворот UDP/TCP 53 из LAN на резолвер
+# роутера. Подмену она снимала только там, где сам роутер ходит наружу через
+# DoT/DoH, а у остальных лишь обещала защиту, поэтому убрана целиком. Патч
+# удалённые файлы с роутера не убирает, а оставшийся хук NDM 89 возвращал бы
+# правила после каждого регена, — поэтому снимаем здесь: генератор отрабатывает и
+# при обновлении (regen-config), и при установке. Сначала хук, потом правила.
+z2k_retire_dns_redirect() {
+    local zd="${ZAPRET2_DIR:-/opt/zapret2}" prefix _p _n
+    prefix=${zd%/*}
+    rm -f "$prefix/etc/ndm/netfilter.d/89-z2k-dns-redirect.sh" \
+        "$zd/z2k-dns-redirect.sh" "$zd/files/z2k-dns-redirect.sh" \
+        "$zd/files/ndm/89-z2k-dns-redirect.sh" 2>/dev/null
+    if command -v iptables >/dev/null 2>&1; then
+        for _p in udp tcp; do
+            _n=0
+            while [ "$_n" -lt 20 ] && iptables -w -t nat -C PREROUTING -p "$_p" --dport 53 -m set --match-set z2k_lan4 src -m set ! --match-set z2k_lan4 dst -j REDIRECT --to-ports 53 2>/dev/null; do
+                iptables -w -t nat -D PREROUTING -p "$_p" --dport 53 -m set --match-set z2k_lan4 src -m set ! --match-set z2k_lan4 dst -j REDIRECT --to-ports 53 2>/dev/null || break
+                _n=$((_n + 1))
+            done
+        done
+    fi
+    # Best-effort retirement: an already removed set makes ipset return 1.
+    # Regen also runs under set -e; still remove watchdog marks on a repeat.
+    command -v ipset >/dev/null 2>&1 && ipset destroy z2k_lan4 2>/dev/null || :
+    rm -f "${Z2K_DNS_STATE_DIR:-/tmp}/z2k-dns-redirect.down" \
+        "${Z2K_DNS_STATE_DIR:-/tmp}/z2k-dns-redirect.hc" 2>/dev/null
+    return 0
+}
+
+# Retire the experimental discovery daemon, not the on-demand probe binary.
+# Its only publication target was discovered-domains.txt; do not subtract
+# matching names from user lists, where their provenance cannot be inferred.
+z2k_retire_discovery() {
+    local zd="${ZAPRET2_DIR:-/opt/zapret2}" prefix proc pid args n
+    prefix=${zd%/*}
+    # Remove the launchers first: an old scheduler must not revive the daemon.
+    rm -f "$prefix/etc/init.d/S98z2k-detect" \
+        "$zd/z2k-detect-watchdog.sh" "$zd/files/z2k-detect-watchdog.sh" \
+        "$zd/files/init.d/S98z2k-detect" || return 1
+    for proc in "${Z2K_DISCOVERY_PROC_ROOT:-/proc}"/[0-9]*; do
+        [ -r "$proc/cmdline" ] || continue
+        args=$(tr '\000' '\n' 2>/dev/null < "$proc/cmdline" | head -2)
+        # Never kill a concurrent manual probe/classify/tcp16 invocation.
+        [ "$args" = "$(printf '%s\nrun' "$prefix/sbin/z2k-detect")" ] || continue
+        pid=${proc##*/}
+        kill "$pid" 2>/dev/null || { [ ! -d "$proc" ] || return 1; }
+        n=0
+        while [ -r "$proc/cmdline" ] && [ "$n" -lt 5 ]; do
+            args=$(tr '\000' '\n' 2>/dev/null < "$proc/cmdline" | head -2)
+            [ "$args" = "$(printf '%s\nrun' "$prefix/sbin/z2k-detect")" ] || break
+            sleep 1
+            n=$((n + 1))
+        done
+        # Do not delete the publication file while its writer is still alive.
+        args=$(tr '\000' '\n' 2>/dev/null < "$proc/cmdline" | head -2)
+        [ "$args" != "$(printf '%s\nrun' "$prefix/sbin/z2k-detect")" ] || return 1
+    done
+    rm -f "$zd/lists/discovered-domains.txt" \
+        "$zd/lists/discovered-domains.txt.etag" \
+        "$zd/files/lists/discovered-domains.txt" || return 1
+}
+
+# Toggle registry: key, fresh default, disabled value (inverse switches use 1).
+# Add future switches HERE only, never to the immutable legacy snapshot below.
+z2k_toggle_defaults() {
+    cat <<'Z2K_TOGGLES'
+ENABLED 1 0
+DISABLE_CUSTOM 1 1
+DISABLE_IPV6 1 1
+POLICY_EXCLUDE 0 0
+GAME_WARP_ENABLED 0 0
+TG_PROXY_USER_DISABLED 0 1
+Z2K_CATEGORY_YOUTUBE 1 0
+Z2K_CATEGORY_RKN 1 0
+Z2K_CATEGORY_DISCORD_VOICE 1 0
+Z2K_CIRCULAR_RESET 1 0
+Z2K_DISCORD_UPDATE_TLS_TIMEOUT 1 0
+Z2K_INJECT_TLS_MODS 0 0
+Z2K_PADENCAP 1 0
+Z2K_NFQWS2_TEMPLATES 1 0
+Z2K_DYNAMIC_TTL 1 0
+Z2K_INSTA_DNS 1 0
+Z2K_REDIRECTOR_DNS 1 0
+Z2K_SNI_STALL 1 0
+Z2K_GV_SERVER_REPLY2 1 0
+Z2K_QUIC_OFF 0 0
+Z2K_YT_QUIC_OFF 0 0
+Z2K_PPE_DEOFFLOAD_QUIC 1 0
+Z2K_PANEL_AUTH 0 0
+Z2K_AUTO_UPDATE_ENABLED 1 0
+Z2K_AUTOHOSTLIST 0 0
+Z2K_WARP_WDTT 0 0
+Z2K_REFACTOR_PHASE3 0 0
+Z2K_TOGGLES
+}
+
+# Immutable effective defaults of the release preceding the preservation policy.
+# Never add future toggles here: absence means the old version had no feature.
+z2k_legacy_toggle_defaults() {
+    cat <<'Z2K_LEGACY'
+ENABLED 0
+DISABLE_CUSTOM 0
+DISABLE_IPV6 0
+POLICY_EXCLUDE 0
+GAME_WARP_ENABLED 0
+TG_PROXY_USER_DISABLED 0
+Z2K_CATEGORY_YOUTUBE 1
+Z2K_CATEGORY_RKN 1
+Z2K_CATEGORY_DISCORD_VOICE 1
+Z2K_CIRCULAR_RESET 1
+Z2K_DISCORD_UPDATE_TLS_TIMEOUT 1
+Z2K_INJECT_TLS_MODS 0
+Z2K_PADENCAP 1
+Z2K_NFQWS2_TEMPLATES 1
+Z2K_DYNAMIC_TTL 1
+Z2K_INSTA_DNS 1
+Z2K_REDIRECTOR_DNS 1
+Z2K_SNI_STALL 1
+Z2K_GV_SERVER_REPLY2 1
+Z2K_QUIC_OFF 0
+Z2K_YT_QUIC_OFF 0
+Z2K_PPE_DEOFFLOAD_QUIC 1
+Z2K_PANEL_AUTH 0
+Z2K_AUTO_UPDATE_ENABLED 1
+Z2K_AUTOHOSTLIST 0
+Z2K_WARP_WDTT 0
+Z2K_REFACTOR_PHASE3 0
+Z2K_LEGACY
+}
+
+# Bootstrap from the installed pre-policy generator when it is still present.
+# No eval/source of old code: read literal 0/1 fallbacks only. Unknown old
+# Z2K switches were not features of that version and must start disabled.
+z2k_prior_toggle_default() {
+    local cfg="$1" key="$2" fallback="$3" off="$4" old value base known=0
+    # S99 reads these directly: unset ENABLED is disabled; unset DISABLE_*
+    # is not equal to 1. Generator fresh defaults are not runtime defaults.
+    case "$key" in ENABLED|DISABLE_CUSTOM|DISABLE_IPV6) printf '%s' "$fallback"; return ;; esac
+    base=$(dirname "$cfg")
+    old="$base/lib/config_official.sh"
+    if [ -f "$old" ] && ! grep -q '^z2k_toggle_defaults()' "$old"; then
+        # Some old generators did not preserve a switch even though its actual
+        # consumer (updater, CGI, init or DNS refresher) already supported it.
+        for old in "$base/lib/config_official.sh" "$base/lib/"*.sh \
+                   "$base/"*.sh "$base/webpanel/cgi/"*.sh \
+                   "${base%/*}/etc/init.d/S99zapret2"; do
+            [ -f "$old" ] || continue
+            grep -q "$key" "$old" || continue
+            known=1
+            value=$(awk -v key="$key" '
+                /safe_config_read|read_flag/ && index($0,key) && $0 !~ /^[ \t]*#/ {
+                    if (match($0, /[ \t]+"?[01]"?\)/)) {
+                        v=substr($0,RSTART,RLENGTH); gsub(/[^01]/,"",v); print v; exit
+                    }
+                }
+            ' "$old")
+            case "$value" in 0|1) printf '%s' "$value"; return ;; esac
+        done
+        if [ "$known" = 0 ]; then
+            case "$key" in Z2K_*) printf '%s' "$off"; return ;; esac
+        fi
+    fi
+    printf '%s' "$fallback"
+}
+
+# Materialize only missing keys, before generating options or backing up config.
+# The .done ledger is also the inventory for subsequent versions. New entries
+# absent from that inventory are OFF, irrespective of their fresh defaults.
+z2k_migrate_toggle_values() {
+    local cfg="$1" state="${2:-$(dirname "$1")/state}"
+    local marker="$state/toggle-values-v1.done" tmp key def off value prior reply_generation=-1 reply_default=1 reply_key tag
+    [ -f "$cfg" ] || return 0
+    mkdir -p "$state" || return 1
+    tmp="${cfg}.toggles.$$"
+    cp -p "$cfg" "$tmp" || return 1
+    # Preserve the switch that was effective in the SOURCE release, not stale
+    # aliases intentionally ignored by that release. p-87.21..23 defaulted to
+    # OFF, p-87.24 renamed to SERVER_REPLY (ON), p-87.27 to SERVER_REPLY2 (ON).
+    prior="$(dirname "$cfg")/lib/config_official.sh"
+    if grep -q 'safe_config_read "Z2K_GV_SERVER_REPLY2"' "$prior" 2>/dev/null; then reply_generation=2
+    elif grep -q 'safe_config_read "Z2K_GV_SERVER_REPLY"' "$prior" 2>/dev/null; then reply_generation=1
+    elif grep -q 'safe_config_read "Z2K_GV_PREFLIGHT"' "$prior" 2>/dev/null; then reply_generation=0
+    fi
+    # A patch can have replaced the source library before this gate runs.
+    tag=$(cat "$(dirname "$cfg")/.z2k-installed-tag" 2>/dev/null) || tag=""
+    if [ -n "$tag" ]; then
+        reply_generation=$(printf '%s\n' "$tag" | awk -v fallback="$reply_generation" '
+            /^[pr]-[0-9]+[.][0-9]+$/ {
+                sub(/^[pr]-/, ""); split($0,v,"."); found=1
+                if (v[1]<87 || (v[1]==87 && v[2]<21)) print -2
+                else if (v[1]==87 && v[2]<24) print 0
+                else if (v[1]==87 && v[2]<27) print 1
+                else print 2
+            }
+            END { if (!found) print fallback }
+        ')
+    fi
+    if ! grep -q '^Z2K_GV_SERVER_REPLY2=' "$cfg"; then
+        value=""
+        case "$reply_generation" in
+            -2) value=0 ;; # feature did not exist
+            0|1)
+                reply_key=Z2K_GV_PREFLIGHT; reply_default=0
+                [ "$reply_generation" = 0 ] || { reply_key=Z2K_GV_SERVER_REPLY; reply_default=1; }
+                reply_default=$(z2k_prior_toggle_default "$cfg" "$reply_key" "$reply_default" "$reply_default")
+                value=$(safe_config_read "$reply_key" "$cfg" "$reply_default")
+                case "$value" in 0|1) ;; *) value=0 ;; esac
+                ;;
+            -1) # untagged config-only recovery: newest explicit alias wins
+                for prior in Z2K_GV_SERVER_REPLY Z2K_GV_PREFLIGHT; do
+                    value=$(safe_config_read "$prior" "$cfg" "")
+                    case "$value" in 0|1) break ;; *) value="" ;; esac
+                done
+                ;;
+        esac
+        [ -z "$value" ] || printf '\nZ2K_GV_SERVER_REPLY2=%s\n' "$value" >> "$tmp" || return 1
+    fi
+    while read -r key def off; do
+        grep -q "^${key}=" "$tmp" && continue
+        if [ -f "$marker" ]; then
+            value=$(safe_config_read "$key" "$marker" "$off")
+        else
+            value=$(z2k_legacy_toggle_defaults | awk -v k="$key" '$1==k {print $2; exit}')
+            [ -n "$value" ] || value="$off"
+            value=$(z2k_prior_toggle_default "$cfg" "$key" "$value" "$off")
+        fi
+        if [ "$key" = DISABLE_IPV6 ]; then
+            # Reinstall can expose a partial config before the old-tree restore.
+            # shellcheck disable=SC2045,SC2046
+            for prior in "${Z2K_OLD_TREE_BACKUP:-/nonexistent}/config" $(ls -dt "$(dirname "$cfg")".old.*/config 2>/dev/null); do
+                [ -f "$prior" ] || continue
+                value=$(safe_config_read "$key" "$prior" "$value")
+                break
+            done
+        fi
+        printf '\n%s=%s\n' "$key" "$value" >> "$tmp" || return 1
+    done <<Z2K_REGISTRY
+$(z2k_toggle_defaults)
+Z2K_REGISTRY
+    if cmp -s "$tmp" "$cfg"; then rm -f "$tmp"; else
+        mv -f "$tmp" "$cfg" || return 1
+    fi
+    z2k_record_toggle_values "$cfg" "$state"
+}
+
+z2k_record_toggle_values() {
+    local cfg="$1" state="$2" key def off value tmp
+    mkdir -p "$state" || return 1
+    tmp="$state/toggle-values-v1.done.tmp.$$"
+    : > "$tmp" || return 1
+    while read -r key def off; do
+        # Snapshot VERSION defaults, never the user's explicit selection.
+        # If a key is later absent, its effective value was the old runtime
+        # fallback, not the last 0/1 the user wrote before removing that key.
+        value="$def"
+        case "$key" in ENABLED|DISABLE_CUSTOM|DISABLE_IPV6) value=0 ;; esac
+        printf '%s=%s\n' "$key" "$value" >> "$tmp" || return 1
+    done <<Z2K_REGISTRY
+$(z2k_toggle_defaults)
+Z2K_REGISTRY
+    # Do not rewrite a completed migration on every boot/regen.
+    if cmp -s "$tmp" "$state/toggle-values-v1.done"; then rm -f "$tmp"; else
+        mv -f "$tmp" "$state/toggle-values-v1.done" || return 1
+    fi
+}
+
+create_official_config() {
+    # $1 - путь к config файлу (обычно /opt/zapret2/config)
+
+    local config_file="${1:-/opt/zapret2/config}"
+
+    local _toggle_existing=0
+    if [ -f "$config_file" ]; then
+        _toggle_existing=1
+        z2k_migrate_toggle_values "$config_file" || return 1
+    fi
+
+    print_info "Создание официального config файла: $config_file"
+
+    # Создать директорию если не существует
+    mkdir -p "$(dirname "$config_file")"
+
+    # Генерировать NFQWS2_OPT. `$(...)` съедает return-код функции, поэтому
+    # проверяем его отдельно: порченый Strategy.txt (0xFF-мусор с мёртвого
+    # NAND-блока) роняет генерацию здесь, ДО записи в конфиг — так живой
+    # config_file и работающий сервис остаются нетронутыми.
+    local nfqws2_opt_section
+    nfqws2_opt_section=$(generate_nfqws2_opt_from_strategies) || return 1
+
+    # =========================================================================
+    # ВАЛИДАЦИЯ NFQWS2 ОПЦИЙ (ВАЖНО)
+    # =========================================================================
+    print_info "Валидация сгенерированных опций nfqws2..."
+
+    # Извлечь NFQWS2_OPT из сгенерированной секции (многострочный heredoc между кавычками)
+    local nfqws2_opt_value
+    nfqws2_opt_value=$(echo "$nfqws2_opt_section" | sed -n '/^NFQWS2_OPT="/,/^"$/{ /^NFQWS2_OPT="/d; /^"$/d; p; }')
+
+    # Загрузить модули для dry_run_nfqws()
+    if [ -f "/opt/zapret2/common/base.sh" ]; then
+        . "/opt/zapret2/common/base.sh"
+    fi
+
+    if [ -f "/opt/zapret2/common/linux_daemons.sh" ]; then
+        . "/opt/zapret2/common/linux_daemons.sh"
+
+        # Установить временно NFQWS2_OPT для проверки
+        export NFQWS2_OPT="$nfqws2_opt_value"
+        export NFQWS2="/opt/zapret2/nfq2/nfqws2"
+
+        # Проверить опции (dry_run может ложно падать если lua/blob файлы
+        # ещё не установлены — это нормально при первой установке)
+        if command -v dry_run_nfqws >/dev/null 2>&1; then
+            if dry_run_nfqws 2>/dev/null; then
+                print_success "Опции nfqws2 валидны (dry-run OK)"
+            else
+                print_info "dry-run nfqws2 не прошёл (нормально при установке — lua/blob файлы подключатся при запуске)"
+            fi
+        fi
+    else
+        print_info "Модули валидации не найдены, пропускаем проверку"
+    fi
+
+    z2k_have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+    # Получить FWTYPE и FLOWOFFLOAD из окружения (если установлены)
+    local fwtype_value="${FWTYPE:-iptables}"
+    local flowoffload_value="${FLOWOFFLOAD:-none}"
+    local tmpdir_value="${TMPDIR:-}"
+
+    # ==============================================================================
+    # IPv6 auto-detect (Keenetic)
+    # ==============================================================================
+    # Default behavior historically was DISABLE_IPV6=1 because many Keenetic builds
+    # don't ship ip6tables. Here we enable IPv6 only if:
+    # - IPv6 looks configured (default route or global address exists)
+    # - and the firewall backend can actually handle IPv6 rules:
+    #   - iptables => ip6tables must exist
+    #   - nftables => nft must exist
+    local disable_ipv6_value="${DISABLE_IPV6:-}"
+    # PRESERVE policy (Mark 2026-06-20): на апдейте НИКОГДА не включаем и не
+    # выключаем IPv6 — берём значение как есть. Часть юзеров правит DISABLE_IPV6
+    # руками; автодетект имеет право решать ТОЛЬКО на чистой установке, где
+    # прежнего значения нет нигде. Источник по приоритету:
+    #   env override > config_file, который сейчас пишем > config прежней
+    #   установки (живой ИЛИ его .old.$$ бэкап от текущей переустановки).
+    if [ -z "$disable_ipv6_value" ] && [ -f "$config_file" ]; then
+        disable_ipv6_value=$(safe_config_read "DISABLE_IPV6" "$config_file" "")
+    fi
+    # Auto-update reinstall строит config_file с нуля (step_build_zapret2
+    # переносит старое дерево в .old.$$ ДО генерации конфига), поэтому чтение
+    # выше на первом проходе пустое и старый код тут сваливался в автодетект —
+    # т.е. сам включал/выключал v6 вместо сохранения. Достаём прежнее значение
+    # из живого конфига или самого свежего .old.$$ бэкапа, чтобы автодетект
+    # ниже не перетёр пользовательскую настройку посреди переустановки.
+    if [ -z "$disable_ipv6_value" ]; then
+        local _zd_ipv6="${ZAPRET2_DIR:-/opt/zapret2}"
+        local _prior_cfg
+        # shellcheck disable=SC2045,SC2046
+        for _prior_cfg in "${_zd_ipv6}/config" $(ls -dt "${_zd_ipv6}".old.*/config 2>/dev/null); do
+            [ -f "$_prior_cfg" ] || continue
+            [ "$_prior_cfg" = "$config_file" ] && continue
+            disable_ipv6_value=$(safe_config_read "DISABLE_IPV6" "$_prior_cfg" "")
+            [ -n "$disable_ipv6_value" ] && break
+        done
+    fi
+    if [ -z "$disable_ipv6_value" ]; then
+        disable_ipv6_value="1"
+        local v6_ok="0"
+        if z2k_have_cmd ip; then
+            ip -6 route show default 2>/dev/null | grep -q . && v6_ok="1"
+            if [ "$v6_ok" = "0" ]; then
+                ip -6 addr show scope global 2>/dev/null | grep -q "inet6" && v6_ok="1"
+            fi
+        fi
+
+        if [ "$v6_ok" = "1" ]; then
+            if [ "$fwtype_value" = "nftables" ]; then
+                if z2k_have_cmd nft; then
+                    disable_ipv6_value="0"
+                    print_info "IPv6 обнаружен, backend=nftables: включаем обработку IPv6 (DISABLE_IPV6=0)"
+                else
+                    print_info "IPv6 обнаружен, но nft не найден: оставляем IPv6 отключенным (DISABLE_IPV6=1)"
+                fi
+            else
+                if z2k_have_cmd ip6tables; then
+                    disable_ipv6_value="0"
+                    print_info "IPv6 обнаружен, backend=iptables: включаем обработку IPv6 (DISABLE_IPV6=0)"
+                else
+                    print_info "IPv6 обнаружен, но ip6tables не найден: оставляем IPv6 отключенным (DISABLE_IPV6=1)"
+                fi
+            fi
+        else
+            print_info "IPv6 не обнаружен (нет default route/global addr): оставляем IPv6 отключенным (DISABLE_IPV6=1)"
+        fi
+    else
+        print_info "DISABLE_IPV6 сохранён как есть (апдейт IPv6 не трогает): DISABLE_IPV6=$disable_ipv6_value"
+    fi
+
+    # Сохранить пользовательские настройки из существующего конфига
+    local saved_category_youtube saved_category_rkn saved_category_voice
+    saved_category_youtube=$(safe_config_read Z2K_CATEGORY_YOUTUBE "$config_file" 1)
+    saved_category_rkn=$(safe_config_read Z2K_CATEGORY_RKN "$config_file" 1)
+    saved_category_voice=$(safe_config_read Z2K_CATEGORY_DISCORD_VOICE "$config_file" 1)
+    local saved_GAME_WARP_ENABLED="0"
+    local saved_TG_PROXY_USER_DISABLED="0"
+    local saved_ENABLED="1"
+    local saved_Z2K_CIRCULAR_RESET="1"
+    local saved_Z2K_DISCORD_UPDATE_TLS_TIMEOUT="1"
+    local saved_Z2K_PADENCAP="1"
+    local saved_Z2K_NFQWS2_TEMPLATES="1"
+    local saved_Z2K_INJECT_TLS_MODS="0"
+    local saved_Z2K_DYNAMIC_TTL="1"
+    local saved_Z2K_INSTA_DNS="1"
+    local saved_Z2K_REDIRECTOR_DNS="1"
+    local saved_DISABLE_CUSTOM="1"
+    local saved_POLICY_NAME="nfqws"
+    local saved_POLICY_EXCLUDE="0"
+    local _pn_q="" _pe_q=""   # те же значения, экранированные под одинарные кавычки
+    local saved_Z2K_SNI_STALL="1"
+    local saved_Z2K_GV_SERVER_REPLY2="" saved_Z2K_PROVIDER_CACHE=""
+    local saved_Z2K_QUIC_OFF="" saved_Z2K_YT_QUIC_OFF=""
+    local saved_Z2K_PPE_DEOFFLOAD_QUIC="1"
+    # Вход в панель по паролю. Умолчание 0 — выключено; панель годами ставили
+    # без пароля, и регенерация конфига не должна его однажды включить.
+    #
+    # ПОЧЕМУ ЭТОТ КЛЮЧ ОБЯЗАН БЫТЬ ЗДЕСЬ. Генератор пишет конфиг С НУЛЯ по
+    # фиксированному списку и подменяет боевой файл. Ключ, которого в списке
+    # нет, ИСЧЕЗАЕТ — а set_flag из панели и меню дописывает его в конец. То
+    # есть без этой строки пароль снимался сам: достаточно щёлкнуть любой
+    # тумблер в панели (каждый зовёт regenerate_config) или дождаться ночного
+    # обновления, и панель молча открыта всем в локальной сети, причём
+    # владельцу об этом никто не сообщит. Выключатель безопасности, который
+    # выключается сам, хуже его отсутствия.
+    local saved_Z2K_PANEL_AUTH="0"
+    # Автообновление ночью. Умолчание 1 — как было всегда.
+    #
+    # Ключ пропал из этого списка и стоил нам issue #38 «Бесполезная кнопка
+    # отключения авто обновлений». Механика ровно та же, что описана абзацем
+    # выше: панель дописывает Z2K_AUTO_UPDATE_ENABLED=0 в конец конфига, а
+    # следующая регенерация пишет файл заново по списку, ключа в нём нет, он
+    # исчезает — и read_flag возвращает умолчание, то есть «включено».
+    # Регенерацию вызывает любой другой тумблер панели и само ночное
+    # обновление, поэтому выключение не переживало ни одного цикла.
+    local saved_Z2K_AUTO_UPDATE_ENABLED="1"
+    # Транспорт WARP, выбранный в панели. Та же механика пропажи, что выше:
+    # без этой строки выбор сбрасывался бы в автомат любым тумблером.
+    local saved_Z2K_WARP_TRANSPORT="auto"
+    local saved_Z2K_WARP_WDTT="0"
+    # Час ночного автообновления (issue #60). Читается планировщиком
+    # (files/z2k-scheduler.sh), ставится в панели: «Режимы» → Автообновление.
+    local saved_Z2K_AU_HOUR="02"
+    if [ -f "$config_file" ]; then
+        saved_GAME_WARP_ENABLED=$(safe_config_read "GAME_WARP_ENABLED" "$config_file" "0")
+        saved_TG_PROXY_USER_DISABLED=$(safe_config_read "TG_PROXY_USER_DISABLED" "$config_file" "0")
+        # ENABLED — master service on/off gate (read by S99zapret2.new start()).
+        # Was hardcoded =1 below and NOT preserved, so a user who stopped the
+        # service (ENABLED=0) saw it resurrected by the next config regen
+        # (auto-update reinstall / any toggle / reboot). Now preserved like
+        # DISABLE_CUSTOM. Default 1: fresh install or a config missing the key
+        # comes up enabled, so users who never stopped are unaffected.
+        saved_ENABLED=$(safe_config_read "ENABLED" "$config_file" "1")
+        # Z2K_CIRCULAR_RESET — RST ретрансмиттеру после фиксации неудачи
+        # (см. ensure_circular_doc_args). Умолчание 1, переживает регенерацию.
+        saved_Z2K_CIRCULAR_RESET=$(safe_config_read "Z2K_CIRCULAR_RESET" "$config_file" "1")
+        saved_Z2K_DISCORD_UPDATE_TLS_TIMEOUT=$(safe_config_read "Z2K_DISCORD_UPDATE_TLS_TIMEOUT" "$config_file" "1")
+        saved_Z2K_PADENCAP=$(safe_config_read "Z2K_PADENCAP" "$config_file" "1")
+        saved_Z2K_NFQWS2_TEMPLATES=$(safe_config_read "Z2K_NFQWS2_TEMPLATES" "$config_file" "1")
+        saved_Z2K_INJECT_TLS_MODS=$(safe_config_read "Z2K_INJECT_TLS_MODS" "$config_file" "0")
+        # Z2K_AUTOHOSTLIST — default 0, deliberately against the "new flags come
+        # on" rule. It does not improve behaviour, it swaps the filtering mode
+        # for ALL traffic: nfqws2 starts deciding for itself which hosts are
+        # blocked and appends them to the RKN list. That was asked for as an
+        # option, not as a change for everyone.
+        saved_Z2K_AUTOHOSTLIST=$(safe_config_read "Z2K_AUTOHOSTLIST" "$config_file" "0")
+        saved_Z2K_DYNAMIC_TTL=$(safe_config_read "Z2K_DYNAMIC_TTL" "$config_file" "1")
+        saved_Z2K_INSTA_DNS=$(safe_config_read "Z2K_INSTA_DNS" "$config_file" "1")
+        saved_Z2K_REDIRECTOR_DNS=$(safe_config_read "Z2K_REDIRECTOR_DNS" "$config_file" "1")
+        # DISABLE_CUSTOM — custom.d on/off (inverse: 0 = custom.d enabled). Was
+        # hardcoded =1 in the generated config and NOT preserved, so enabling
+        # custom.d (menu [S] / webpanel) survived only until the next config
+        # regen (any other toggle / auto-update) silently re-disabled it. Now
+        # preserved like the other knobs.
+        saved_DISABLE_CUSTOM=$(safe_config_read "DISABLE_CUSTOM" "$config_file" "1")
+        # Keenetic policy integration (см. S99zapret2.new:919-1100). По умолчанию
+        # nfqws=POLICY_NAME, exclude=0 (= "process only this policy"); если юзер
+        # явно настроил bypass конкретного устройства через создание политики +
+        # POLICY_EXCLUDE=1 в config'е — preserve'им через reinstall.
+        saved_POLICY_NAME=$(safe_config_read "POLICY_NAME" "$config_file" "nfqws")
+        saved_POLICY_EXCLUDE=$(safe_config_read "POLICY_EXCLUDE" "$config_file" "0")
+        # Z2K_PPE_DEOFFLOAD_QUIC — разгрузка QUIC-рукопожатия от аппаратного
+        # ускорителя Keenetic, ручной ключ (по умолчанию 1). TCP-разгрузка своего
+        # ключа больше не имеет: работает всегда, где прошивка её умеет.
+        saved_Z2K_PPE_DEOFFLOAD_QUIC=$(safe_config_read "Z2K_PPE_DEOFFLOAD_QUIC" "$config_file" "1")
+        # Z2K_SNI_STALL — выключатель обхода обрыва на 16 КБ (генератор, блок
+        # sni_pick). Раньше его не было ни здесь, ни в heredoc: выключатель
+        # исчезал при первой же пересборке (ревью 25.10.2026).
+        saved_Z2K_SNI_STALL=$(safe_config_read "Z2K_SNI_STALL" "$config_file" "1")
+        case "$saved_Z2K_SNI_STALL" in 0|1) ;; *) saved_Z2K_SNI_STALL=1 ;; esac
+        # Z2K_GV_SERVER_REPLY2 — выключатель пробы в профиле googlevideo.
+        # S99 ставит правило NAT по наличию шага в собранном NFQWS2_OPT.
+        # Ключ обязан сохраняться здесь и выводиться ниже: после обновления
+        # новый выбор человека не должен теряться при пересборке.
+        # Missing values were frozen by z2k_migrate_toggle_values above.
+        saved_Z2K_GV_SERVER_REPLY2=$(safe_config_read "Z2K_GV_SERVER_REPLY2" "$config_file" "")
+        case "$saved_Z2K_GV_SERVER_REPLY2" in 0|1|"") ;; *) saved_Z2K_GV_SERVER_REPLY2="" ;; esac
+        # Compatibility only: preserve an existing inert key, never create a toggle.
+        saved_Z2K_PROVIDER_CACHE=$(safe_config_read "Z2K_PROVIDER_CACHE" "$config_file" "")
+        case "$saved_Z2K_PROVIDER_CACHE" in 0|1) ;; *) saved_Z2K_PROVIDER_CACHE="" ;; esac
+        # Тумблеры QUIC сохраняются тем же механизмом.
+        saved_Z2K_QUIC_OFF=$(safe_config_read "Z2K_QUIC_OFF" "$config_file" "")
+        case "$saved_Z2K_QUIC_OFF" in 0|1|"") ;; *) saved_Z2K_QUIC_OFF="" ;; esac
+        saved_Z2K_YT_QUIC_OFF=$(safe_config_read "Z2K_YT_QUIC_OFF" "$config_file" "")
+        case "$saved_Z2K_YT_QUIC_OFF" in 0|1|"") ;; *) saved_Z2K_YT_QUIC_OFF="" ;; esac
+        saved_Z2K_PANEL_AUTH=$(safe_config_read "Z2K_PANEL_AUTH" "$config_file" "0")
+        saved_Z2K_AUTO_UPDATE_ENABLED=$(safe_config_read "Z2K_AUTO_UPDATE_ENABLED" "$config_file" "1")
+        saved_Z2K_WARP_TRANSPORT=$(safe_config_read "Z2K_WARP_TRANSPORT" "$config_file" "auto")
+        saved_Z2K_WARP_WDTT=$(safe_config_read "Z2K_WARP_WDTT" "$config_file" "0")
+        case "$saved_Z2K_WARP_WDTT" in 0|1) ;; *) saved_Z2K_WARP_WDTT=0 ;; esac
+        # В heredoc значение уходит без кавычек — пропускаем только известное.
+        case "$saved_Z2K_WARP_TRANSPORT" in wg|h2) ;; *) saved_Z2K_WARP_TRANSPORT=auto ;; esac
+        saved_Z2K_AU_HOUR=$(safe_config_read "Z2K_AU_HOUR" "$config_file" "02")
+        # Час — ровно две цифры 00..23. Мусор (правка руками, обрезанный
+        # конфиг) молча возвращает ночное умолчание: планировщик сравнивает
+        # строки, и «2» вместо «02» означало бы «никогда».
+        case "$saved_Z2K_AU_HOUR" in [01][0-9]|2[0-3]) ;; *) saved_Z2K_AU_HOUR=02 ;; esac
+    fi
+
+    # NFQWS2_TCP_PKT_IN — глубина наблюдения за ответом, см. z2k_reply_pkt_cap.
+    local nfqws2_tcp_pkt_in
+    nfqws2_tcp_pkt_in=$(z2k_reply_pkt_cap)
+
+    # Создать полный config файл
+    local z2k_mode_filter=hostlist
+    [ "${saved_Z2K_AUTOHOSTLIST:-0}" = "1" ] && [ "$saved_category_rkn" != 0 ] && z2k_mode_filter=autohostlist
+
+    # Пороги детектора автохостлиста. Наружу не выставлены: их не крутит ни
+    # меню, ни панель — это ручка для разбора конкретного тикета. В конфиге
+    # они лежат закомментированными вместе с дефолтами движка, чтобы было
+    # видно, что вообще можно подкрутить и каким значением; раскомментированное
+    # переживает регенерацию, как и всё остальное, что задал человек.
+    #
+    # Значение чистим до цифр: строка уходит и в аргументы демона, и обратно в
+    # конфиг, который сорсится от root. Апостроф в числовом поле — это не
+    # злоумышленник, это опечатка, но сервис от неё не поднимется.
+    local _ah_block="" _ah_pair _ah_name _ah_def _ah_cur
+    for _ah_pair in FAIL_THRESHOLD=3 FAIL_TIME=60 RETRANS_THRESHOLD=3 RETRANS_RESET=1 \
+                    RETRANS_MAXSEQ=32768 INCOMING_MAXSEQ=4096 UDP_IN=1 UDP_OUT=4 DEBUGLOG=0; do
+        _ah_name="AUTOHOSTLIST_${_ah_pair%%=*}"
+        _ah_def="${_ah_pair#*=}"
+        _ah_cur=$(safe_config_read "$_ah_name" "$config_file" "")
+        _ah_cur=$(printf '%s' "$_ah_cur" | tr -dc '0-9')
+        if [ -n "$_ah_cur" ]; then
+            _ah_block="${_ah_block}${_ah_name}=${_ah_cur}
+"
+        else
+            _ah_block="${_ah_block}#${_ah_name}=${_ah_def}
+"
+        fi
+    done
+
+    # Пишем во ВРЕМЕННЫЙ файл, а боевой подменяем одним rename в самом конце.
+    #
+    # Ниже конфиг собирается десятком отдельных `>>`. Раньше они шли прямо в
+    # боевой файл, и любой обрыв в середине (полный /opt, умирающий NAND —
+    # прецедент с 0xFF-мусором в Strategy.txt был) оставлял ПОЛУКОНФИГ, который
+    # S99zapret2 сорсит на следующем бутe от root. Функция при этом печатала
+    # «Config файл создан» и возвращала 0.
+    #
+    # Все чтения саженных значений (safe_config_read выше) уже отработали по
+    # боевому файлу, так что подмена цели здесь безопасна.
+    local _cfg_target="$config_file"
+    config_file="${_cfg_target}.new.$$"
+    rm -f "$config_file"
+
+    cat > "$config_file" <<CONFIG
+# zapret2 configuration for Keenetic
+# Generated by z2k installer
+# Based on official zapret2 config structure
+
+# ==============================================================================
+# BASIC SETTINGS
+# ==============================================================================
+
+# Enable zapret2 service
+ENABLED=${saved_ENABLED}
+
+# Mode filter: none, ipset, hostlist, autohostlist
+# Default is hostlist — domains come from explicit hostlist files. With
+# Z2K_AUTOHOSTLIST=1 the engine switches to autohostlist and works out the
+# blocked hosts itself (see ensure_autohostlist_files / sync_autohostlist_to_rkn
+# in S99zapret2), appending what it finds to the RKN list.
+MODE_FILTER=${z2k_mode_filter}
+Z2K_AUTOHOSTLIST=${saved_Z2K_AUTOHOSTLIST}
+Z2K_CATEGORY_YOUTUBE=${saved_category_youtube}
+Z2K_CATEGORY_RKN=${saved_category_rkn}
+Z2K_CATEGORY_DISCORD_VOICE=${saved_category_voice}
+
+# Пороги детектора автохостлиста. Действуют только при Z2K_AUTOHOSTLIST=1.
+# Закомментировано = значение по умолчанию самого движка (показано справа).
+# FAIL_THRESHOLD — сколько неудач подряд заносят хост в список
+# FAIL_TIME — за сколько секунд от ПЕРВОЙ неудачи они должны уложиться
+# RETRANS_* — что считать неудачей по TCP-ретрансмиссиям
+# INCOMING_MAXSEQ — до какого места во входящем потоке ищется RST/редирект
+# UDP_IN/UDP_OUT — критерий неудачи для QUIC/UDP
+# DEBUGLOG=1 — построчный лог решений детектора (пишется на флеш, включать точечно)
+${_ah_block}
+
+# Firewall type - AUTO-DETECTED by init script, DO NOT set manually
+# Init script calls linux_fwtype() which detects iptables/nftables automatically
+# If FWTYPE is set here, linux_fwtype() will skip detection!
+#FWTYPE=iptables
+
+# ==============================================================================
+# NFQWS2 DAEMON SETTINGS
+# ==============================================================================
+
+# Enable nfqws2
+NFQWS2_ENABLE=1
+
+# TCP ports to process (will be filtered by --filter-tcp in NFQWS2_OPT).
+# Base only: HTTP/HTTPS + Cloudflare alternates. game_mode hybrid/aggressive
+# used to append 1024-65535 here to feed a catch-all TCP profile, but that
+# profile also matched the router's OUTPUT replies to LAN clients and
+# broke the web UI — removed 2026-04-24.
+# 5222 — шлюз WhatsApp (Noise поверх TCP). Без него пакеты рукопожатия не
+# попадают в NFQUEUE вовсе, и расщепить их нечем: см. профиль wa_noise.
+NFQWS2_PORTS_TCP="80,443,2053,2083,2087,2096,5222,8443"
+
+# UDP ports to process (will be filtered by --filter-udp in NFQWS2_OPT)
+NFQWS2_PORTS_UDP="443,50000-50100,1400,3478-3481,5349,19294-19344"
+
+# Discord voice/STUN: KEEPALIVE DISABLED (empty) — по канону bol-van.
+# Раньше (2026-06-11) на discord-портах connbytes-лимит снимался (keepalive),
+# и dbankcloud-fake летел на КАЖДЫЙ исходящий пакет флоу. Это ломало видео-стрим:
+# непрерывный decoy перед каждым медиапакетом → пинг 5000 сразу при старте стрима.
+# bol-van (#4450): "на linux нас спасёт connbytes" — медиапоток нельзя гнать
+# через NFQUEUE целиком; пробивается маленьким cutoff на старте, не keepalive'ом.
+# Теперь discord-порты идут под стандартным connbytes 1:5 (NFQWS2_PORTS_UDP) +
+# --out-range=-d4 в самой стратегии (тугой cutoff, #1267 "n2 или d2 лучше").
+# Голос пробивается на старте, стрим не страдает. Пусто = keepalive-правил нет.
+NFQWS2_PORTS_UDP_KEEPALIVE=""
+
+# Packet direction filters (connbytes)
+# NOTE: These are packet counts, NOT ranges
+# PKT_OUT=20 means "first 20 packets" (connbytes 1:20)
+# Official zapret2 defaults: TCP_PKT_OUT=20, UDP_PKT_OUT=5
+NFQWS2_TCP_PKT_OUT="20"
+NFQWS2_TCP_PKT_IN="${nfqws2_tcp_pkt_in}"
+# UDP-окно: 8/8 вместо апстримных 5/3.
+#
+# Замер 2026-08-19 на боевом роутере, 1646 QUIC-потоков. Окно в 3 входящих
+# НЕ ДЕРЖИТ: в журнале есть потоки с семью и более входящими, дошедшими до
+# демона. Причина — kernel-conntrack по UDP протухает за 30 секунд, запись
+# пересоздаётся, connbytes считает заново, а собственный ctrack демона живёт
+# 60 секунд (CTRACK_T_UDP) и продолжает копить. То есть счётчики у нас
+# работают благодаря протуханию conntrack, а не вопреки ему.
+#
+# Полагаться на это нельзя: на роутере с другими таймаутами окно окажется
+# жёстким потолком в 3 пакета, и порог успеха udp_in станет недостижим —
+# получим ровно тот баг, который здесь и чиним (успех не срабатывает никогда,
+# провалы копятся без сброса, страта ротируется на здоровом трафике).
+#
+# Мануал, «Обслуживание позиций»: «Счетчик не может и не будет считать то,
+# что не перехватывается», и там же у детекторов: «требуют перенаправления
+# входящего и исходящего трафика в объеме, необходимом для срабатывания их
+# критериев». В собственном примере правил перехвата мануал ставит
+# MAX_PKT_IN=15 и MAX_PKT_OUT=15 одинаково для TCP и UDP, так что 8 —
+# осторожная величина, а не смелая. TCP у нас давно 50/20.
+#
+# Инвариант, который обязан держаться: окно > порога детектора.
+#   quic      udp_in=1 udp_out=5   -> нужно >=6, ставим 8
+#   discord   udp_in=1 udp_out=4   -> нужно >=5, ставим 8
+NFQWS2_UDP_PKT_OUT="${Z2K_UDP_PKT_OUT}"
+NFQWS2_UDP_PKT_IN="${Z2K_UDP_PKT_IN}"
+
+# ==============================================================================
+# NFQWS2 OPTIONS (MULTI-PROFILE MODE)
+# ==============================================================================
+# This section is auto-generated from z2k strategy database
+# Each --new separator creates independent profile with own filters and strategy
+# Order: RKN TCP → YouTube GV → YouTube TCP → QUIC YT → Discord UDP → HTTP RKN → Catch-all TCP
+# Profiles use explicit hostlists from z2k list files without placeholder expansion.
+# This avoids mixing with global hostlists from MODE_FILTER.
+CONFIG
+
+    # Добавить сгенерированный NFQWS2_OPT
+    echo "$nfqws2_opt_section" >> "$config_file"
+
+    # Добавить остальные настройки
+    cat >> "$config_file" <<'CONFIG'
+
+# ==============================================================================
+# FIREWALL SETTINGS
+# ==============================================================================
+
+# Queue number for NFQUEUE
+QNUM=200
+
+# Firewall mark for desync prevention
+DESYNC_MARK=0x40000000
+DESYNC_MARK_POSTNAT=0x20000000
+
+# Apply firewall rules in init script
+INIT_APPLY_FW=1
+
+# Flow offloading mode: none, software, hardware, donttouch
+# Set during installation based on system detection
+CONFIG
+    # FLOWOFFLOAD must carry the value computed above, not the literal text —
+    # the heredocs around it are single-quoted (literal), so emit it separately.
+    echo "FLOWOFFLOAD=$flowoffload_value" >> "$config_file"
+    cat >> "$config_file" <<'CONFIG'
+
+# WAN interface override (space/comma separated). Empty = auto-detect
+#WAN_IFACE=
+
+# ==============================================================================
+# SYSTEM SETTINGS
+# ==============================================================================
+
+# Temporary directory for downloads and processing
+# Empty = use system default /tmp (tmpfs, in RAM)
+# Set to disk path for low RAM systems (e.g., /opt/zapret2/tmp)
+CONFIG
+    # Добавить TMPDIR только если установлен
+    if [ -n "$tmpdir_value" ]; then
+        echo "TMPDIR=$tmpdir_value" >> "$config_file"
+    else
+        echo "#TMPDIR=/opt/zapret2/tmp" >> "$config_file"
+    fi
+
+    # Disable IPv6 processing (0=enabled, 1=disabled)
+    # Auto-detected during install; can be overridden by setting DISABLE_IPV6 in environment/config.
+    echo "" >> "$config_file"
+    echo "# Disable IPv6 processing (0=enabled, 1=disabled)" >> "$config_file"
+    echo "DISABLE_IPV6=$disable_ipv6_value" >> "$config_file"
+
+    cat >> "$config_file" <<'CONFIG'
+
+# ==============================================================================
+# IPSET SETTINGS
+# ==============================================================================
+
+# Maximum elements in ipsets
+SET_MAXELEM=522288
+
+# ipset options
+IPSET_OPT="hashsize 262144 maxelem $SET_MAXELEM"
+
+# ip2net options
+IP2NET_OPT4="--prefix-length=22-30 --v4-threshold=3/4"
+IP2NET_OPT6="--prefix-length=56-64 --v6-threshold=5"
+
+# Пороги автохостлиста живут выше, рядом с MODE_FILTER (секция с подстановкой):
+# этот heredoc в одинарных кавычках и сохранённые значения сюда не подставить.
+
+# ==============================================================================
+# CUSTOM SCRIPTS
+# ==============================================================================
+
+# Directory for custom scripts
+CUSTOM_DIR="/opt/zapret2/init.d/keenetic"
+# DISABLE_CUSTOM is emitted in the variable-expanding section below (with the
+# other saved_* flags) so the user's choice survives config regeneration —
+# do NOT hardcode it here (this heredoc is single-quoted, no expansion).
+
+# ==============================================================================
+# MISCELLANEOUS
+# ==============================================================================
+
+# Temporary directory (if /tmp is too small)
+#TMPDIR=/opt/zapret2/tmp
+
+# User for zapret daemons (security hardening: drop privileges to nobody)
+WS_USER=nobody
+
+# Compress large lists
+GZIP_LISTS=1
+
+# Number of parallel threads for domain resolves
+MDIG_THREADS=30
+
+# EAI_AGAIN retries
+MDIG_EAGAIN=10
+MDIG_EAGAIN_DELAY=500
+CONFIG
+
+    # ОДИНАРНЫЕ КАВЫЧКИ ДЛЯ ЗНАЧЕНИЙ, КОТОРЫЕ ПИШЕТ ЧЕЛОВЕК.
+    #
+    # Конфиг не читается — он ИСПОЛНЯЕТСЯ: S99zapret2.new сорсит его через точку
+    # от root. Имя политики Keenetic человек задаёт сам, произвольным текстом, и
+    # оно проходит полный круг: меню/вебпанель → конфиг → safe_config_read →
+    # снова конфиг при каждой регенерации. Двойные кавычки, поставленные здесь
+    # ради пробелов и кириллицы, от разбиения на слова спасают, но подстановку
+    # не запрещают: `$(...)`, обратные кавычки и `$VAR` внутри значения
+    # выполнятся при следующем сорсинге с правами root. Одинарные кавычки не
+    # раскрывают ничего вообще, а единственный символ, который в них не живёт —
+    # сама одинарная кавычка — экранируется приёмом '\'' ниже.
+    #
+    # Это не гипотеза про злоумышленника: достаточно апострофа в имени вроде
+    # «Vasya's network», чтобы конфиг перестал сорситься и сервис не поднялся.
+    _pn_q=$(printf '%s' "$saved_POLICY_NAME" | sed "s/'/'\\\\''/g")
+    _pe_q=$(printf '%s' "$saved_POLICY_EXCLUDE" | sed "s/'/'\\\\''/g")
+
+    # Append settings that need variable expansion (heredoc with quotes doesn't expand)
+    # База для ночного обновления списков доменов. Это ПОСТОЯННОЕ значение, а не
+    # источник текущего прогона: z2k-update-lists.sh читает его из конфига по
+    # расписанию, годами.
+    #
+    # Обновление на время своей работы пинит GITHUB_RAW на НЕИЗМЕНЯЕМЫЙ тег
+    # релиза, чтобы всё приехало из одного среза. Раньше этот пин утекал сюда и
+    # застывал в конфиге: роутер, переустановившийся на r-79.7, потом вечно
+    # тянул списки из тега r-79.7 — ветка уезжала, а у него списки замирали, и
+    # ни в одном логе это не выглядело ошибкой. С переходом на адресные
+    # обновления переустановки стали редкими, то есть пин жил бы дольше.
+    #
+    # Поэтому пин срезаем: в конфиг идёт ветка, из которой роутер живёт.
+    _z2k_persist_raw="${GITHUB_RAW:-https://raw.githubusercontent.com/necronicle/z2k/z2k-enhanced}"
+    case "$_z2k_persist_raw" in
+        */necronicle/z2k/z2k-enhanced|*/necronicle/z2k/z2k-staging) ;;
+        */necronicle/z2k/*)
+            _z2k_persist_raw="${Z2K_RELEASE_BRANCH:-https://raw.githubusercontent.com/necronicle/z2k/z2k-enhanced}" ;;
+    esac
+
+    local _gv_preflight_line="# Z2K_GV_SERVER_REPLY2 не задан: действует умолчание версии"
+    [ -n "$saved_Z2K_GV_SERVER_REPLY2" ] && _gv_preflight_line="Z2K_GV_SERVER_REPLY2=${saved_Z2K_GV_SERVER_REPLY2}"
+    local _quic_off_line="# Z2K_QUIC_OFF не задан: действует умолчание версии"
+    [ -n "$saved_Z2K_QUIC_OFF" ] && _quic_off_line="Z2K_QUIC_OFF=${saved_Z2K_QUIC_OFF}"
+    local _yt_quic_off_line="# Z2K_YT_QUIC_OFF не задан: действует умолчание версии"
+    [ -n "$saved_Z2K_YT_QUIC_OFF" ] && _yt_quic_off_line="Z2K_YT_QUIC_OFF=${saved_Z2K_YT_QUIC_OFF}"
+    cat >> "$config_file" <<EOF
+
+# Game WARP mode — route game-server ipset through Cloudflare WARP (usque/MASQUE);
+# engine is z2k-warp.sh. Toggled from the webpanel / menu [E].
+GAME_WARP_ENABLED=${saved_GAME_WARP_ENABLED}
+
+# Telegram tunnel: user-disable flag from menu/webpanel "Stop tunnel".
+# Preserved across reinstall так что step_finalize autostart не воскрешал
+# daemon, который юзер явно остановил.
+TG_PROXY_USER_DISABLED=${saved_TG_PROXY_USER_DISABLED}
+
+# RST ретрансмиттеру после фиксации неудачи ротатором (аргумент reset у
+# circular, документация nfqws2). 1 — включено; 0 — откат, если на линии
+# RST рвёт живые потоки.
+Z2K_CIRCULAR_RESET=${saved_Z2K_CIRCULAR_RESET}
+
+# Experimental: recover ACKed ClientHello without any TLS reply ONLY for
+# updates.discord.com in the RKN pool. 10s deadline, at most 6 retries / 5min.
+# 0 disables it; Z2K_CIRCULAR_RESET=0 also disables intervention.
+Z2K_DISCORD_UPDATE_TLS_TIMEOUT=${saved_Z2K_DISCORD_UPDATE_TLS_TIMEOUT}
+
+# TLS extension auto-injection master switch (default 0, 2026-05-03):
+# выключено по дефолту после field-проверки — auto-injection
+# z2k_grease/alpn/psk/keyshare/earlydata/pha/sct/delegcred/padencap к
+# fake-стратегиям ломала handshake на cloudflare и большинстве хостов
+# до r2 fix, после r2 даёт слабую JA3-distortion которой autocircular
+# не выбирает. =1 для opt-in возврата автоинъекции (вместе с
+# Z2K_PADENCAP=1 для управления padencap).
+Z2K_INJECT_TLS_MODS=${saved_Z2K_INJECT_TLS_MODS}
+
+# Dynamic TTL fool hook auto-inject (default 1). =0 для опт-аута на
+# сетапах с принудительным NDM TTL-fix (команда "ip ttl-fix" на Keenetic при
+# модемном тарифе с запретом раздачи: телефонная симка + IMEI-
+# маскировка). В такой топологии NDM всё равно перебивает TTL всех
+# исходящих, поэтому inject избыточен; опт-аут оставляет fake'ам
+# default TTL стека и убирает per-fake lua call overhead на слабом MIPS.
+Z2K_DYNAMIC_TTL=${saved_Z2K_DYNAMIC_TTL}
+
+# Статические ip host для Instagram (обход DNS-отравления). 0 — юзер убрал их
+# через меню [I]; установка и ежедневный рефреш их тогда не возвращают
+# (issue #39). Переживает реинсталл. «Вернуть» в [I] ставит 1.
+Z2K_INSTA_DNS=${saved_Z2K_INSTA_DNS}
+
+# Alternative redirector.googlevideo.com DNS from VPS; no proxy or HTTP probe.
+# 0 stops automatic refresh and preserves existing records.
+Z2K_REDIRECTOR_DNS=${saved_Z2K_REDIRECTOR_DNS}
+
+# Custom.d scripts (50-stun4all / 50-discord-media — STUN desync that fixes
+# WhatsApp/Telegram voice on some networks). Default 1 = disabled (z2k's own
+# Discord strategy covers most cases). Enable via menu [S] / webpanel toggle
+# (sets 0). Emitted here (expanding heredoc) with the preserved value so a regen
+# from another toggle or auto-update no longer silently re-disables custom.d.
+DISABLE_CUSTOM=${saved_DISABLE_CUSTOM}
+
+# TLS padding extension flag — действует только когда
+# Z2K_INJECT_TLS_MODS=1. Управляет добавлением padencap в дополнение
+# к z2k_grease/alpn/psk/keyshare/earlydata/pha/sct/delegcred. =0 для
+# отката padencap при включённой остальной инъекции.
+Z2K_PADENCAP=${saved_Z2K_PADENCAP}
+
+# Форма записи профилей в NFQWS2_OPT. =1 — общий арсенал объявляется один раз
+# (--template) и подставляется в профили (--import); строка короче на 13 КБ, а
+# правка арсенала физически не может разъехаться между профилями. =0 — прежняя
+# плоская запись, где каждый профиль несёт свою полную копию. Аварийный
+# выключатель: на поведение движка не влияет (проверено дампом профилей —
+# идентичны), но если формат чем-то помешает, откат не требует нового релиза.
+Z2K_NFQWS2_TEMPLATES=${saved_Z2K_NFQWS2_TEMPLATES}
+
+# Keenetic policy integration (см. S99zapret2.new). POLICY_NAME — имя политики
+# в админке Keenetic, POLICY_EXCLUDE — режим:
+#   0 — обрабатывать ТОЛЬКО устройства из этой политики (default — политики
+#       нет, NFQUEUE-rules применяются к всему трафику фактически)
+#   1 — исключить устройства из этой политики из обработки z2k (нужно если
+#       одно устройство должно ходить direct без модификации пакетов)
+# preserve через reinstall (без префикса Z2K_, поэтому добавлены в whitelist).
+# В ОДИНАРНЫХ КАВЫЧКАХ. Конфиг исполняется как скрипт (files/S99zapret2.new:197
+# сорсит его через точку от root), а имя политики Keenetic человек задаёт сам и
+# по-русски: «Через ВПН», «Прямой канал». Без кавычек такое присваивание
+# разваливается на POLICY_NAME=Через и попытку выполнить ВПН как команду.
+# Двойные кавычки, стоявшие здесь раньше, чинили только это, но оставляли
+# работающими подстановку команд, обратные кавычки и подстановку переменных —
+# при следующем сорсинге они исполнились бы от root. Одинарные не раскрывают
+# ничего; экранирование самой кавычки сделано выше, при вычислении _pn_q/_pe_q.
+# (Этот комментарий уезжает в сам конфиг, поэтому написан без знака доллара:
+# внутри heredoc он раскрылся бы прямо при генерации.)
+# Отчёт 2026-08-05: «нельзя прописать политику кириллицей и с пробелом».
+POLICY_NAME='${_pn_q}'
+POLICY_EXCLUDE='${_pe_q}'
+
+# Разгрузка QUIC-рукопожатия от аппаратного ускорителя Keenetic (первые пакеты
+# соединения идут мимо ускорителя, чтобы обход видел ответ). 0 — только TCP.
+Z2K_PPE_DEOFFLOAD_QUIC=${saved_Z2K_PPE_DEOFFLOAD_QUIC}
+# Обход обрыва на 16 КБ (подстановка белого имени по сети, см. state/tcp16_*).
+# 0 — выключить механизм, даже если проба нашла блок.
+Z2K_SNI_STALL=${saved_Z2K_SNI_STALL}
+# «Видео YouTube: обход по ответу сервера»: пробное соединение перед настоящим, только
+# googlevideo и загрузки Google Play (gvt1); на IPv6 — там, где он без NAT (lua/z2k-preflight.lua). Лечит адреса, которые режутся
+# по ответу сервера: соединение встаёт, а ServerHello не приходит, и плечи там не
+# помогают. Соединение с узлом Google начинается примерно на полсекунды позже; в
+# том числе там, где блока нет. Пока ключа нет — включено (умолчание версии). 0 — выключить.
+# Тумблер в панели, «Режимы»: при ручной правке нужна ещё пересборка конфига,
+# одного перезапуска мало.
+${_gv_preflight_line}
+${saved_Z2K_PROVIDER_CACHE:+Z2K_PROVIDER_CACHE=$saved_Z2K_PROVIDER_CACHE}
+# QUIC мимо обхода: роутер отказывает QUIC, браузер и приложения сразу идут по TCP.
+# Z2K_YT_QUIC_OFF=1 — только YouTube («YouTube без QUIC»), Z2K_QUIC_OFF=1 — весь
+# QUIC («Весь QUIC через TCP»). Пока ключа нет — выключено (умолчание версии).
+# Тумблеры в панели, «Режимы»; при ручной правке нужна пересборка конфига.
+${_yt_quic_off_line}
+${_quic_off_line}
+Z2K_PANEL_AUTH=${saved_Z2K_PANEL_AUTH}
+Z2K_AUTO_UPDATE_ENABLED=${saved_Z2K_AUTO_UPDATE_ENABLED}
+Z2K_WARP_TRANSPORT=${saved_Z2K_WARP_TRANSPORT}
+Z2K_WARP_WDTT=${saved_Z2K_WARP_WDTT}
+# Час ночного автообновления, 00..23 по времени роутера. Реальный запуск
+# позже на 0..60 минут: разброс детерминированный по хосту, чтобы флот не
+# пришёл к GitHub в одну секунду (см. z2k_host_jitter в z2k-auto-update.sh).
+Z2K_AU_HOUR=${saved_Z2K_AU_HOUR}
+
+# Persist the branch URL that this install was booted from, so that
+# z2k-update-lists.sh and other post-install tools (cron-driven) can
+# continue pulling from the SAME branch instead of defaulting back to
+# master. Set automatically from \$GITHUB_RAW at install time; edit by
+# hand only if you know what you are doing.
+Z2K_GITHUB_RAW="${_z2k_persist_raw}"
+EOF
+
+    # Записалось ли всё до конца. Хвост heredoc'а — последнее, что попадает в
+    # файл, поэтому его наличие и есть признак «конфиг не обрезан».
+    if [ ! -s "$config_file" ] || ! grep -q '^Z2K_GITHUB_RAW=' "$config_file"; then
+        print_error "Конфиг записан не полностью — боевой файл оставлен прежним"
+        rm -f "$config_file"
+        config_file="$_cfg_target"
+        return 1
+    fi
+
+    # Preserve every registered switch, including future additions not yet
+    # represented by the static heredoc. Existing values win byte-for-byte.
+    local _toggle_key _toggle_def _toggle_off _toggle_line
+    while read -r _toggle_key _toggle_def _toggle_off; do
+        # IPv6 has its own explicit env > config > prior-tree precedence.
+        [ "$_toggle_key" != DISABLE_IPV6 ] || continue
+        _toggle_line=""
+        if [ "$_toggle_existing" = 1 ]; then
+            _toggle_line=$(grep -m1 "^${_toggle_key}=" "$_cfg_target")
+        elif ! grep -q "^${_toggle_key}=" "$config_file"; then
+            _toggle_line="${_toggle_key}=${_toggle_def}"
+        fi
+        [ -n "$_toggle_line" ] || continue
+        if grep -q "^${_toggle_key}=" "$config_file"; then
+            awk -v key="$_toggle_key" '
+                NR==FNR { if ($0 ~ "^" key "=" && !found) { line=$0; found=1 }; next }
+                $0 ~ "^" key "=" { print line; next }
+                { print }
+            ' "$_cfg_target" "$config_file" > "${config_file}.keep" || return 1
+            mv -f "${config_file}.keep" "$config_file" || return 1
+        else
+            printf '%s\n' "$_toggle_line" >> "$config_file" || return 1
+        fi
+    done <<Z2K_REGISTRY
+$(z2k_toggle_defaults)
+Z2K_REGISTRY
+
+    # Relay/proxy overrides are optional and are not emitted by the template.
+    # Preserve them across regeneration, including custom reseller endpoints.
+    if [ -f "$_cfg_target" ]; then
+        grep -E '^Z2K_(RELAY_URL|RELAY_SECRET|WARP_VPS_PROXY|VPS_GH_IP|OPKG_VPS)=' "$_cfg_target" >> "$config_file" || true
+    fi
+
+    # Подмена одним rename: на той же ФС это атомарно, и сорсящий init-скрипт
+    # видит либо старый конфиг целиком, либо новый целиком, но не половину.
+    if ! mv -f "$config_file" "$_cfg_target"; then
+        print_error "Не удалось заменить конфиг — боевой файл оставлен прежним"
+        rm -f "$config_file"
+        config_file="$_cfg_target"
+        return 1
+    fi
+    config_file="$_cfg_target"
+    z2k_record_toggle_values "$config_file" "$(dirname "$config_file")/state" || return 1
+
+    z2k_retire_discovery || { print_error "Не удалось удалить старую автодетекцию"; return 1; }
+    z2k_retire_dns_redirect
+
+    print_success "Config файл создан: $config_file"
+    return 0
+}
+
+# ==============================================================================
+# ОБНОВЛЕНИЕ NFQWS2_OPT В СУЩЕСТВУЮЩЕМ CONFIG
+# ==============================================================================
+
+update_nfqws2_opt_in_config() {
+    # Обновляет только секцию NFQWS2_OPT в существующем config файле
+    # $1 - путь к config файлу
+
+    local config_file="${1:-/opt/zapret2/config}"
+
+    if [ ! -f "$config_file" ]; then
+        print_error "Config файл не найден: $config_file"
+        return 1
+    fi
+
+    print_info "Обновление NFQWS2_OPT в: $config_file"
+
+    # Создать backup. Проверяем: страховка, которая молча не создалась, хуже
+    # отсутствия страховки — на неё рассчитывают дальше по цепочке.
+    if ! cp "$config_file" "${config_file}.backup.$(date +%Y%m%d_%H%M%S)"; then
+        print_error "Не удалось создать резервную копию конфига — правку не делаем"
+        return 1
+    fi
+
+    # Генерировать новый NFQWS2_OPT (см. коммент в create_official_config:
+    # порченый Strategy.txt роняет генерацию, старый конфиг не переписываем).
+    local nfqws2_opt_section
+    nfqws2_opt_section=$(generate_nfqws2_opt_from_strategies) || return 1
+
+    # Создать временный файл
+    local temp_file="${config_file}.tmp"
+
+    # Удалить старый NFQWS2_OPT и добавить новый
+    awk '
+    /^NFQWS2_OPT=/ {
+        in_nfqws_opt=1
+        next
+    }
+    in_nfqws_opt && /^"$/ {
+        in_nfqws_opt=0
+        next
+    }
+    !in_nfqws_opt { print }
+    ' "$config_file" > "$temp_file" || {
+        print_error "Не удалось подготовить новый конфиг (обрыв записи)"
+        rm -f "$temp_file"
+        return 1
+    }
+
+    # Добавить новый NFQWS2_OPT в конец файла (перед последней секцией)
+    # Найти позицию для вставки (перед FIREWALL SETTINGS или в конец)
+    #
+    # Каждый шаг проверяется. Раньше ни awk, ни оба mv статус не отдавали, и
+    # обрыв записи (полный или умирающий NAND — прецедент с 0xFF-мусором в
+    # Strategy.txt был) укладывал усечённый конфиг поверх рабочего, а функция
+    # печатала «NFQWS2_OPT обновлён» и возвращала 0. Конфиг сорсится root-овым
+    # init-скриптом, так что полуфайл — это не косметика.
+    if grep -q "# FIREWALL SETTINGS" "$temp_file"; then
+        # Вставить перед FIREWALL SETTINGS
+        if ! awk -v opt="$nfqws2_opt_section" '
+        /# FIREWALL SETTINGS/ {
+            print opt
+            print ""
+        }
+        { print }
+        ' "$temp_file" > "${temp_file}.2"; then
+            print_error "Не удалось вставить NFQWS2_OPT (обрыв записи)"
+            rm -f "$temp_file" "${temp_file}.2"
+            return 1
+        fi
+        if ! mv "${temp_file}.2" "$temp_file"; then
+            print_error "Не удалось подготовить конфиг к замене"
+            rm -f "$temp_file" "${temp_file}.2"
+            return 1
+        fi
+    else
+        # Добавить в конец
+        if ! { echo "" >> "$temp_file" && echo "$nfqws2_opt_section" >> "$temp_file"; }; then
+            print_error "Не удалось дописать NFQWS2_OPT (обрыв записи)"
+            rm -f "$temp_file"
+            return 1
+        fi
+    fi
+
+    # Заменить оригинальный файл
+    if ! mv "$temp_file" "$config_file"; then
+        print_error "Не удалось заменить конфиг — оставлен прежний, рабочий"
+        rm -f "$temp_file"
+        return 1
+    fi
+
+    print_success "NFQWS2_OPT обновлён в config файле"
+    return 0
+}
+
+# ==============================================================================
+# ЭКСПОРТ ФУНКЦИЙ
+# ==============================================================================
+
+# Функции доступны после source этого файла

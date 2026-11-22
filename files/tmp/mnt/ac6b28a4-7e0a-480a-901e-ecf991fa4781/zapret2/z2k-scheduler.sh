@@ -1,0 +1,546 @@
+#!/bin/sh
+# z2k-scheduler.sh — z2k internal task scheduler.
+#
+# Replaces Vixie cron for ALL z2k periodic tasks on Keenetic Entware,
+# where the cron daemon's crontab reload mechanism is broken: even on a
+# fresh `crontab -` + spool-dir mtime update + SIGHUP, the daemon does
+# not pick up new entries (see field debug notes around r-26).
+#
+# Runs as a long-lived process started by S99z2k-scheduler at boot.
+# Sleeps ~30s between ticks, fires each registered task once per day at
+# the configured HH:MM. Persistent state at $STATE prevents re-firing
+# the same minute twice if we wake up multiple times within it.
+#
+# Tasks (HH:MM <command>):
+#   HH:00  z2k-auto-update.sh apply       — nightly auto-update, HH=Z2K_AU_HOUR (02)
+#   03:30  z2k-tcp16-probe.sh              — блок по объёму: сети и имя на каждую
+#   04:00  z2k-update-lists.sh             — RKN/YT hostlist refresh
+
+export PATH=/opt/sbin:/opt/bin:/opt/usr/sbin:/opt/usr/bin:/sbin:/usr/sbin:/bin:/usr/bin
+
+# ЧУЖИЕ МЕТКИ РУЧНОГО ОБНОВЛЕНИЯ — ЗА ПОРОГ.
+#
+# Мы вечный демон, и всё, что лежит в нашем окружении, мы раздаём КАЖДОЙ ночной
+# задаче через run_task до самой перезагрузки. А запускают нас в том числе из
+# середины обновления: установщик на шаге 12 делает
+# `/opt/etc/init.d/S99z2k-scheduler restart`, и если обновление начал человек
+# кнопкой в панели или пунктом меню, в окружении лежат Z2K_AU_MANUAL=1 и
+# Z2K_AU_NO_JITTER=1. Первая говорит z2k-auto-update.sh «это ручной запуск,
+# гейт не применяй» — то есть выключенное автообновление начинало срабатывать
+# каждую ночь. Вторая снимает разброс 0..60 мин и сводит такие роутеры в один
+# запрос к GitHub в 02:00:00.
+#
+# Источник чинится в z2k-auto-update.sh (он снимает метки с себя), здесь —
+# второй рубеж: он закрывает и путь через меню, и запуск планировщика руками из
+# SSH-сессии, где человек сам выставил переменную.
+unset Z2K_AU_MANUAL Z2K_AU_NO_JITTER
+
+ZAPRET2_DIR="/opt/zapret2"
+PIDFILE="${Z2K_SCHED_PIDFILE:-/var/run/z2k-scheduler.pid}"
+LOG="/opt/var/log/z2k-scheduler.log"
+# Flash (persistent) state — daily-cadence keys only (fired ≤1×/day). Persisting
+# these across reboot is the point: it stops a same-day re-fire after a restart.
+STATE="${ZAPRET2_DIR}/.z2k-scheduler-state"
+# Retire the old uploader from installations upgraded from earlier releases.
+rm -f "${ZAPRET2_DIR}/z2k-stats-upload.sh" 2>/dev/null || true
+# RAM state — minute-cadence epoch keys (tg-watchdog-epoch / ppe-deoffload-epoch).
+# These are rewritten ~2×/min; keeping them on flash burned ~2880 write+rename
+# per day (flash wear). They only gate "did we already fire this minute", which
+# is meaningless across a reboot, so /tmp (tmpfs) is the correct home.
+TMP_STATE="/tmp/.z2k-scheduler-state"
+
+# Don't double-launch.
+#
+# КОД ВОЗВРАТА ЗДЕСЬ — 3, А НЕ 0, И ЭТО НЕСУЩАЯ ДЕТАЛЬ.
+#
+# Надзиратель (S99z2k-scheduler) крутит `запустить; sleep 10` вечно. Пока эта
+# ветка отдавала 0, «работу уже делает кто-то другой» было для него неотличимо
+# от «мой планировщик отработал и завершился» — и он респавнил каждые 10 секунд
+# впустую. В поле (роутер Keenetic, 2026-08-09 12:56–12:58) это выглядело как
+# чередование «scheduler exited (rc=0) — respawning in 10s» и «already running
+# pid 2983» до тех пор, пока чужой процесс не умер сам.
+#
+# Как в это состояние попадают: OOM убивает надзирателя, а планировщик остаётся
+# сиротой; NDM-хук 95-z2k-scheduler-watchdog видит мёртвого надзирателя и
+# поднимает стек заново; новый надзиратель запускает планировщик, тот видит
+# живой pid сироты — и цикл замыкается. Работа при этом идёт (сирота исправно
+# тикает), поэтому снаружи виден только форк-шторм и залитый лог.
+#
+# Свой pid в pidfile — это НЕ «другой родитель». При обновлении файла цикл
+# ниже делает `exec sh "$_self"`, а exec сохраняет pid: новый экземпляр
+# находил в pidfile самого себя, kill -0 отвечал «жив», и он выходил с 3.
+# Надзиратель ждал 30 секунд «чужого» планировщика, которого не было, — то
+# есть каждое обновление z2k оставляло роутер на полминуты без планировщика
+# (роутер владельца 02.09.2026 08:31:25 → 08:31:55).
+if [ -f "$PIDFILE" ]; then
+    old_pid=$(cat "$PIDFILE" 2>/dev/null)
+    if [ -n "$old_pid" ] && [ "$old_pid" != "$$" ] && kill -0 "$old_pid" 2>/dev/null; then
+        echo "z2k-scheduler already running pid $old_pid" >&2
+        exit 3
+    fi
+fi
+echo $$ > "$PIDFILE"
+# `:` — СПЕЦИАЛЬНЫЙ ВСТРОЕННЫЙ ОПЕРАТОР, А НЕ ВНЕШНИЙ БИНАРНИК.
+#
+# Здесь стоял `rm -f "$PIDFILE"`, и он падал: на Keenetic `rm` вне /opt НЕ
+# СУЩЕСТВУЕТ ВОВСЕ (в /bin только ndm-овские утилиты и sh), единственные копии —
+# /opt/bin/rm. Тело трапа исполняется в момент прерывания, и шелл приписывает
+# ошибку той строке, на которой процесс застали, — отсюда загадочное
+# «z2k-scheduler.sh: line 293: rm: not found» рядом с «Terminated» в журналах.
+#
+# Последствие не косметическое: pidfile оставался с мёртвым pid. Обычно это
+# безвредно, но планировщик форкает около шести детей в минуту, и попадание
+# живого чужого процесса на застрявший pid уводит надзирателя в ветку «уже
+# запущен другим родителем» — а там встают ВСЕ периодические задачи разом:
+# обновление, списки, сторож туннеля, self-heal NFQUEUE и WARP.
+#
+# `:` не форкает, не смотрит в PATH и работает даже при отвалившемся /opt —
+# то есть ровно в том случае, когда `rm` не работает по определению. Для всех
+# читателей pidfile пустой файл равнозначен отсутствию: они делают `cat`, а
+# затем `[ -n "$pid" ] && kill -0`.
+trap ': > "$PIDFILE"; exit 0' INT TERM HUP
+
+# We were forked by the OOM-protected supervisor (S99z2k-scheduler sets its
+# oom_score_adj to -1000) and inherit that immunity. Reset ours to normal so the
+# scheduler AND every heavy task it fires (auto-update reinstall, list refresh)
+# stay ordinary OOM candidates — only the tiny supervisor stays protected, and it
+# respawns us if we are ever killed. Without this, a leaking task would be immune
+# and the OOM killer would take an innocent bystander (nfqws2, dropbear) instead.
+echo 0 > "/proc/$$/oom_score_adj" 2>/dev/null || true
+
+# Ensure log dir exists.
+mkdir -p "$(dirname "$LOG")" 2>/dev/null
+
+log() {
+    local ts
+    ts=$(date +"%Y-%m-%d %H:%M:%S")
+    printf '[%s] %s\n' "$ts" "$1" >> "$LOG"
+}
+
+# $1 - log path (defaults to the scheduler's own $LOG)
+rotate_log() {
+    local f="${1:-$LOG}"
+    [ -f "$f" ] || return
+    local lines
+    lines=$(wc -l < "$f" 2>/dev/null)
+    if [ "${lines:-0}" -gt 1000 ]; then
+        # TRUNCATE IN PLACE, never mv. `mv` replaces the inode, and a daemon holding the
+        # file open with >> keeps writing into the unlinked one — its log then freezes
+        # forever while the file on disk looks fine. That is exactly what happened to the
+        # usque engine log: field reports were read from a file the engine had stopped
+        # writing to days earlier, and every conclusion drawn from them was unsound.
+        tail -800 "$f" > "${f}.tmp" 2>/dev/null && cat "${f}.tmp" > "$f" 2>/dev/null
+        rm -f "${f}.tmp" 2>/dev/null
+    fi
+}
+
+# Every z2k log lives in tmpfs, i.e. in RAM on a 500 MB box, and NOTHING capped
+# any of them except the scheduler's own. Measured on the owner's router before
+# adding this: rt-proxy 18 KB / 185 lines, all z2k logs together 592 KB, tmpfs at
+# 21% - so this is insurance against a chatty failure mode (a flapping pool logs
+# per demotion), not a fix for observed growth. Reuses rotate_log rather than
+# introducing a second rotation mechanism.
+rotate_all_logs() {
+    local d="${Z2K_LOG_DIR:-/tmp/z2k-log}"
+    [ -d "$d" ] || return
+    for f in "$d"/*.log; do
+        [ -f "$f" ] || continue
+        rotate_log "$f"
+    done
+}
+
+# $1 state file, $2 key
+last_fired_in() {
+    local file="$1" key="$2"
+    [ -f "$file" ] || return
+    awk -F= -v k="$key" '$1==k {print $2}' "$file" | tail -1
+}
+
+# $1 state file, $2 key, $3 value
+mark_fired_in() {
+    local file="$1" key="$2" val="$3"
+    if [ -f "$file" ]; then
+        awk -F= -v k="$key" '$1!=k' "$file" > "${file}.tmp"
+    else
+        : > "${file}.tmp"
+    fi
+    printf '%s=%s\n' "$key" "$val" >> "${file}.tmp"
+    mv "${file}.tmp" "$file"
+}
+
+# Час ночного автообновления (issue #60: «нет возможности выбрать время»).
+#
+# Читаем из конфига КАЖДЫЙ РАЗ, а не один раз при старте: человек меняет час в
+# панели, и ждать перезагрузки роутера ради этого он не должен. Цена — один awk
+# в час (вызов стоит за `минуты = 00`, см. цикл ниже), а не каждые 30 секунд.
+#
+# Конфиг не исполняем: `.` затянул бы сюда весь ENABLED/NFQWS2_OPT и переопределил
+# бы переменные самого планировщика. Тот же awk-разбор, что в z2k-auto-update.sh.
+#
+# Мусор в ключе = ночное умолчание. Сравнение строковое, поэтому «2» без нуля
+# не совпало бы ни с одним тиком и автообновление тихо перестало бы приходить.
+au_hour() {
+    _auh=$(awk -F= '/^Z2K_AU_HOUR=/ {gsub(/["'"'"' ]/,"",$2); print $2; exit}' \
+           "${ZAPRET2_DIR}/config" 2>/dev/null)
+    case "$_auh" in [01][0-9]|2[0-3]) ;; *) _auh=02 ;; esac
+    printf '%s' "$_auh"
+}
+
+# Daily-cadence keys live on flash ($STATE) so a same-day reboot can't re-fire.
+last_fired_for_key() { last_fired_in "$STATE" "$1"; }
+mark_fired() { mark_fired_in "$STATE" "$1" "$2"; }
+
+# Run one task in background, with output captured into the scheduler log.
+run_task() {
+    local label="$1"
+    shift
+    log "fire $label: $*"
+    ( "$@" >> "$LOG" 2>&1; log "done $label (exit $?)" ) &
+}
+
+# Время файла. busybox на Entware не знает у stat ни -c, ни -f — /opt/bin/stat
+# это тоже busybox, дело не в PATH (1.37.0, роутер 06.09.2026). `date -r ФАЙЛ
+# +%s` он знает: так панель считает mtime с r-22 (file_mtime в actions.sh).
+# На BSD `date -r` ждёт секунды, а не файл, поэтому стенд уходит на stat.
+# Пусто — «сравнивать не с чем», перезапуска не будет.
+# Разбор: tests/test_scheduler_mtime_busybox.sh
+_z2k_mtime() {
+    date -r "$1" +%s 2>/dev/null \
+        || stat -c %Y "$1" 2>/dev/null \
+        || stat -f %m "$1" 2>/dev/null \
+        || echo ""
+}
+
+log "scheduler started (pid $$, $(uname -srm))"
+
+# Seed the per-game WARP lists if there are none.
+#
+# This lives HERE, and not only in the updater, for a reason worth remembering:
+# an update is applied by the updater ALREADY on the router, i.e. the previous
+# release. So a hook added to lib/auto_update.sh cannot run during the very
+# update that ships it — p-67.9 shipped exactly such a hook and it did nothing,
+# because p-67.8's updater executed that update. The scheduler, by contrast, is
+# RESTARTED by any patch carrying files/z2k-scheduler.sh, so this runs the new
+# code on the update that introduces it.
+#
+# Same empty-directory gate as the updater's: once lists exist this costs one
+# `ls` per service start and never touches the network.
+if [ -x "${ZAPRET2_DIR}/z2k-update-lists.sh" ] && \
+   [ -z "$(ls "${ZAPRET2_DIR}/lists/warp/games/"*.txt 2>/dev/null)" ]; then
+    run_task warp-games-seed sh "${ZAPRET2_DIR}/z2k-update-lists.sh" warp-games
+fi
+
+# Записи ip host от прежних версий — чистим РОВНО ОДИН РАЗ.
+#
+# Их писал снятый четвёртый слой скачивания: постоянная запись на КАЖДУЮ
+# неудачную попытку. Тянутся с 23 апреля, у людей накопилось по три-четыре
+# строки на домен при 256 слотах статического DNS у Keenetic.
+#
+# Один раз — это не экономия, а требование: чистка правит конфигурацию роутера
+# и сохраняет её, и делать это по расписанию у человека за спиной незачем.
+# Записи наши, они больше не появляются (слой снят), значит достаточно убрать
+# унаследованное и поставить отметку.
+#
+# Чистка здесь, а не шагом обновления, по двум причинам: шага нет в
+# каноническом списке, а апдейтеры до r-81 о нём и не знают — незнакомый шаг
+# они трактуют как «из будущего» и уходят в полную переустановку.
+#
+# Планировщик перезапускается, когда обновление везёт его файл, — этого и
+# достаточно: отметки нет только у тех, у кого чистка ещё не проходила.
+_cl_done="${ZAPRET2_DIR}/state/ip-hosts-cleanup.done"
+if [ ! -f "$_cl_done" ] && [ -r "${ZAPRET2_DIR}/lib/utils.sh" ]; then
+    mkdir -p "${ZAPRET2_DIR}/state" 2>/dev/null
+    # Отметку ставим ПОСЛЕ чистки и только при её успехе: иначе оборванный
+    # прогон закрыл бы себе путь навсегда, а записи остались бы висеть.
+    # Функция может быть ещё не доставлена: обновление кладёт файлы по одному,
+    # и планировщик способен подняться раньше, чем приедет новый utils.sh.
+    # Тогда молча откладываем до следующего старта — отметку не ставим, иначе
+    # чистка не случится никогда. В журнале это выглядело как «sh:
+    # cleanup_legacy_ip_hosts: not found» (диагностика пользователя 31.08.2026).
+    run_task cleanup-ip-hosts sh -c \
+        ". ${ZAPRET2_DIR}/lib/utils.sh >/dev/null 2>&1
+         if command -v cleanup_legacy_ip_hosts >/dev/null 2>&1; then
+             cleanup_legacy_ip_hosts && date +%s > \"$_cl_done\"
+         else
+             echo \"чистка отложена: utils.sh ещё не обновлён\"
+         fi"
+fi
+
+# СТАРТ СЛУЖБЫ — ЭТО И ЕСТЬ УСТАНОВКА И ОБНОВЛЕНИЕ.
+#
+# Отдельных крючков в установщике и обновлении не нужно: и то, и другое
+# перезапускает службу, а планировщик стартует вместе с ней. Здесь мы меряем
+# линию (если ещё не мерили) и приводим имя в порядок — селектор сам сперва
+# проверит текущее и полезет в перебор только если оно перестало пробивать.
+#
+# Дроссель на час. Перезапусков бывает много подряд — NDM дёргает службу на
+# каждое переподключение, и self-heal тоже, — а платить за каждый лишний
+# запрос незачем. Отметка лежит в /tmp: переживать перезагрузку ей ни к чему,
+# после неё как раз и надо проверить заново.
+_sni_stamp=/tmp/z2k-sni-refresh.ts
+_sni_now=$(date +%s 2>/dev/null || echo 0)
+_sni_last=$(cat "$_sni_stamp" 2>/dev/null || echo 0)
+case "$_sni_last" in ''|*[!0-9]*) _sni_last=0 ;; esac
+
+# Дроссель разный для двух разных случаев, и это важно.
+#
+# «Уже мерили» — час: перемер нужен редко, а перезапусков бывает много подряд.
+# «Не мерили ни разу» — десять минут: тут механизм ВЫКЛЮЧЕН, и держать человека
+# без обхода целый час из-за отметки в /tmp неправильно. Отметка переживает
+# переустановку (она в /tmp, а не в /opt), поэтому иначе переустановка могла
+# оставить механизм выключенным на час, ничем этого не показав.
+# Совсем без дросселя нельзя: проба, которая падает, устроила бы шторм на
+# каждом перезапуске службы.
+#
+# ОБОРВАННЫЙ ПРОГОН СЧИТАЕТСЯ НЕИЗМЕРЕННЫМ. Флаг проба ставит в СЕРЕДИНЕ
+# работы, до подбора имён и пересборки конфига. Убей её после этого — и
+# прежнее условие «флаг есть, значит измерено» глушило десятиминутный повтор
+# до ночи: у владельца 25.10.2026 так и вышло (флаг 1, карта имён пустая,
+# механизм не в конфиге). Отметку завершения проба пишет последней строкой,
+# отметку начала — первой; завершённым считаем прогон, где завершение не
+# старше начала, а при найденном блоке есть и карта имён.
+_tcp16_done() {
+    _td_s=$(cat "${ZAPRET2_DIR}/state/tcp16.flag.started" 2>/dev/null || echo 0)
+    _td_t=$(cat "${ZAPRET2_DIR}/state/tcp16.flag.ts" 2>/dev/null || echo 0)
+    case "$_td_s" in ''|*[!0-9]*) _td_s=0 ;; esac
+    case "$_td_t" in ''|*[!0-9]*) _td_t=0 ;; esac
+    [ "$_td_t" -ge "$_td_s" ] 2>/dev/null || return 1
+    [ "$_td_t" -gt 0 ] || return 1
+    [ "$(cat "${ZAPRET2_DIR}/state/tcp16.flag" 2>/dev/null)" = "1" ] || return 0
+    [ -f "${ZAPRET2_DIR}/state/tcp16_sni.txt" ]
+}
+if [ -s "${ZAPRET2_DIR}/state/tcp16.flag" ] && _tcp16_done; then
+    _sni_gap=3600
+else
+    _sni_gap=600
+fi
+if [ $((_sni_now - _sni_last)) -ge "$_sni_gap" ]; then
+    echo "$_sni_now" > "$_sni_stamp" 2>/dev/null
+    # Проверяем ЧИТАЕМОСТЬ, а не бит запуска: запускаем через sh, а бит
+    # patch-путь на части сборок BusyBox терял (p-42). Гвард строже вызова —
+    # это тихая осечка, а тихих осечек в этом механизме уже было довольно.
+    if [ ! -r "${ZAPRET2_DIR}/z2k-tcp16-probe.sh" ]; then
+        log "проба линии: файла нет — пропускаю"
+    elif [ -s "${ZAPRET2_DIR}/state/tcp16.flag" ] && _tcp16_done; then
+        : # линия измерена и прогон доведён до конца, перемер — ночным слотом
+    elif [ -s "${ZAPRET2_DIR}/state/tcp16.flag" ]; then
+        log "проба линии: прошлый прогон оборвался — повторяю"
+        run_task tcp16-probe sh "${ZAPRET2_DIR}/z2k-tcp16-probe.sh"
+    else
+        run_task tcp16-probe sh "${ZAPRET2_DIR}/z2k-tcp16-probe.sh"
+    fi
+fi
+
+# ПЕРЕЗАПУСК САМОГО СЕБЯ, КОГДА ФАЙЛ ОБНОВИЛСЯ.
+#
+# Путь сходимости выполняет только те шаги, что объявил релиз, и планировщик в
+# них не входит: новый код приезжал на диск и ждал перезагрузки роутера —
+# то есть неделями. Так одноразовая чистка записей и проба линии не начинались
+# у людей вовсе.
+#
+# Сравниваем время файла с тем, что было при старте, и переходим на новый код
+# через exec. Зацикливания нет по построению: после exec отметка снимается
+# заново с того же файла, и следующая проверка совпадёт.
+_self="${ZAPRET2_DIR}/z2k-scheduler.sh"
+_self_mtime=$(_z2k_mtime "$_self")
+
+# Отметка «на диске лежит ровно тот код, что сейчас в памяти». По ней init
+# главной службы понимает, что после обновления нас надо перезапустить: сама
+# сходимость этого не делает, и до 31.08.2026 новый код планировщика ждал
+# перезагрузки роутера. Пишем её и здесь, и в init'е — значения совпадают,
+# лишнего перезапуска не будет.
+#
+# ЗНАЧЕНИЕ СЧИТАЕМ ТАК ЖЕ, КАК ЕГО СЧИТАЕТ INIT. Он сравнивает отметку с
+# БОЛЬШИМ из времён двух файлов — своего и пробы, — а мы писали сюда только
+# своё. Стоило пробе оказаться новее планировщика (ровно в выпуске, который
+# меняет одну пробу), и значения расходились навсегда: init перезапускал
+# планировщика при КАЖДОМ старте службы, попутно убивая его фоновые задачи
+# (ревью 25.10.2026).
+_stamp_value="$_self_mtime"
+_probe_mtime=$(_z2k_mtime "${ZAPRET2_DIR}/z2k-tcp16-probe.sh")
+if [ -n "$_probe_mtime" ] && [ "$_probe_mtime" -gt "${_stamp_value:-0}" ] 2>/dev/null; then
+    _stamp_value="$_probe_mtime"
+fi
+[ -n "$_stamp_value" ] && echo "$_stamp_value" > /tmp/z2k-scheduler.mtime 2>/dev/null
+
+while true; do
+    _now_mtime=$(_z2k_mtime "$_self")
+    if [ -n "$_now_mtime" ] && [ "$_now_mtime" != "$_self_mtime" ]; then
+        log "файл планировщика обновлён — перехожу на новый код"
+        exec sh "$_self"
+    fi
+    hhmm=$(date +%H:%M)
+    today=$(date +%Y-%m-%d)
+    now_epoch=$(date +%s)
+
+    # Автообновление — в час, выбранный человеком в панели, а не в зашитые
+    # 02:00. Стоит ДО общего case, чтобы ветка `*:00` не перехватила задачу.
+    #
+    # Порядок условий не косметика: au_hour читает конфиг, и проверка минут
+    # перед ним оставляет этот awk ровно на ровных часах.
+    if [ "${hhmm#*:}" = "00" ] && [ "${hhmm%:*}" = "$(au_hour)" ] \
+       && [ "$(last_fired_for_key auto-update)" != "$today" ]; then
+        mark_fired auto-update "$today"
+        run_task auto-update "${ZAPRET2_DIR}/z2k-auto-update.sh" apply
+    fi
+
+    # Daily tasks — gate on date-key so each only fires once per day even
+    # if our 30s tick passes through the same minute twice.
+    case "$hhmm" in
+        # ЕСЛИ ЛИНИЯ ТАК И НЕ ИЗМЕРЕНА — ПОВТОРЯТЬ, НЕ ДОЖИДАЯСЬ НОЧИ.
+        #
+        # Раньше проба запускалась только при старте службы и в 03:30. На свежей
+        # установке она проигрывает гонку установщику (замер 31.08.2026:
+        # планировщик в 22:21:15, бинарник в 22:21:54) — и механизм оставался
+        # выключенным до ночи, а человек всё это время видел «не измерялась».
+        # Перезапуска службы может не случиться вовсе.
+        #
+        # Поэтому пока флага нет, повторяем каждые десять минут. Как только
+        # линия измерена — с блоком или без, — эта ветка замолкает навсегда:
+        # дальше работает ночной перемер.
+        *)
+            if [ ! -s "${ZAPRET2_DIR}/state/tcp16.flag" ] \
+               && [ -r "${ZAPRET2_DIR}/z2k-tcp16-probe.sh" ]; then
+                _rt_now=$(date +%s 2>/dev/null || echo 0)
+                _rt_last=$(cat /tmp/z2k-sni-refresh.ts 2>/dev/null || echo 0)
+                case "$_rt_last" in ''|*[!0-9]*) _rt_last=0 ;; esac
+                if [ $((_rt_now - _rt_last)) -ge 600 ]; then
+                    echo "$_rt_now" > /tmp/z2k-sni-refresh.ts 2>/dev/null
+                    run_task tcp16-probe sh "${ZAPRET2_DIR}/z2k-tcp16-probe.sh"
+                fi
+            fi
+            ;;
+    esac
+
+    case "$hhmm" in
+        03:30)
+            # Свежесть имени из белого списка провайдера.
+            #
+            # Оно протухает: замер 30.08.2026 — имя работало в 17:19 и
+            # перестало через час. Поэтому раз в сутки гоняем ту же пробу
+            # целиком: она перемеряет линию (провайдер может блок и снять —
+            # тогда механизм уходит из конфига) и пересобирает карту имён,
+            # начиная с уже найденных. Замер 25.10.2026 на роутере владельца:
+            # линия — 11 с, быстрая фаза подбора — минуты, длинный хвост идёт
+            # только для сетей, оставшихся без имени, и не чаще раза в неделю
+            # на каждую такую сеть.
+            if [ "$(last_fired_for_key sni-refresh)" != "$today" ]; then
+                mark_fired sni-refresh "$today"
+                if [ -r "${ZAPRET2_DIR}/z2k-tcp16-probe.sh" ]; then
+                    run_task sni-refresh sh "${ZAPRET2_DIR}/z2k-tcp16-probe.sh"
+                else
+                    log "проба линии: файла нет — ночной перемер пропущен"
+                fi
+            fi
+            ;;
+        04:00)
+            if [ "$(last_fired_for_key update-lists)" != "$today" ]; then
+                mark_fired update-lists "$today"
+                run_task update-lists "${ZAPRET2_DIR}/z2k-update-lists.sh"
+            fi
+            ;;
+        # Задачи «06:00 ipset/get_config.sh» здесь больше нет — и возвращать
+        # её нельзя. В z2k (MODE_FILTER=hostlist) сеты zapret/ipban не
+        # используются нигде, а цепочка get_config.sh -> get_ipban.sh ->
+        # create_ipset.sh делала `ipset flush nozapret` и пересобирала сет из
+        # одного вывода mdig по zapret-hosts-user-exclude.txt. Каждую ночь из
+        # nozapret исчезал засев z2k (локальные диапазоны, адреса с
+        # комментарием в конце строки, записи панели), а доменные строки, которые
+        # засев намеренно пропускает, mdig разрешал — в исключения уезжал общий
+        # адрес CDN. На роутере владельца 02.09.2026 сет стоял пустым с 06:00 до
+        # 08:09, пока хук NDM не перезапустил файрвол. Единственный читатель
+        # файла — засев при старте файрвола и панель (tests/test_no_upstream_ipset_job.sh).
+    esac
+
+    # Minute-cadence task: tg-tunnel-watchdog. Mirrors the old
+    # `* * * * *` cron entry. Tracked by unix timestamp so we fire it
+    # ~1×/min even though our tick runs ~2×/min.
+    if [ -x "${ZAPRET2_DIR}/tg-tunnel-watchdog.sh" ]; then
+        last_wd=$(last_fired_in "$TMP_STATE" tg-watchdog-epoch)
+        case "$last_wd" in ''|*[!0-9]*) last_wd=0 ;; esac
+        if [ "$((now_epoch - last_wd))" -ge 55 ]; then
+            mark_fired_in "$TMP_STATE" tg-watchdog-epoch "$now_epoch"
+            "${ZAPRET2_DIR}/tg-tunnel-watchdog.sh" >/dev/null 2>&1 &
+        fi
+    fi
+
+    # Minute-cadence task: потолок отладочного лога.
+    #
+    # traffic_debug_rotate внутри S99zapret2 срабатывает ТОЛЬКО при старте
+    # сервиса, а лог с 19.08.2026 пишется в /tmp, то есть в оперативку. Флаг,
+    # забытый включённым на ночь без единого рестарта, растёт без предела:
+    # замеренные 475 МБ за 17 часов при 500 МБ ОЗУ — это OOM, ради которого
+    # потолок и заводили. Дёшево: при выключенной отладке verb выходит сразу.
+    if [ -x /opt/etc/init.d/S99zapret2 ]; then
+        last_dbg=$(last_fired_in "$TMP_STATE" debug-rotate-epoch)
+        case "$last_dbg" in ''|*[!0-9]*) last_dbg=0 ;; esac
+        if [ "$((now_epoch - last_dbg))" -ge 55 ]; then
+            mark_fired_in "$TMP_STATE" debug-rotate-epoch "$now_epoch"
+            /opt/etc/init.d/S99zapret2 debug_rotate >/dev/null 2>&1 &
+        fi
+    fi
+
+    # ПРАВИЛА НУЖНЫ ТОЛЬКО ЖИВОМУ nfqws2.
+    #
+    # Разгрузка снимает поток с аппаратного ускорителя ради того, чтобы nfqws2 его
+    # видел. Когда обход остановлен, видеть некому, а плата остаётся: первые пакеты
+    # каждого соединения продолжают идти через процессор. Пользователь выключает
+    # z2k и вправе ожидать, что роутер вернулся к своей штатной скорости.
+    #
+    # Проверка — по живому демону, а не по флагу в конфиге: флаг говорит о намерении
+    # пользователя, а правила осмысленны ровно тогда, когда есть кому смотреть.
+    # Per-flow PPE de-offload re-assert (mangle FORWARD/PREROUTING). The NDM hook
+    # (94-z2k-ppe-deoffload.sh) handles event-driven re-apply after netfilter
+    # regen; this is the secondary net AND the boot-time apply (the rule is
+    # self-contained — no ipset/order dependency — so this lands it as soon as
+    # the scheduler ticks). No-ops cleanly where the firmware `-j PPE` target is
+    # absent or the user disabled the layer.
+    if [ -r "${ZAPRET2_DIR}/z2k-ppe-deoffload.sh" ]; then
+        last_ppe=$(last_fired_in "$TMP_STATE" ppe-deoffload-epoch)
+        case "$last_ppe" in ''|*[!0-9]*) last_ppe=0 ;; esac
+        if [ "$((now_epoch - last_ppe))" -ge 55 ]; then
+            mark_fired_in "$TMP_STATE" ppe-deoffload-epoch "$now_epoch"
+            ( pidof nfqws2 >/dev/null 2>&1 || exit 0
+              . "${ZAPRET2_DIR}/z2k-ppe-deoffload.sh"
+              z2k_ppe_ensure_rules ) >/dev/null 2>&1 &
+        fi
+    fi
+
+    # NFQUEUE self-heal (minute-cadence). Standalone script (mirrors the
+    # tg-watchdog / ppe-deoffload pattern) re-applies the firewall when nfqws2 is
+    # running and the WAN is up but its NFQUEUE rules are GONE — the boot-race
+    # (fw_nfqws_post4/pre4 SKIP rule insertion when the WAN iface isn't detected
+    # yet at start_fw and never retry -> NFQUEUE=0 with a live nfqws2, incl.
+    # CGNAT/late-WAN topologies) and the secondary net for NDM wiping our rules
+    # (the netfilter.d hook is the event-driven primary). Idempotent + coalesced
+    # with the hook via the shared restart-fw mutex.
+    if [ -x "${ZAPRET2_DIR}/z2k-nfqueue-selfheal.sh" ]; then
+        last_sh=$(last_fired_in "$TMP_STATE" nfq-selfheal-epoch)
+        case "$last_sh" in ''|*[!0-9]*) last_sh=0 ;; esac
+        if [ "$((now_epoch - last_sh))" -ge 55 ]; then
+            mark_fired_in "$TMP_STATE" nfq-selfheal-epoch "$now_epoch"
+            "${ZAPRET2_DIR}/z2k-nfqueue-selfheal.sh" >/dev/null 2>&1 &
+        fi
+    fi
+
+    # WARP: selfheal каждые 25 с — ставит/снимает маршрут по status.json
+    # движка z2k-warpd (fail open: мёртвый туннель = трафик напрямую, а не в
+    # чёрную дыру) и поднимает демон, если он не запущен. No-op при
+    # GAME_WARP_ENABLED=0 или без установленного движка.
+    if [ -r "${ZAPRET2_DIR}/z2k-warp.sh" ]; then
+        last_warp=$(last_fired_in "$TMP_STATE" warp-selfheal-epoch)
+        case "$last_warp" in ''|*[!0-9]*) last_warp=0 ;; esac
+        if [ "$((now_epoch - last_warp))" -ge 25 ]; then
+            mark_fired_in "$TMP_STATE" warp-selfheal-epoch "$now_epoch"
+            sh "${ZAPRET2_DIR}/z2k-warp.sh" selfheal >/dev/null 2>&1 &
+        fi
+    fi
+
+    # Rotate logs occasionally (cheap, only every minute boundary).
+    if [ "$(date +%S)" -lt 30 ]; then
+        rotate_log
+        rotate_all_logs
+    fi
+
+    sleep 30
+done

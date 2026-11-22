@@ -1,0 +1,14 @@
+Package: opt-ndmsv2
+Version: 1.0-17
+Depends: libc, libssp, librt, libpthread, libgcc, libstdcpp, ldconfig, findutils, terminfo, opkg, entware-release, locales, zoneinfo-asia, zoneinfo-europe
+Provides: opt-ndmsv2-any
+Source: feeds/keendev3x/opt-ndmsv2
+SourceName: opt-ndmsv2
+Section: libs
+SourceDateEpoch: 1775664427
+Essential: yes
+Maintainer: Entware team, http://entware.net
+Architecture: aarch64-3.10_kn
+Installed-Size: 51200
+Description:  opt-ndmsv2 is a metapackage to install Entware basic libraries and scripts
+ on Keenetic routers.

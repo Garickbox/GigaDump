@@ -1,0 +1,3841 @@
+#!/bin/sh
+# /opt/etc/init.d/S99zapret2
+# Адаптация официального init.d/openwrt/zapret2 для Keenetic
+# Использует модули common/ и config файл вместо hardcoded настроек
+
+# PATH С /opt/bin — ОБЯЗАТЕЛЕН, И ВОТ ПОЧЕМУ.
+#
+# NDM, cron и загрузка запускают init-скрипты с урезанным PATH, где /opt/bin
+# нет. Всё, что стоит из Entware, в таком окружении просто «не найдено», и
+# поскольку вызовы у нас прикрыты `2>/dev/null`, отказ выходит МОЛЧАЛИВЫМ.
+#
+# Как это стоило людям механизма. Функция сверки планировщика берёт время
+# файла через `stat` и, не получив его, пишет «не читается время файлов —
+# перезапуск пропущен» и уходит. Значит новый z2k-scheduler.sh ложится на
+# диск, а в памяти остаётся прежний процесс — до перезагрузки роутера.
+# Отсюда и то, что проба блока по объёму не запускалась НИ РАЗУ у людей,
+# обновившихся до выпуска, где появился её десятиминутный повтор: файл с
+# повтором приехал, запускать его было некому. В отчёте это выглядело как
+# «механизм выключен» (06.09.2026).
+#
+# Проверено на роутере: `stat` лежит в /opt/bin, с полным PATH отдаёт время,
+# с урезанным — пусто. У соседних init-скриптов (S99z2k-scheduler,
+# S98tg-tunnel) эта строка стоит с самого начала, здесь её не было.
+export PATH=/opt/sbin:/opt/bin:/opt/usr/sbin:/opt/usr/bin:/sbin:/usr/sbin:/bin:/usr/bin
+
+# ==============================================================================
+# ПУТИ И ПЕРЕМЕННЫЕ
+# ==============================================================================
+
+ZAPRET_BASE=/opt/zapret2
+ZAPRET_RW=${ZAPRET_RW:-"$ZAPRET_BASE"}
+ZAPRET_CONFIG=${ZAPRET_CONFIG:-"$ZAPRET_RW/config"}
+
+# Проверка что zapret2 установлен
+[ -d "$ZAPRET_BASE" ] || {
+    echo "ERROR: zapret2 not installed in $ZAPRET_BASE"
+    exit 1
+}
+
+# ==============================================================================
+# SOURCE ОФИЦИАЛЬНЫХ МОДУЛЕЙ (как в init.d/openwrt/functions)
+# ==============================================================================
+
+# ������� �������
+. "$ZAPRET_BASE/common/base.sh"
+
+# ------------------------------------------------------------------------------
+# Z2K: fast substring test + bounded condition waits
+# ------------------------------------------------------------------------------
+# Shadow of common/base.sh's contains(). THIS is what delivers the restart win:
+# the engine's own copy is still the quadratic `${1#*$2}` form on every router in
+# the field (verified 2026-07-26 on the owner's box), because the engine arrives as
+# a GitHub release tarball of the fork, on its own schedule, and the fix there is
+# not released yet. Sourced right after base.sh, so it overrides the slow version
+# for this whole process no matter which engine build is installed.
+# Drop this shadow only once the fixed engine is the FLOOR version, not merely
+# released. Rationale and measurements in the fork's common/base.sh.
+contains()
+{
+	# Empty-needle guard mirrors the old form exactly; see common/base.sh.
+	[ -n "$2" ] || return 1
+	case "$1" in *"$2"*) return 0 ;; esac
+	return 1
+}
+
+# Sub-second sleep, probed once. BusyBox `sleep` here is built without fractional
+# support ("sleep: invalid number '0.1'") and `read -t` rejects fractions, so
+# usleep (a BusyBox applet on Entware) is the portable path. Where it is absent
+# callers MUST fall back to whole seconds and shrink their poll count to match -
+# never keep the poll count and let the deadline stretch.
+Z2K_FRACSLEEP=
+z2k_fracsleep_avail()
+{
+    # Probe by EXECUTING, not by `command -v`. A PATH entry proves a file
+    # exists, not that it runs: a BusyBox build without the usleep applet still
+    # answers `command -v usleep` through the multi-call symlink and then fails
+    # at every call. That combination is exactly the deadline-stretch this
+    # design exists to prevent - the frac branch would be selected (n = max*20)
+    # while each usleep fell through to a whole second, turning a 3 s SIGKILL
+    # deadline into 60 s and stalling every restart behind a wedged daemon.
+    [ -n "$Z2K_FRACSLEEP" ] || {
+        if usleep 1 >/dev/null 2>&1; then Z2K_FRACSLEEP=1; else Z2K_FRACSLEEP=0; fi
+    }
+    [ "$Z2K_FRACSLEEP" = 1 ]
+}
+
+# Is pid $1 a RUNNING process — not merely a pid that kill -0 accepts?
+#
+# kill -0 succeeds for a ZOMBIE, so "the daemon is alive" was really "the daemon
+# has not been reaped yet". The old flat `sleep 1` hid that: a foreground external
+# command gave the shell time to reap the corpse, so the following kill -0 saw
+# ESRCH. Any replacement that polls faster than the reap inherits a false
+# "started" — stale pidfile, lying `status`, and a broken option string that looks
+# fine. Reading the state field out of /proc removes the timing dependency
+# entirely: a zombie is 'Z' no matter how fast we look.
+#
+# /proc/<pid>/stat field 3 is the state. The comm field (2) can contain spaces and
+# parentheses, so parse after the LAST ')'.
+z2k_pid_running()
+{
+    kill -0 "$1" 2>/dev/null || return 1
+    [ -r "/proc/$1/stat" ] || return 0   # no procfs: fall back to kill -0
+    local st
+    st=$(awk '{ n=match($0, /\)[^)]*$/); if (n) print substr($0, n+2, 1) }' "/proc/$1/stat" 2>/dev/null)
+    case "$st" in
+        Z|X|x) return 1 ;;               # zombie / dead
+    esac
+    return 0
+}
+
+# Wait for pid $1 to exit, at most $2 whole seconds. The ceiling is in TIME, not
+# in iterations: without fractional sleep a 3 s deadline must stay 3 s, not
+# become 3 s x N polls - a wedged daemon (OOM, MIPS async-preempt) would
+# otherwise stall every restart and self-heal. Returns 0 once it is gone.
+z2k_wait_gone()
+{
+    local pid="$1" max="${2:-3}" i=0 n
+    if z2k_fracsleep_avail; then
+        n=$(( max * 20 ))
+        while [ "$i" -lt "$n" ]; do
+            kill -0 "$pid" 2>/dev/null || return 0
+            # Deliberately NO `|| sleep 1` here. z2k_fracsleep_avail already
+            # proved usleep runs; a failure now is anomalous, and falling back
+            # to a whole second would multiply the remaining 60 polls into a
+            # 60 s deadline - the precise bug the probe above guards. Spinning
+            # out the remaining iterations instead exits EARLY, which is bounded
+            # and safe; the caller re-checks liveness either way.
+            usleep 50000 2>/dev/null
+            i=$((i+1))
+        done
+    else
+        while [ "$i" -lt "$max" ]; do
+            z2k_pid_running "$pid" || return 0
+            sleep 1
+            i=$((i+1))
+        done
+    fi
+    kill -0 "$pid" 2>/dev/null || return 0
+    return 1
+}
+
+# Процессы по имени без killall/pidof: только /proc и встроенные команды
+# оболочки. В Entware эти команды — ссылки на busybox, и у части людей ссылки
+# пропадают; тогда `killall nfqws2 2>/dev/null` молча ничего не делал, старый
+# демон держал очередь, новый падал с nfq_create_queue(): Operation not
+# permitted, а автообновление откатывалось. Ядро хранит в comm не больше 15
+# символов имени.
+z2k_pids_by_comm()
+{
+    local want="$1" root="${Z2K_PROC:-/proc}" p c
+    [ "${#want}" -gt 15 ] && want=$(printf '%.15s' "$want")
+    for p in "$root"/[0-9]*; do
+        c=
+        read -r c 2>/dev/null < "$p/comm" || continue
+        [ "$c" = "$want" ] && echo "${p##*/}"
+    done
+    return 0
+}
+
+# Entware раскладывает команды busybox ссылками в /opt/bin. Если ссылки нет,
+# а busybox команду умеет и другой такой команды в системе нет, — возвращаем
+# ссылку. Печатает имена восстановленных. Копия в z2k.sh (там до загрузки
+# модулей) — менять вместе.
+z2k_restore_busybox_links()
+{
+    local bb="${Z2K_BUSYBOX:-/opt/bin/busybox}" list name d found nl='
+'
+    [ -x "$bb" ] || return 0
+    list=$("$bb" --list 2>/dev/null) || return 0
+    for name in awk sed grep egrep fgrep cut tr sort uniq head tail wc xargs \
+                find killall pidof pgrep readlink sha256sum md5sum mktemp stat \
+                tar gzip gunzip zcat cmp diff seq basename dirname expr usleep \
+                logger nslookup tee touch; do
+        case "$nl$list$nl" in *"$nl$name$nl"*) ;; *) continue ;; esac
+        found=
+        for d in "${bb%/*}" ${Z2K_BIN_DIRS:-/opt/bin /opt/sbin /opt/usr/bin /opt/usr/sbin /bin /sbin /usr/bin /usr/sbin}; do
+            [ -e "$d/$name" ] && { found=1; break; }
+        done
+        [ -n "$found" ] && continue
+        # Существующее не перезаписываем никогда: там может стоять GNU-версия
+        # из альтернатив opkg. Убираем только битую ссылку.
+        [ -L "${bb%/*}/$name" ] && rm -f "${bb%/*}/$name"
+        ln -s "$bb" "${bb%/*}/$name" 2>/dev/null && echo "$name"
+    done
+    return 0
+}
+
+# Positive readiness for nfqws2: its NFQUEUE is bound. One line per bound queue
+# in /proc/net/netfilter/nfnetlink_queue, first field = queue number. Replaces a
+# flat `sleep 1` that verified nothing and outlasted the daemon's entire init
+# (measured 0.27 s). A timeout is deliberately NOT an error - on a cold USB the
+# daemon may still be loading 80k hostlines; the caller re-checks liveness.
+z2k_wait_queue_bound()
+{
+    local pid="$1" qnum="$2" max="${3:-3}" i=0 n q owner rest
+    if z2k_fracsleep_avail; then n=$(( max * 20 )); else n="$max"; fi
+    while [ "$i" -lt "$n" ]; do
+        z2k_pid_running "$pid" || return 1
+        while read -r q owner rest; do
+            # Match the queue number AND its owner. Column 2 is the netlink peer
+            # portid = the binding process's pid (verified on the box: pidfile
+            # 384 <-> portid 384; nfqws2 is never started with --daemon here, so
+            # $! is the real daemon). Matching qnum alone returns instantly off a
+            # queue ANOTHER instance already owns - which both skips waiting for
+            # THIS daemon and destroys the window in which an instantly-dying
+            # daemon is reported as a failed start.
+            [ "$q" = "$qnum" ] && [ "$owner" = "$pid" ] && return 0
+        # 2>/dev/null MUST precede the input redirect. Redirections are applied
+        # left to right, so `< file 2>/dev/null` still reports "can't open" on
+        # the un-redirected fd 2 - verified on BusyBox ash 1.37.0, dash and bash.
+        # Without nfnetlink_queue procfs (module not loaded, netns) that is 60
+        # identical error lines per daemon start on the console/webpanel.
+        done 2>/dev/null < /proc/net/netfilter/nfnetlink_queue
+        # See z2k_wait_gone: no `|| sleep 1` on the frac path - it would turn
+        # the remaining polls into whole seconds and stretch the deadline.
+        if z2k_fracsleep_avail; then usleep 50000 2>/dev/null; else sleep 1; fi
+        i=$((i+1))
+    done
+    return 0
+}
+
+# Определение типа firewall (iptables/nftables)
+. "$ZAPRET_BASE/common/fwtype.sh"
+
+# KEENETIC FIX: Переопределить linux_ipt_avail для работы без ip6tables
+# На Keenetic может быть DISABLE_IPV6=1, но iptables все равно работает
+linux_ipt_avail()
+{
+	# Для Keenetic достаточно только iptables (IPv4-only режим)
+	[ -n "$Z2K_DEBUG" ] && echo "DEBUG: linux_ipt_avail() вызвана"
+	exists iptables
+	local result=$?
+	[ -n "$Z2K_DEBUG" ] && echo "DEBUG: exists iptables = $result"
+	return $result
+}
+
+# IP helper functions
+. "$ZAPRET_BASE/common/linux_iphelper.sh"
+
+# Функции для работы с iptables
+. "$ZAPRET_BASE/common/ipt.sh"
+
+# Функции для работы с nftables (если доступны)
+existf zapret_do_firewall_nft || . "$ZAPRET_BASE/common/nft.sh" 2>/dev/null
+
+# Управление firewall
+. "$ZAPRET_BASE/common/linux_fw.sh"
+
+# Управление daemon процессами
+. "$ZAPRET_BASE/common/linux_daemons.sh"
+
+# Работа со списками доменов
+. "$ZAPRET_BASE/common/list.sh"
+
+# Поддержка custom scripts
+. "$ZAPRET_BASE/common/custom.sh"
+
+# Keep upstream allocation order even when a bundled category is disabled.
+# The toggle stops the old configuration before changing this flag, so teardown
+# still runs for every daemon that was started under the old configuration.
+custom_runner()
+{
+    [ "$DISABLE_CUSTOM" = 1 ] && return 0
+    local n script FUNC=$1
+    shift
+    [ -d "$CUSTOM_DIR/custom.d" ] || return 0
+    for script in "$CUSTOM_DIR/custom.d/"*; do
+        [ -f "$script" ] || continue
+        unset -f "$FUNC"
+        . "$script"
+        case "${script##*/}" in
+            50-stun4all|50-discord-media)
+                [ "${Z2K_CATEGORY_DISCORD_VOICE:-1}" != 0 ] || continue ;;
+        esac
+        if existf "$FUNC"; then "$FUNC" "$@"; fi
+    done
+    return 0
+}
+
+
+# ==============================================================================
+# �������� ������������
+# ==============================================================================
+
+# ��������� ������������
+. "$ZAPRET_CONFIG"
+
+# DEBUG: Проверить FWTYPE после загрузки config
+[ -n "$Z2K_DEBUG" ] && echo "DEBUG: После загрузки config - FWTYPE='$FWTYPE'"
+
+# КРИТИЧНО: Преобразовать порты в формат iptables (заменить - на :)
+# std_ports() была вызвана при загрузке ipt.sh, но тогда переменные были пустые
+# Повторно вызвать std_ports() ПОСЛЕ загрузки config
+command -v std_ports >/dev/null 2>&1 && std_ports
+[ -n "$Z2K_DEBUG" ] && echo "DEBUG: std_ports() вызвана - NFQWS2_PORTS_TCP_IPT='$NFQWS2_PORTS_TCP_IPT'"
+
+# ------------------------------------------------------------------------------
+# �������� ������ ��� ORCHESTRATION (STRICT MANUAL MODE)
+# ------------------------------------------------------------------------------
+# ��� ���������� ������ ������������� (��������, circular) ��������� ������
+# �������� RST/redirect � �.�. ������� �������� �������� ������� �� ���������.
+[ -z "$NFQWS2_TCP_PKT_IN" ] && NFQWS2_TCP_PKT_IN="$NFQWS2_TCP_PKT_OUT"
+[ -z "$NFQWS2_UDP_PKT_IN" ] && NFQWS2_UDP_PKT_IN="$NFQWS2_UDP_PKT_OUT"
+
+# ------------------------------------------------------------------------------
+# AUTOHOSTLIST: ensure required files exist to avoid nfqws2 start failures
+# ------------------------------------------------------------------------------
+ensure_autohostlist_files()
+{
+	[ "$MODE_FILTER" = "autohostlist" ] || return 0
+	local base="${HOSTLIST_BASE:-$ZAPRET_BASE/ipset}"
+	mkdir -p "$base" || return 1
+	local auto="$base/zapret-hosts-auto.txt"
+	local debuglog="$base/zapret-hosts-auto-debug.log"
+	[ -f "$auto" ] || : > "$auto"
+
+	# Файл ОБЯЗАН быть записываемым для WS_USER: демон роняет привилегии в
+	# nobody (--user=$WS_USER), а этот файл создаёт root. Без chown движок
+	# молча не может дописать найденный домен — детектор считает неудачи,
+	# доходит до порога и падает на fopen("at"). Так же сделано у
+	# ensure_autocircular_files ниже, и по той же причине.
+	if [ -n "$WS_USER" ] && [ "$WS_USER" != "root" ]; then
+		chown "$WS_USER" "$auto" 2>/dev/null || true
+	fi
+
+	# Отладочный лог движка (--hostlist-auto-debug). Скобки обязательны:
+	# без них `A && B || C` при выключенной отладке уходил в C и обнулял лог
+	# на каждом старте — то есть ровно тогда, когда его никто не просил.
+	if [ "$AUTOHOSTLIST_DEBUGLOG" = "1" ]; then
+		[ -f "$debuglog" ] || : > "$debuglog"
+		if [ -n "$WS_USER" ] && [ "$WS_USER" != "root" ]; then
+			chown "$WS_USER" "$debuglog" 2>/dev/null || true
+		fi
+	fi
+
+	# Здесь копировался whitelist в ipset/zapret-hosts-exclude.txt «чтобы
+	# nfqueue их не видел». Имя было выбрано неверно: апстрим читает
+	# zapret-hosts-user-exclude.txt, а этот файл не читал никто и никогда.
+	# Исключения в автолистовом профиле работают штатным
+	# --hostlist-exclude=lists/whitelist.txt (см. lib/config_official.sh).
+}
+
+normalize_autohost_domains()
+{
+	# Normalize possible host/domain forms to bare lowercase domain names.
+	awk '
+	{
+		s=$0
+		gsub(/\r/, "", s)
+		sub(/#.*/, "", s)
+		gsub(/^[[:space:]]+|[[:space:]]+$/, "", s)
+		if (s == "") next
+
+		s=tolower(s)
+		sub(/^[a-z][a-z0-9+.-]*:\/\//, "", s)
+		sub(/\/.*/, "", s)
+		sub(/:[0-9]+$/, "", s)
+		gsub(/^\*\./, "", s)
+		sub(/\.$/, "", s)
+		gsub(/^[[:space:]]+|[[:space:]]+$/, "", s)
+		if (s == "") next
+
+		if (s ~ /[^a-z0-9.-]/) next
+		if (s ~ /\.\./) next
+		if (index(s, ".") == 0) next
+
+		n=split(s, a, ".")
+		if (n < 2) next
+		bad=0
+		for (i=1; i<=n; i++) {
+			if (a[i] == "") { bad=1; break }
+			if (a[i] ~ /^-/ || a[i] ~ /-$/) { bad=1; break }
+			if (a[i] !~ /^[a-z0-9-]+$/) { bad=1; break }
+		}
+		if (bad) next
+		print s
+	}
+	'
+}
+
+sync_autohostlist_to_rkn()
+{
+	[ "${AUTOHOSTLIST_SYNC_TO_RKN:-1}" = "1" ] || return 0
+
+	local base="${HOSTLIST_BASE:-$ZAPRET_BASE/ipset}"
+	local auto="${AUTOHOSTLIST_FILE:-$base/zapret-hosts-auto.txt}"
+	local rkn_list="${AUTOHOSTLIST_RKN_LIST:-$ZAPRET_BASE/extra_strats/TCP/RKN/List.txt}"
+	local whitelist="${AUTOHOSTLIST_WHITELIST:-$ZAPRET_BASE/lists/whitelist.txt}"
+	# Постоянный след того, что автохостлист нашёл сам.
+	#
+	# Раньше его не было вообще: найденные домены вливались в РКН-список, а
+	# исходный файл очищался — и отличить их от 75 тысяч апстримных записей
+	# становилось нечем. Показать человеку «вот что подобралось само» было
+	# неоткуда, а главное — обновление РКН-списка с апстрима перезаписывает
+	# файл целиком и уносит их с собой. Пока страж усадки держал апстрим
+	# заблокированным, это не проявлялось; после его размыкания проявится.
+	local keep="${AUTOHOSTLIST_KEEP_FILE:-$ZAPRET_BASE/lists/autohostlist-domains.txt}"
+
+	# Работаем, если есть что переносить ЛИБО что восстанавливать: второе нужно
+	# как раз после замены РКН-списка апстримом.
+	[ -s "$auto" ] || [ -s "$keep" ] || return 0
+	mkdir -p "$(dirname "$rkn_list")" 2>/dev/null || true
+	[ -f "$rkn_list" ] || : > "$rkn_list"
+
+	local tmp_auto tmp_have tmp_add tmp_final drain
+	tmp_auto="$(mktemp /tmp/z2k_ah_auto.XXXXXX 2>/dev/null || echo "/tmp/z2k_ah_auto.$$")"
+	tmp_have="$(mktemp /tmp/z2k_ah_have.XXXXXX 2>/dev/null || echo "/tmp/z2k_ah_have.$$")"
+	tmp_add="$(mktemp /tmp/z2k_ah_add.XXXXXX 2>/dev/null || echo "/tmp/z2k_ah_add.$$")"
+	tmp_final="$(mktemp /tmp/z2k_ah_final.XXXXXX 2>/dev/null || echo "/tmp/z2k_ah_final.$$")"
+
+	# Забираем находки ПЕРЕИМЕНОВАНИЕМ, а не «прочитать и потом обнулить».
+	#
+	# Движок дописывает в этот файл по одной строке, без блокировок, в момент
+	# попадания хоста в лист (nfq2/desync.c → helpers.c, fopen "at"). Прежняя
+	# схема читала файл, а обнуляла его в самом конце — всё, что движок успевал
+	# дописать между этими двумя моментами, стиралось молча. rename атомарен:
+	# после него движок открывает уже новый файл, и потерять нечего.
+	#
+	# Файл обязан существовать к следующему старту демона: он объявлен в
+	# аргументах как обычный хостлист, а движок резолвит путь при разборе
+	# аргументов и не стартует, если пути нет. Поэтому сразу создаём пустой —
+	# но только если движок не создал его сам своей же записью.
+	drain="$auto.drain.$$"
+	if [ -s "$auto" ] && mv -f "$auto" "$drain" 2>/dev/null; then
+		[ -f "$auto" ] || {
+			: > "$auto"
+			[ -n "$WS_USER" ] && [ "$WS_USER" != "root" ] && chown "$WS_USER" "$auto" 2>/dev/null
+		}
+	else
+		# Нечего забирать. Имя всё равно оставляем непустым: ниже оно уходит в
+		# один общий rm -f, а `rm -f ""` на busybox — это ошибка, а не no-op.
+		drain="/tmp/z2k_ah_nodrain.$$"
+	fi
+
+	# Источник = свежая находка ∪ уже накопленное. Второе слагаемое и есть
+	# восстановление после того, как апстримный список затёр цель.
+	{
+		[ -n "$drain" ] && [ -f "$drain" ] && cat "$drain"
+		[ -f "$keep" ] && cat "$keep"
+	} | normalize_autohost_domains | sort -u > "$tmp_auto" 2>/dev/null || true
+	[ -s "$tmp_auto" ] || {
+		rm -f "$tmp_auto" "$tmp_have" "$tmp_add" "$tmp_final" "$drain" 2>/dev/null || true
+		return 0
+	}
+
+	# Домены из whitelist выкидываем ДО того, как сохранить накопленное.
+	#
+	# Раньше whitelist вычитался только перед вливанием в РКН-список, а в
+	# накопленное («Автохостлист» во вкладке доп. доменов) домен попадал как
+	# есть. Человек видел его в списке найденного, хотя сам же его исключил и
+	# обход для него не включается — панель показывала то, чего нет.
+	local tmp_wl
+	tmp_wl="$(mktemp /tmp/z2k_ah_wl.XXXXXX 2>/dev/null || echo "/tmp/z2k_ah_wl.$$")"
+	[ -f "$whitelist" ] && normalize_autohost_domains < "$whitelist" | sort -u > "$tmp_wl" 2>/dev/null
+	[ -f "$tmp_wl" ] || : > "$tmp_wl"
+	awk 'NR==FNR { wl[$0]=1; next } !($0 in wl) { print }' "$tmp_wl" "$tmp_auto" > "$tmp_final" 2>/dev/null \
+		&& mv -f "$tmp_final" "$tmp_auto" 2>/dev/null
+
+	# Накопленное сохраняем ДО слияния: если ниже что-то оборвётся, находки уже
+	# не потеряются. Пишем через temp + mv, чтобы не оставить обрубок.
+	mkdir -p "$(dirname "$keep")" 2>/dev/null || true
+	if cp -f "$tmp_auto" "${keep}.tmp.$$" 2>/dev/null; then
+		mv -f "${keep}.tmp.$$" "$keep" 2>/dev/null || rm -f "${keep}.tmp.$$" 2>/dev/null
+	fi
+
+	{
+		[ -f "$rkn_list" ] && cat "$rkn_list"
+		cat "$tmp_wl"
+	} | normalize_autohost_domains | sort -u > "$tmp_have" 2>/dev/null || true
+
+	awk 'NR==FNR { seen[$0]=1; next } !($0 in seen) { print }' "$tmp_have" "$tmp_auto" > "$tmp_add"
+	local added
+	added=$(awk 'END { print NR+0 }' "$tmp_add")
+
+	if [ "$added" -gt 0 ]; then
+		cat "$tmp_add" >> "$rkn_list"
+		sort -u "$rkn_list" > "$tmp_final" 2>/dev/null && mv "$tmp_final" "$rkn_list"
+		echo "autohostlist sync: added $added domains to $rkn_list"
+	fi
+
+	# Исходник больше не обнуляем: он уже забран переименованием выше, причём
+	# независимо от того, оказалось ли что дописывать в РКН-список. Прежний
+	# `: > "$auto"` под условием added>0 оставлял файл расти, когда все находки
+	# уже были в списке, — а счётчик в меню продолжал их считать «новыми».
+	rm -f "$tmp_auto" "$tmp_have" "$tmp_add" "$tmp_final" "$tmp_wl" "$drain" 2>/dev/null || true
+}
+
+# ------------------------------------------------------------------------------
+# AUTOCIRCULAR: ensure writable cache files for runtime user (WS_USER / nobody)
+# ------------------------------------------------------------------------------
+ensure_autocircular_files()
+{
+	local base="${EXTRA_STRATS_DIR:-$ZAPRET_BASE/extra_strats}/cache/autocircular"
+	mkdir -p "$base" || return 1
+	chmod 755 "$base" 2>/dev/null || true
+	chown nobody "$base" 2>/dev/null || true
+	# Preparation also runs after startup: do not remove locks or temporary
+	# files belonging to a live panel/runtime writer.
+
+	[ -f "$base/state.tsv" ] || : > "$base/state.tsv"
+	chmod 644 "$base/state.tsv" 2>/dev/null || true
+	chown nobody "$base/state.tsv" 2>/dev/null || true
+
+	[ -f "$base/telemetry.tsv" ] || : > "$base/telemetry.tsv"
+	chmod 644 "$base/telemetry.tsv" 2>/dev/null || true
+	chown nobody "$base/telemetry.tsv" 2>/dev/null || true
+
+	[ -f "$base/debug.log" ] || : > "$base/debug.log"
+	chmod 644 "$base/debug.log" 2>/dev/null || true
+	chown nobody "$base/debug.log" 2>/dev/null || true
+
+	# Optional debug toggle file; keep if present and readable.
+	[ -f "$base/debug.flag" ] && chmod 644 "$base/debug.flag" 2>/dev/null || true
+	[ -f "$base/debug.flag" ] && chown nobody "$base/debug.flag" 2>/dev/null || true
+}
+
+# ПЕРЕНОС КЛЮЧА ПУЛА QUIC В СОСТОЯНИИ РОТАЦИИ: yt_quic -> quic (16.09.2026).
+#
+# Пул QUIC перестал быть ютубовским: тем же профилем теперь обходятся все
+# домены из списков РКН, и ключ пула переименован в generic `quic`. Строки в
+# state.tsv помечены КЛЮЧОМ ПУЛА — без переноса демон читает файл, своего ключа
+# не находит и начинает подбор со стратегии 1 на каждом хосте. У людей с долгим
+# аптаймом это сотни строк и сутки повторного подбора на ровном месте, причём
+# молча: снаружи это выглядит как «после обновления сломался ютуб».
+#
+# ЗДЕСЬ, А НЕ ШАГОМ ОБНОВЛЕНИЯ, по двум причинам. Шаги релиза исполняет код,
+# КОТОРЫЙ УЖЕ ЛЕЖИТ НА РОУТЕРЕ, то есть предыдущая версия: нового шага она не
+# знает и потребует полную переустановку всему флоту. А init приезжает вместе с
+# обновлением и запускается сразу после него — ровно в тот момент, когда демон
+# остановлен и файл никто не держит.
+#
+# Замок тот же, что у панели и у Lua (файл <path>.lock, протухает за 10 с).
+# Не отняли — не мигрируем и отметку не ставим: попробуем на следующем старте.
+_z2k_migrate_quic_pool_key()
+{
+	local base="${EXTRA_STRATS_DIR:-$ZAPRET_BASE/extra_strats}/cache/autocircular"
+	local done_flag="${ZAPRET_BASE}/state/quic-pool-key.done"
+	[ -f "$done_flag" ] && return 0
+
+	local f moved=0 skipped=0
+	# Оба возможных дома состояния: основной на флешке и запасной в tmpfs
+	# (z2k-state-persist.lua уходит туда, когда основной недоступен на запись).
+	for f in "$base/state.tsv" "/tmp/z2k-autocircular-state.tsv"; do
+		[ -s "$f" ] || continue
+		# Табуляция в шаблоне grep на busybox не разворачивается, поэтому
+		# и поиск, и правка — одним awk по первому полю.
+		awk -F'\t' '$1 == "yt_quic" { found = 1; exit } END { exit !found }' "$f" 2>/dev/null || continue
+		if ( set -C; printf '%s' "$(date +%s 2>/dev/null || echo 0)" > "$f.lock" ) 2>/dev/null; then
+			if awk -F'\t' 'BEGIN { OFS = "\t" } $1 == "yt_quic" { $1 = "quic" } { print }' \
+			       "$f" > "$f.mig" 2>/dev/null && [ -s "$f.mig" ]; then
+				# Права и владельца держим прежними: файл пишет демон под
+				# nobody, а мы здесь root.
+				chmod 644 "$f.mig" 2>/dev/null || true
+				chown nobody "$f.mig" 2>/dev/null || true
+				mv -f "$f.mig" "$f" 2>/dev/null && moved=$((moved + 1))
+			fi
+			rm -f "$f.mig" "$f.lock" 2>/dev/null
+		else
+			skipped=$((skipped + 1))
+		fi
+	done
+
+	if [ "$skipped" = "0" ]; then
+		mkdir -p "${ZAPRET_BASE}/state" 2>/dev/null
+		: > "$done_flag" 2>/dev/null
+	fi
+	[ "$moved" = "0" ] || echo "QUIC pool key migrated in rotation state (yt_quic -> quic)"
+	return 0
+}
+
+# ПЕРЕНУМЕРАЦИЯ ПУЛОВ В СОСТОЯНИИ РОТАЦИИ (23–26.10.2026, актуализация пулов).
+#
+# В rkn_tcp сняты четыре ютубовских плеча (10, 40, 45, 46 — у всех источников
+# они стоят только в наборах для Google) и вставлены девять новых плеч; пул
+# стал 55. В yt_tcp и gv_tcp вставлены восемь плеч Google-набора и ещё три
+# лучших по замеру; пулы стали 33. В quic добавлены девять плеч, пул стал 18.
+# 26.10.2026 все четыре пула выстроены по качеству из замера на линии
+# владельца (успехи, при равенстве время ответа): у yt и gv порядок теперь
+# разный. Внутри групп «от 90 %», «50–90 %», «ниже 50 %» плечи, чей фейк
+# держится на одной tcp_ts, стоят после остальных: у клиентов без timestamp
+# option (Windows) такой фейк доходит до сервера. state.tsv помнит ИМЕННО НОМЕР: без переноса хост, закреплённый на
+# «24», получил бы чужую технику и три ретрансмиссии до следующего плеча — на
+# каждом закреплённом хосте, на каждом роутере, молча. Июньская перенумерация
+# (04.06.2026) так и уехала, без переноса.
+#
+# Автоматические записи этих пулов СТИРАЮТСЯ (решение Марка 26.10.2026): пулы
+# переставлены по качеству, и номер, подобранный по старому порядку, — это не
+# лучшее плечо для хоста, а случайный след прежнего перебора. Хост начинает
+# подбор с первого, лучшего плеча. Замороженные пользователем записи
+# переносятся по таблицам — это выбор человека, его техника сохраняется.
+#
+# Таблицы — полные, номер выпущенного пула → номер нового (промежуточной
+# нумерации ветки на роутерах не было); «x» — плечо снято, строка стирается и
+# хост начинает подбор с первого плеча. Номер вне таблицы (не бывает, но)
+# остаётся как есть. Ключ google_tls — слитый профиль yt+gv
+# (Z2K_REFACTOR_PHASE3=1): в нём yt шли как 1..22, gv — как 22+n; теперь yt
+# 1..33, gv — 33+n, и каждая половина переносится своей таблицей.
+#
+# Голосовой пул discord_udp (25.10.2026) переведён на новый фейк целиком, и
+# первым встало его плечо repeats=6; прежнее плечо 3 (repeats=6) слито с ним.
+# Автоматическая запись стирается: после смены блоба помнить номер незачем,
+# подбор начинается с первого плеча. Замороженная пользователем запись
+# переносится по таблице 1→2, 2→3, 3→1, 4..6 на месте — те же повторы, что
+# человек выбрал руками.
+#
+# Здесь, а не шагом релиза, и до подъёма демона — по тем же причинам, что и
+# перенос ключа QUIC выше. Замок тот же; не отняли — попробуем на следующем
+# старте, отметку не ставим. Снимок до переноса остаётся рядом (.pre-renumber-v1).
+# Общий каркас переноса номеров плеч в state.tsv: один проход по основному и
+# запасному файлу, снимок до переноса, замок, отметка «сделано». Таблицы и
+# правила переноса — у каждой версии свои (awk-программа и её -v переменные).
+#   $1 — версия (v1, v2…): имена отметки и снимка;
+#   $2 — ключи пулов, которых касается перенос (регэксп для awk);
+#   $3 — строка в журнал при фактическом переносе;
+#   остальное — аргументы awk (-v … и программа).
+_z2k_migrate_pool_renumber()
+{
+	local ver="$1" keys="$2" what="$3"; shift 3
+	local base="${EXTRA_STRATS_DIR:-$ZAPRET_BASE/extra_strats}/cache/autocircular"
+	local done_flag="${ZAPRET_BASE}/state/pool-renumber-$ver.done"
+	[ -f "$done_flag" ] && return 0
+	local fallback="${Z2K_STATE_FALLBACK:-${Z2K_AUTOCIRCULAR_FALLBACK_OVERRIDE:-/tmp}/z2k-autocircular-state.tsv}"
+
+	local f moved=0 skipped=0
+	for f in "$base/state.tsv" "$fallback"; do
+		[ -s "$f" ] || continue
+		# Снимок до переноса — одновременно и отметка «этот файл уже перенесён»:
+		# отметка на весь перенос ставится только когда оба файла отпущены, а
+		# замок на одном из них не должен на следующем старте прогнать таблицу
+		# по второму ещё раз.
+		[ -f "$f.pre-renumber-$ver" ] && continue
+		awk -F'\t' -v K="$keys" '$1 ~ "^(" K ")$" { found = 1; exit } END { exit !found }' "$f" 2>/dev/null || continue
+		if ( set -C; printf '%s' "$(date +%s 2>/dev/null || echo 0)" > "$f.lock" ) 2>/dev/null; then
+			if awk -F'\t' "$@" "$f" > "$f.mig" 2>/dev/null && [ -s "$f.mig" ]; then
+				chmod 644 "$f.mig" 2>/dev/null || true
+				chown nobody "$f.mig" 2>/dev/null || true
+				# Сначала снимок, потом подмена: без снимка не подменяем, иначе
+				# файл перенесён, а отметки о переносе нет.
+				cp -p "$f" "$f.pre-renumber-$ver" 2>/dev/null \
+					&& mv -f "$f.mig" "$f" 2>/dev/null && moved=$((moved + 1))
+			fi
+			rm -f "$f.mig" "$f.lock" 2>/dev/null
+		else
+			skipped=$((skipped + 1))
+		fi
+	done
+
+	if [ "$skipped" = "0" ]; then
+		mkdir -p "${ZAPRET_BASE}/state" 2>/dev/null
+		: > "$done_flag" 2>/dev/null
+	fi
+	[ "$moved" = "0" ] || echo "Pool strategy numbers migrated in rotation state ($what)"
+	return 0
+}
+
+# 26.10.2026: пулы TCP и QUIC выстроены по качеству, голос переведён на новый блоб.
+_z2k_migrate_pool_renumber_v1()
+{
+	local rkn_map='1=41,2=6,3=19,4=33,5=17,6=2,7=3,8=23,9=22,10=x,11=30,12=15,13=24,14=20,15=28,16=26,17=21,18=42,19=8,20=32,21=25,22=50,23=53,24=31,25=54,26=46,27=55,28=38,29=45,30=16,31=48,32=34,33=47,34=49,35=5,36=18,37=4,38=44,39=14,40=x,41=13,42=36,43=35,44=37,45=x,46=x,47=39,48=51,49=40,50=52'
+	local yt_map='1=1,2=17,3=20,4=13,5=28,6=25,7=30,8=3,9=19,10=10,11=2,12=15,13=21,14=14,15=7,16=29,17=9,18=24,19=16,20=5,21=23,22=4'
+	local gv_map='1=3,2=25,3=7,4=17,5=6,6=31,7=5,8=12,9=4,10=11,11=32,12=28,13=13,14=1,15=8,16=22,17=18,18=19,19=16,20=20,21=14,22=9'
+	local quic_map='1=4,2=10,3=5,4=18,5=3,6=2,7=14,8=8,9=7'
+	local dv_map='1=2,2=3,3=1,4=4,5=5,6=6'
+	_z2k_migrate_pool_renumber v1 'rkn_tcp|yt_tcp|gv_tcp|google_tls|quic|discord_udp' \
+		'rkn 55, yt/gv 33, quic 18, discord voice' \
+		-v RKN="$rkn_map" -v YT="$yt_map" -v GV="$gv_map" -v QU="$quic_map" -v DV="$dv_map" '
+		function load(s, m,   n, a, i, kv) { n = split(s, a, ","); for (i = 1; i <= n; i++) { split(a[i], kv, "="); m[kv[1]] = kv[2] } }
+		# "" — номер вне таблицы (оставить), "x" — плечо снято (стереть строку)
+		function remap(m, n) { return (n in m) ? m[n] : "" }
+		BEGIN { OFS = "\t"; load(RKN, rkn); load(YT, yt); load(GV, gv); load(QU, qu); load(DV, dv) }
+		/^#/ || NF < 3 { print; next }
+		# Пулы TCP и QUIC: автоматическую запись стереть, замороженную перенести.
+		$1 == "rkn_tcp" { n = remap(rkn, $3 + 0) }
+		$1 == "yt_tcp" { n = remap(yt, $3 + 0) }
+		$1 == "gv_tcp" { n = remap(gv, $3 + 0) }
+		$1 == "google_tls" {
+			s = $3 + 0
+			if (s <= 22) n = remap(yt, s)
+			else { n = remap(gv, s - 22); if (n != "" && n != "x") n += 33 }
+		}
+		$1 == "quic" { n = remap(qu, $3 + 0) }
+		$1 ~ /^(rkn_tcp|yt_tcp|gv_tcp|google_tls|quic)$/ && $5 != "frozen" { n = "x" }
+		# Голос: автоматическую запись стереть, замороженную перенести.
+		$1 == "discord_udp" { n = ($5 == "frozen") ? remap(dv, $3 + 0) : "x" }
+		$1 ~ /^(rkn_tcp|yt_tcp|gv_tcp|google_tls|quic|discord_udp)$/ {
+			if (n == "x") next
+			if (n != "") $3 = n
+		}
+		{ print }'
+}
+
+# 27.10.2026: в пул quic вторым плечом вставлен нулевой фейк с подменой Initial
+# (стенд: Cloudflare 24/25 с первого Initial), прежнее 18-е (фрагментация,
+# только Cloudflare) снято как перекрытое им. Порядок остальных плеч тот же,
+# поэтому и автоматические записи переносятся, а не стираются.
+_z2k_migrate_pool_renumber_v2()
+{
+	_z2k_migrate_pool_renumber v2 'quic' 'quic: new arm 2, arm 18 removed' '
+		BEGIN { OFS = "\t" }
+		/^#/ || NF < 3 { print; next }
+		$1 == "quic" {
+			s = $3 + 0
+			if (s == 18) next
+			if (s >= 2 && s <= 17) $3 = s + 1
+		}
+		{ print }'
+}
+
+# 30.10.2026: все три TCP-пула переставлены по замеру на линии владельца
+# (контроль без обхода 0 с двух концов, лидеры перемерены отдельно).
+# Автоматические записи СТИРАЮТСЯ: номер, подобранный в прежнем порядке, — это
+# не лучшее плечо для хоста, а след прежнего перебора; хост начинает подбор с
+# первого, теперь действительно лучшего. Замороженные человеком переносятся по
+# таблицам — это его выбор техники, и он сохраняется. Часть слотов при этом
+# сменила содержимое: плечи референсного набора приведены к нему один в один,
+# то есть техника та же, а параметры — как в первоисточнике.
+#
+# Таблицы полные: номер выпущенного пула -> номер нового. Слоты, которых в
+# выпущенном пуле не было (новые плечи в конце), ни одному старому номеру не
+# соответствуют и в таблицах не встречаются. Ключ google_tls — слитый профиль
+# yt+gv: в нём yt шли как 1..33, gv как 33+n; каждая половина переносится своей
+# таблицей, а gv сдвигается на новый размер yt (41).
+_z2k_migrate_pool_renumber_v3()
+{
+	local rkn_map='1=36,2=37,3=16,4=18,5=41,6=42,7=30,8=43,9=3,10=17,11=38,12=14,13=45,14=19,15=25,16=34,17=44,18=20,19=7,20=21,21=2,22=8,23=22,24=28,25=6,26=27,27=4,28=1,29=15,30=5,31=11,32=9,33=31,34=32,35=39,36=40,37=35,38=23,39=24,40=47,41=10,42=26,43=12,44=29,45=50,46=54,47=55,48=46,49=33,50=56,51=57,52=53,53=48,54=49,55=51,56=13,57=52'
+	local yt_map='1=5,2=4,3=9,4=16,5=8,6=1,7=10,8=6,9=14,10=17,11=31,12=29,13=18,14=19,15=25,16=13,17=7,18=24,19=15,20=27,21=11,22=20,23=28,24=38,25=32,26=2,27=39,28=33,29=30,30=40,31=34,32=35,33=36,34=21,35=41,36=12,37=37,38=3,39=22,40=26,41=23'
+	local gv_map='1=31,2=10,3=7,4=13,5=19,6=2,7=20,8=11,9=29,10=27,11=30,12=21,13=28,14=25,15=32,16=22,17=3,18=14,19=23,20=16,21=4,22=17,23=18,24=1,25=24,26=26,27=33,28=8,29=34,30=35,31=36,32=37,33=38,34=12,35=5,36=39,37=15,38=9,39=6'
+	_z2k_migrate_pool_renumber v3 'rkn_tcp|yt_tcp|gv_tcp|google_tls' \
+		'rkn 57, yt 41, gv 39 — порядок по замеру' \
+		-v RKN="$rkn_map" -v YT="$yt_map" -v GV="$gv_map" -v YTSIZE=41 '
+		function load(s, m,   n, a, i, kv) { n = split(s, a, ","); for (i = 1; i <= n; i++) { split(a[i], kv, "="); m[kv[1]] = kv[2] } }
+		# "" — номера нет в таблице, оставить как есть
+		function remap(m, n) { return (n in m) ? m[n] : "" }
+		BEGIN { OFS = "	"; load(RKN, rkn); load(YT, yt); load(GV, gv) }
+		/^#/ || NF < 3 { print; next }
+		$1 == "rkn_tcp" { n = remap(rkn, $3 + 0) }
+		$1 == "yt_tcp" { n = remap(yt, $3 + 0) }
+		$1 == "gv_tcp" { n = remap(gv, $3 + 0) }
+		$1 == "google_tls" {
+			s = $3 + 0
+			if (s <= 33) n = remap(yt, s)
+			else { n = remap(gv, s - 33); if (n != "") n += YTSIZE }
+		}
+		$1 ~ /^(rkn_tcp|yt_tcp|gv_tcp|google_tls)$/ && $5 != "frozen" { next }
+		$1 ~ /^(rkn_tcp|yt_tcp|gv_tcp|google_tls)$/ { if (n != "") $3 = n }
+		{ print }'
+}
+
+# 31.10.2026: пул quic — выпущенный набор на 18 плеч, плечи-копии референсных
+# страт доведены до точного совпадения, две недостающие дописаны в конец (20).
+# p-87.4 по ошибке сократил пул до 10 референсных плеч, и его миграция (v4)
+# перевела состояние в нумерацию 1..10, стерев автоматические записи. Здесь:
+#   * роутер прошёл v4 — номера 1..10 переносятся на места тех же техник в
+#     новом пуле; все десять есть, поэтому НИЧЕГО не стирается, и
+#     автоматические записи тоже переезжают — техника та же;
+#   * роутер v4 не проходил (p-87.4 до него не доехал, свежая установка) —
+#     состояние в нумерации выпущенного пула, а она совпадает с новой 1..18:
+#     переносить нечего, ставится только отметка.
+# v4 больше не вызывается: на таком роутере она стерла бы то, что совпадает.
+_z2k_migrate_pool_renumber_v5()
+{
+	if [ ! -f "${ZAPRET_BASE}/state/pool-renumber-v4.done" ]; then
+		mkdir -p "${ZAPRET_BASE}/state" 2>/dev/null
+		: > "${ZAPRET_BASE}/state/pool-renumber-v5.done" 2>/dev/null
+		return 0
+	fi
+	local quic_map='1=18,2=1,3=8,4=20,5=19,6=4,7=3,8=15,9=9,10=11'
+	_z2k_migrate_pool_renumber v5 'quic' 'quic 20 — выпущенный пул, копии референсных страт один в один' \
+		-v QU="$quic_map" '
+		function load(s, m,   n, a, i, kv) { n = split(s, a, ","); for (i = 1; i <= n; i++) { split(a[i], kv, "="); m[kv[1]] = kv[2] } }
+		BEGIN { OFS = "\t"; load(QU, qu) }
+		/^#/ || NF < 3 { print; next }
+		$1 == "quic" && (($3 + 0) in qu) { $3 = qu[$3 + 0] }
+		{ print }'
+}
+
+# ПОЛЬЗОВАТЕЛЬСКИЕ СТРАТЕГИИ НА СНЯТОМ ГОЛОСОВОМ БЛОБЕ (25.10.2026).
+#
+# Голосовой пул переехал с quic_dbankcloud на quic_initial_steamcommunity_com, и
+# старый блоб больше не регистрируется. Панель собирает пользовательскую
+# голосовую стратегию из работающего конфига, поэтому в lists/custom-strategies
+# имя старого блоба есть у каждого, кто её правил. Оставь его там — nfqws2 не
+# найдёт блоб и не поднимется. Меняем имя на новое, остальное в строке
+# пользователя не трогаем: повторы и TTL, выбранные руками, сохраняются — так же,
+# как замороженный номер в state.tsv. Оригинал остаётся рядом (.pre-voice-blob-v1).
+_z2k_migrate_custom_voice_blob_v1()
+{
+	local dir="${ZAPRET_BASE}/lists/custom-strategies"
+	local done_flag="${ZAPRET_BASE}/state/custom-voice-blob-v1.done"
+	[ -f "$done_flag" ] && return 0
+	local f moved=0 failed=0
+	for f in "$dir"/*.txt; do
+		[ -f "$f" ] || continue
+		grep -Eq 'blob=quic_dbankcloud([^A-Za-z0-9_]|$)' "$f" 2>/dev/null || continue
+		[ -f "$f.pre-voice-blob-v1" ] || cp -p "$f" "$f.pre-voice-blob-v1" 2>/dev/null || { failed=1; continue; }
+		# Три формы конца имени по отдельности: чередование в BRE не переносимо
+		# между sed BusyBox, GNU и BSD.
+		if sed -e 's/blob=quic_dbankcloud:/blob=quic_initial_steamcommunity_com:/g' \
+			-e 's/blob=quic_dbankcloud\([[:space:]]\)/blob=quic_initial_steamcommunity_com\1/g' \
+			-e 's/blob=quic_dbankcloud$/blob=quic_initial_steamcommunity_com/' "$f" > "$f.mig" 2>/dev/null \
+			&& [ -s "$f.mig" ] && mv -f "$f.mig" "$f" 2>/dev/null; then
+			moved=$((moved + 1))
+		else
+			rm -f "$f.mig" 2>/dev/null
+			failed=1
+		fi
+	done
+	if [ "$failed" = "0" ]; then
+		mkdir -p "${ZAPRET_BASE}/state" 2>/dev/null
+		: > "$done_flag" 2>/dev/null
+	fi
+	[ "$moved" = "0" ] || echo "Custom strategies moved to the new Discord voice blob ($moved file(s))"
+	return 0
+}
+
+# ВОЗВРАТ СТРАТЕГИЙ ПОСЛЕ ПОВТОРНОЙ ПЕРЕНУМЕРАЦИИ (08.11.2026).
+#
+# Переустановка откладывала старое дерево и переносила state.tsv, но не отметки
+# state/*.done. На первом старте миграции v1..v3 шли ПОВТОРНО по уже
+# перенесённому файлу: автоматические записи стирались, замороженные уезжали на
+# чужие плечи (12 -> 15 -> 25). Так прошли r-87.22 и ночной переход p-87.21 ->
+# p-87.23 через неё. Перенос отметок починен в lib/install.sh, здесь — возврат
+# для тех, у кого это уже случилось.
+#
+# Источник — снимок, который сама v1 оставила перед повтором
+# (state.tsv.pre-renumber-v1): это состояние ровно до порчи. Признак повтора —
+# отметка v1 моложе выпуска r-87.22: законно v1 в эти дни проходит только у
+# роутеров, не обновлявшихся с конца октября.
+#
+# Правила слияния:
+#   * замороженная запись снимка возвращается, если текущая с тем же временем
+#     записи тоже заморожена — её трогала только миграция, не человек;
+#   * запись снимка, которой сейчас нет, возвращается;
+#   * остальное (подобранное заново, переключённое человеком) остаётся.
+_z2k_restore_state_after_rerun_v1()
+{
+	local base="${EXTRA_STRATS_DIR:-$ZAPRET_BASE/extra_strats}/cache/autocircular"
+	local done_flag="${ZAPRET_BASE}/state/rerun-restore-v1.done"
+	[ -f "$done_flag" ] && return 0
+	local f="$base/state.tsv" snap="$base/state.tsv.pre-renumber-v1"
+	local v1="${ZAPRET_BASE}/state/pool-renumber-v1.done" t
+	_rr_mark() { mkdir -p "${ZAPRET_BASE}/state" 2>/dev/null; : > "$done_flag" 2>/dev/null; }
+	if [ ! -s "$snap" ] || [ ! -f "$v1" ] || [ ! -f "$f" ]; then _rr_mark; return 0; fi
+	t=$(date -r "$v1" +%s 2>/dev/null)
+	case "$t" in ''|*[!0-9]*) _rr_mark; return 0 ;; esac
+	# 2026-11-07T12:29:17Z — выпуск r-87.22.
+	[ "$t" -ge 1794054557 ] || { _rr_mark; return 0; }
+	( set -C; printf '%s' "$(date +%s 2>/dev/null || echo 0)" > "$f.lock" ) 2>/dev/null || return 0
+	if awk -F'\t' 'BEGIN { OFS = "\t" }
+		NR == FNR {
+			if ($0 ~ /^#/ || NF < 3) next
+			k = $1 SUBSEP $2; snap[k] = $0; sts[k] = $4; smode[k] = $5; order[++n] = k
+			next
+		}
+		$0 ~ /^#/ || NF < 3 { print; next }
+		{
+			k = $1 SUBSEP $2; seen[k] = 1
+			if ((k in snap) && smode[k] == "frozen" && $5 == "frozen" && $4 == sts[k]) { print snap[k]; back++; next }
+			print
+		}
+		END {
+			for (i = 1; i <= n; i++) if (!(order[i] in seen)) { print snap[order[i]]; back++ }
+			print back + 0 > "/dev/stderr"
+		}' "$snap" "$f" > "$f.mig" 2>"$f.cnt" && [ -s "$f.mig" ]; then
+		chmod 644 "$f.mig" 2>/dev/null || true
+		chown nobody "$f.mig" 2>/dev/null || true
+		cp -p "$f" "$f.pre-rerun-restore-v1" 2>/dev/null \
+			&& mv -f "$f.mig" "$f" 2>/dev/null \
+			&& echo "Rotation state restored after repeated renumbering ($(cat "$f.cnt" 2>/dev/null) row(s))" \
+			&& _rr_mark
+	fi
+	rm -f "$f.mig" "$f.cnt" "$f.lock" 2>/dev/null
+	return 0
+}
+
+# 86.2: subdomains share the native nld=2 rotation record. Run before nfqws2
+# starts, under the same lock as the panel. Keep an original backup for rollback.
+_z2k_migrate_rotator_sld()
+{
+    local base="${EXTRA_STRATS_DIR:-$ZAPRET_BASE/extra_strats}/cache/autocircular"
+    local primary="$base/state.tsv"
+    local fallback="${Z2K_STATE_FALLBACK:-${Z2K_AUTOCIRCULAR_FALLBACK_OVERRIDE:-/tmp}/z2k-autocircular-state.tsv}"
+    local marker="$ZAPRET_BASE/state/domain-sld-v1.done"
+    [ -f "$marker" ] && return 0
+    # An already running old daemon would recreate full-host records. Require
+    # a real restart for the first migration, rather than editing under it.
+    local pidfile pid
+    for pidfile in "${PIDDIR:-/var/run}"/nfqws2_*.pid; do
+        [ -f "$pidfile" ] || continue
+        pid=$(cat "$pidfile" 2>/dev/null)
+        case "$pid" in ''|*[!0-9]*) continue ;; esac
+        if kill -0 "$pid" 2>/dev/null; then
+            echo "State migration requires nfqws2 to be stopped first" >&2
+            return 1
+        fi
+    done
+    mkdir -p "$base" "$ZAPRET_BASE/state" || return 1
+    [ -f "$primary" ] || : > "$primary" || return 1
+    local now stamp
+    now=$(date +%s)
+    # Match the panel's stale-lock timeout; preserve any current owner's lock.
+    if [ -f "$primary.lock" ]; then
+        stamp=$(cat "$primary.lock" 2>/dev/null)
+        case "$stamp" in
+            ''|*[!0-9]*)
+                # Allow an owner between O_EXCL creation and timestamp write
+                # to finish before treating an empty/malformed lock as abandoned.
+                sleep 1
+                stamp=$(cat "$primary.lock" 2>/dev/null)
+                case "$stamp" in ''|*[!0-9]*) rm -f "$primary.lock" || return 1 ;; esac
+                ;;
+        esac
+        case "$stamp" in
+            ''|*[!0-9]*) ;;
+            *) if [ "$stamp" -gt "$((now + 10))" ] || [ "$((now - stamp))" -gt 10 ]; then
+                   rm -f "$primary.lock" || return 1
+               fi ;;
+        esac
+    fi
+    ( set -C; printf '%s' "$now" > "$primary.lock" ) 2>/dev/null || return 1
+    local merged="$base/state.sld.$$" f tmp failed=0
+    set -- "$primary"
+    [ ! -f "$fallback" ] || set -- "$@" "$fallback"
+    # Never erase the first pre-migration snapshot on a retry.
+    for f in "$@"; do
+        if [ ! -f "$f.pre-86.2" ]; then
+            cp -p "$f" "$f.pre-86.2" || failed=1
+        fi
+    done
+    if [ "$failed" = 0 ]; then
+        awk -F '\t' 'BEGIN { OFS="\t" }
+            !/^#/ && NF>=3 {
+                original=tolower($2); h=original; family=""
+                if (h ~ /\|[46]$/) {family=substr(h,length(h)-1); h=substr(h,1,length(h)-2)}
+                sub(/\.$/,"",h)
+                # Hostless records and IP addresses retain their original keys.
+                if (h !~ /:/ && h !~ /^[0-9.]+$/) {
+                    n=split(h,labels,".")
+                    if (n>2) h=labels[n-1] "." labels[n]
+                }
+                host=h family; k=$1 FS host; rank=($5=="frozen"); stamp=$4+0
+                root=(original==host)
+                if (!(k in row) || rank>pin[k] ||
+                    (rank==pin[k] && (stamp>ts[k] ||
+                    (stamp==ts[k] && (root>exact[k] || (root==exact[k] && original<source[k])))))) {
+                    $2=host; if($5=="") $5="auto"
+                    row[k]=$0; pin[k]=rank; ts[k]=stamp; exact[k]=root; source[k]=original
+                }
+            }
+            END { print "# z2k autocircular state: second-level domain keys (86.2)"
+                  for(k in row) print row[k] }
+        ' "$@" > "$merged" || failed=1
+    fi
+    if [ "$failed" = 0 ]; then
+        for f in "$@"; do
+            tmp="$f.sld.$$"
+            if cp -p "$f" "$tmp" && cat "$merged" > "$tmp" && mv -f "$tmp" "$f"; then :
+            else failed=1; rm -f "$tmp"; break; fi
+        done
+    fi
+    if [ "$failed" = 0 ]; then : > "$marker" || failed=1; fi
+    rm -f "$merged" "$primary.lock"
+    [ "$failed" = 0 ]
+}
+
+# ДОЗАПИСЬ ДОМЕНОВ KEENETIC В БЕЛЫЙ СПИСОК (16.09.2026).
+#
+# keenetic.name, mykeenetic.com/.net/.ru, netcraze.net и crazedns.ru — имена, по
+# которым человек заходит в морду СВОЕГО роутера. Обход на них не нужен и
+# вреден: блокировки там нет, а рвущееся рукопожатие выглядит как «роутер
+# недоступен».
+#
+# ЗДЕСЬ, А НЕ ТОЛЬКО В УСТАНОВЩИКЕ. Список доменов заводит create_base_config
+# (lib/config.sh), а её зовёт только полная установка. Патч её не запускает —
+# значит у всех, кто уже стоит, дозапись не случилась бы никогда, и правка
+# доехала бы лишь до новых установок. Init приезжает вместе с обновлением и
+# стартует сразу после него.
+#
+# Дозапись одноразовая по содержимому файла, а не по отметке: человек правит
+# белый список руками, и если он эти строки СНЯЛ — вернуть их значит переспорить
+# его решение. Поэтому сторож — на весь блок сразу (crazedns.ru), как в
+# установщике.
+_z2k_whitelist_keenetic()
+{
+	local wl="${LISTS_DIR:-$ZAPRET_BASE/lists}/whitelist.txt"
+	[ -f "$wl" ] || return 0
+	grep -q '^crazedns\.ru$' "$wl" 2>/dev/null && return 0
+	# Файл читает демон по mtime, поэтому дописываем ДО его старта.
+	{
+		printf '\n# === Keenetic: остальные имена облака и KeenDNS ===\n'
+		printf 'keenetic.name\nmykeenetic.com\nmykeenetic.net\nmykeenetic.ru\n'
+		printf 'netcraze.net\ncrazedns.ru\n'
+	} >> "$wl" 2>/dev/null \
+		&& echo "whitelist: добавлены домены Keenetic/KeenDNS"
+	return 0
+}
+
+# ДОЗАПИСЬ ТЕКУЩИХ ДОМЕНОВ TIKTOK В БЕЛЫЙ СПИСОК (18.09.2026).
+#
+# Приложение давно ходит не на tiktok.com, а на tiktokv.us и tiktokcdn-us.com.
+# Оба лежат в списке РКН из geosite как ложные срабатывания, а секция TikTok в
+# белом списке знала только старые имена — и десинк ложился на живой сервис.
+# Замер на роутере владельца: 165 TLS-потоков телефона к этим именам, у всех
+# одно — ClientHello подтверждён, edge CDN молчит, ротатор отказа не видит:
+# ни ретрансмиссий, ни RST, ловить нечего, стратегия 1 стоит вечно.
+#
+# Здесь по той же причине, что и домены Keenetic выше: create_base_config
+# зовёт только полная установка. Сторож — по tiktokcdn-us.com: старая секция
+# TikTok у всех уже есть, по ней дозапись не сработала бы. Снял человек эти
+# строки руками — не возвращаем.
+_z2k_whitelist_tiktok()
+{
+	local wl="${LISTS_DIR:-$ZAPRET_BASE/lists}/whitelist.txt"
+	[ -f "$wl" ] || return 0
+	grep -q '^tiktokcdn-us\.com$' "$wl" 2>/dev/null && return 0
+	# Файл читает демон по mtime, поэтому дописываем ДО его старта.
+	{
+		printf '\n# === TikTok: текущие домены приложения ===\n'
+		printf 'tiktokv.us\ntiktokcdn-us.com\n'
+	} >> "$wl" 2>/dev/null \
+		&& echo "whitelist: добавлены текущие домены TikTok"
+	return 0
+}
+
+repair_autocircular_files_after_daemon_start()
+{
+	# nfqws2 can touch autocircular files very early during boot/restart.
+	# Re-apply ownership after daemon spawn so runtime keeps using primary cache.
+	ensure_autocircular_files
+	# The t+1s re-apply stays (it covers nfqws2 touching these files just after
+	# exec/lua init - commit 49991d0 guards both sides of that race), but it no
+	# longer blocks the restart: it only re-applies ownership, and nothing
+	# downstream in start() reads these files.
+	( sleep 1; ensure_autocircular_files ) >/dev/null 2>&1 &
+}
+
+# ------------------------------------------------------------------------------
+# TRAFFIC DEBUG: capture "real traffic" (tcpdump pcap) and "traffic in zapret" (nfqws2 --debug log)
+# ------------------------------------------------------------------------------
+Z2K_TRAFFIC_DEBUG=0
+Z2K_TRAFFIC_DEBUG_BASE=""
+Z2K_TRAFFIC_DEBUG_PIDFILE=""
+
+# Куда пишется отладка. ВЫВОД ИДЁТ В tmpfs, НЕ НА ФЛЕШКУ.
+#
+# Раньше лог лежал в extra_strats/cache/traffic, то есть прямо в /opt на USB.
+# Замер 2026-08-19: за 17 часов включённой отладки файл вырос до 475 МБ
+# непрерывных мелких дописываний. Штатная работа такой нагрузки не создаёт
+# никогда — это единственный источник интенсивной записи на носитель, и живёт
+# он ровно столько, сколько длится сеанс отладки.
+#
+# Флаг включения debug.flag остаётся на флешке: он переживает перезагрузку, и
+# его руками ставит человек. А результат — в память.
+Z2K_TRAFFIC_DEBUG_FLAGDIR="${EXTRA_STRATS_DIR:-$ZAPRET_BASE/extra_strats}/cache/traffic"
+Z2K_TRAFFIC_DEBUG_TMPDIR="/tmp/z2k-traffic-debug"
+
+# Сколько мегабайт отладочного лога держим. /tmp это RAM, а её на роутере 500 МБ:
+# без потолка один забытый на ночь debug.flag съест память и получит OOM вместо
+# данных. Уборкой занимается traffic_debug_rotate ниже.
+Z2K_TRAFFIC_DEBUG_MAXMB="${Z2K_TRAFFIC_DEBUG_MAXMB:-64}"
+
+ensure_traffic_debug_files()
+{
+	local base="$Z2K_TRAFFIC_DEBUG_TMPDIR"
+	mkdir -p "$Z2K_TRAFFIC_DEBUG_FLAGDIR" 2>/dev/null || true
+	mkdir -p "$base" || return 1
+	chmod 755 "$base" 2>/dev/null || true
+	chown nobody "$base" 2>/dev/null || true
+
+	[ -f "$base/nfqws2.debug.log" ] || : > "$base/nfqws2.debug.log"
+	chmod 644 "$base/nfqws2.debug.log" 2>/dev/null || true
+	chown nobody "$base/nfqws2.debug.log" 2>/dev/null || true
+
+	[ -f "$base/tcpdump.err.log" ] || : > "$base/tcpdump.err.log"
+	chmod 644 "$base/tcpdump.err.log" 2>/dev/null || true
+	chown nobody "$base/tcpdump.err.log" 2>/dev/null || true
+
+	# Флаг включения — на флешке, чтобы пережить перезагрузку.
+	local flag="$Z2K_TRAFFIC_DEBUG_FLAGDIR/debug.flag"
+	[ -f "$flag" ] && chmod 644 "$flag" 2>/dev/null || true
+	[ -f "$flag" ] && chown nobody "$flag" 2>/dev/null || true
+}
+
+# Обрезать лог, если он перерос потолок. Именно обрезать на месте (>), а не
+# удалять: nfqws2 держит файл открытым, и удаление оставило бы его писать в
+# отвязанный инод — место в tmpfs не освободится, а данные пропадут.
+traffic_debug_rotate()
+{
+	[ "$Z2K_TRAFFIC_DEBUG" = "1" ] || return 0
+	local f="$Z2K_TRAFFIC_DEBUG_TMPDIR/nfqws2.debug.log"
+	[ -f "$f" ] || return 0
+
+	local kb
+	kb=$(du -k "$f" 2>/dev/null | awk '{print $1}')
+	[ -n "$kb" ] || return 0
+	[ "$kb" -gt $((Z2K_TRAFFIC_DEBUG_MAXMB * 1024)) ] 2>/dev/null || return 0
+
+	: > "$f"
+	echo "z2k: отладочный лог превысил ${Z2K_TRAFFIC_DEBUG_MAXMB}МБ и обрезан" >> "$f"
+}
+
+traffic_debug_prepare()
+{
+	local base="$Z2K_TRAFFIC_DEBUG_TMPDIR"
+	Z2K_TRAFFIC_DEBUG_BASE="$base"
+	Z2K_TRAFFIC_DEBUG_PIDFILE="$base/tcpdump.pid"
+
+	# Флаг ищем на флешке — он должен переживать перезагрузку.
+	if [ -f "$Z2K_TRAFFIC_DEBUG_FLAGDIR/debug.flag" ]; then
+		Z2K_TRAFFIC_DEBUG=1
+	else
+		Z2K_TRAFFIC_DEBUG=0
+	fi
+}
+
+traffic_debug_enable_nfqws2_log()
+{
+	[ "$Z2K_TRAFFIC_DEBUG" = "1" ] || return 0
+
+	# Avoid duplicating the option if start() is called twice in one script run.
+	case " $NFQWS2_OPT_BASE " in
+		*" --debug="*)
+			return 0
+			;;
+	esac
+
+	NFQWS2_OPT_BASE="$NFQWS2_OPT_BASE --debug=@$Z2K_TRAFFIC_DEBUG_BASE/nfqws2.debug.log"
+}
+
+traffic_debug_build_tcpdump_filter()
+{
+	local tok list item
+	local tcp_ports=""
+	local udp_ports=""
+	local tcp_expr=""
+	local udp_expr=""
+	local filter=""
+
+	# Collect all TCP/UDP filter ports from every NFQWS2 profile (--new separated).
+	for tok in $NFQWS2_OPT; do
+		case "$tok" in
+			--filter-tcp=*)
+				list="${tok#--filter-tcp=}"
+				for item in $(echo "$list" | tr ',' ' '); do
+					case "$item" in
+						''|*[!0-9-]*)
+							continue
+							;;
+					esac
+					case " $tcp_ports " in
+						*" $item "*) ;;
+						*) tcp_ports="$tcp_ports $item" ;;
+					esac
+				done
+				;;
+			--filter-udp=*)
+				list="${tok#--filter-udp=}"
+				for item in $(echo "$list" | tr ',' ' '); do
+					case "$item" in
+						''|*[!0-9-]*)
+							continue
+							;;
+					esac
+					case " $udp_ports " in
+						*" $item "*) ;;
+						*) udp_ports="$udp_ports $item" ;;
+					esac
+				done
+				;;
+		esac
+	done
+
+	for item in $tcp_ports; do
+		case "$item" in
+			*-*)
+				local first="${item%-*}"
+				local last="${item#*-}"
+				case "$first$last" in
+					''|*[!0-9]*)
+						continue
+						;;
+				esac
+				[ -n "$tcp_expr" ] && tcp_expr="$tcp_expr or "
+				tcp_expr="${tcp_expr}portrange $first-$last"
+				;;
+			*)
+				[ -n "$tcp_expr" ] && tcp_expr="$tcp_expr or "
+				tcp_expr="${tcp_expr}port $item"
+				;;
+		esac
+	done
+
+	for item in $udp_ports; do
+		case "$item" in
+			*-*)
+				local first="${item%-*}"
+				local last="${item#*-}"
+				case "$first$last" in
+					''|*[!0-9]*)
+						continue
+						;;
+				esac
+				[ -n "$udp_expr" ] && udp_expr="$udp_expr or "
+				udp_expr="${udp_expr}portrange $first-$last"
+				;;
+			*)
+				[ -n "$udp_expr" ] && udp_expr="$udp_expr or "
+				udp_expr="${udp_expr}port $item"
+				;;
+		esac
+	done
+
+	[ -n "$tcp_expr" ] && filter="(tcp and ($tcp_expr))"
+	if [ -n "$udp_expr" ]; then
+		[ -n "$filter" ] && filter="$filter or "
+		filter="${filter}(udp and ($udp_expr))"
+	fi
+
+	if [ -z "$filter" ]; then
+		filter='(tcp and (port 80 or port 443 or port 2053 or port 2083 or port 2087 or port 2096 or port 8443)) or (udp and port 443)'
+	fi
+
+	echo "$filter"
+}
+
+traffic_debug_tcpdump_start()
+{
+	[ "$Z2K_TRAFFIC_DEBUG" = "1" ] || return 0
+
+	exists tcpdump || {
+		echo "WARN: traffic debug enabled, but tcpdump not found; skipping pcap capture"
+		return 0
+	}
+
+	# Stop previous tcpdump if pidfile exists (stale or running).
+	traffic_debug_tcpdump_stop
+
+	local pcap="$Z2K_TRAFFIC_DEBUG_BASE/traffic.pcap"
+	local err="$Z2K_TRAFFIC_DEBUG_BASE/tcpdump.err.log"
+	local filter
+	filter="$(traffic_debug_build_tcpdump_filter)"
+
+	# Rotate by size to avoid filling storage: 10 files x 5MB = ~50MB max.
+	# NOTE: if tcpdump doesn't support -C/-W, it will fail; see tcpdump.err.log.
+	tcpdump -i any -nn -s 0 -U -w "$pcap" -C 5 -W 10 "$filter" >/dev/null 2>>"$err" &
+	local pid=$!
+	echo "$pid" > "$Z2K_TRAFFIC_DEBUG_PIDFILE"
+	chmod 644 "$Z2K_TRAFFIC_DEBUG_PIDFILE" 2>/dev/null || true
+	echo "traffic debug: tcpdump filter: $filter"
+	echo "traffic debug: tcpdump started (PID $pid)"
+}
+
+traffic_debug_tcpdump_stop()
+{
+	local pidfile="${Z2K_TRAFFIC_DEBUG_PIDFILE:-$Z2K_TRAFFIC_DEBUG_TMPDIR/tcpdump.pid}"
+	[ -f "$pidfile" ] || return 0
+
+	local pid
+	pid="$(cat "$pidfile" 2>/dev/null)"
+	if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+		echo "traffic debug: stopping tcpdump (PID $pid)"
+		kill "$pid" 2>/dev/null || true
+		sleep 1
+		kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+	fi
+	rm -f "$pidfile" 2>/dev/null || true
+}
+# ==============================================================================
+# НАСТРОЙКИ СПЕЦИФИЧНЫЕ ДЛЯ KEENETIC
+# ==============================================================================
+
+PIDDIR=/var/run
+USEROPT=""
+[ -n "$WS_USER" ] && USEROPT="--user=$WS_USER"
+NFQWS2="${NFQWS2:-$ZAPRET_BASE/nfq2/nfqws2}"
+
+# Memory tier detection for the detectors' per-host failure map. The
+# autocircular state map used to be capped here too, but the cap evicted
+# settled working hosts in practice (users reported the rotator "forgetting"
+# strategies) — it now grows unbounded, which costs at most a few MB on
+# saturated routers and is worth it.
+TOTAL_RAM_MB=$(awk '/^MemTotal:/ {print int($2/1024); exit}' /proc/meminfo 2>/dev/null)
+[ -z "$TOTAL_RAM_MB" ] && TOTAL_RAM_MB=512
+if [ "$TOTAL_RAM_MB" -lt 128 ]; then
+    Z2K_DETECTOR_CAP=128
+elif [ "$TOTAL_RAM_MB" -lt 384 ]; then
+    Z2K_DETECTOR_CAP=256
+else
+    Z2K_DETECTOR_CAP=512
+fi
+export Z2K_DETECTOR_CAP
+
+LUA_LIB="$ZAPRET_BASE/lua/zapret-lib.lua"
+[ -f "$LUA_LIB" ] || LUA_LIB="$LUA_LIB.gz"
+LUA_ANTIDPI="$ZAPRET_BASE/lua/zapret-antidpi.lua"
+[ -f "$LUA_ANTIDPI" ] || LUA_ANTIDPI="$LUA_ANTIDPI.gz"
+LUAOPT="--lua-init=@$LUA_LIB --lua-init=@$LUA_ANTIDPI"
+LUA_AUTO="$ZAPRET_BASE/lua/zapret-auto.lua"
+[ -f "$LUA_AUTO" ] || LUA_AUTO="$LUA_AUTO.gz"
+[ -f "$LUA_AUTO" ] && LUAOPT="$LUAOPT --lua-init=@$LUA_AUTO"
+# locked.lua (upstream'овский circular_locked) больше не загружается:
+# orchestrator.sh удалён upstream'ом 2026-05-07, mechanism осиротел.
+# Discord UDP теперь использует наш circular с allow_nohost (B1).
+# Детекторы неудач: штатные bol-van (zapret-auto.lua) плюс наши поправки к ним.
+#
+# z2k-alert.lua и z2k-quic-silence.lua были сняты 10.09.2026 и возвращены
+# 11.09.2026: отказ от них совпал по времени с ростом числа ротаций, а заняты
+# они обратным — притормаживают её (живой хост не ротируем, RST сервера не
+# провал, провал вешается на стратегию, на которой соединение началось).
+# z2k-detectors.lua остаётся снятым с 26.08: замер показал, что из 1858 его
+# строк до движка доходила одна функция, и она переехала в z2k-alert.lua.
+#
+# ПОСЛЕ zapret-auto.lua: оба зовут standard_failure_detector,
+# automate_host_record и automate_failure_counter, объявленные там. Файлы
+# проверяем на существование — конфиг ссылается на функцию по имени, и её
+# отсутствие роняет движок в error() на каждом пакете профиля.
+LUA_Z2K_ALERT="$ZAPRET_BASE/lua/z2k-alert.lua"
+[ -f "$LUA_Z2K_ALERT" ] && LUAOPT="$LUAOPT --lua-init=@$LUA_Z2K_ALERT"
+LUA_Z2K_QUIC_SILENCE="$ZAPRET_BASE/lua/z2k-quic-silence.lua"
+[ -f "$LUA_Z2K_QUIC_SILENCE" ] && LUAOPT="$LUAOPT --lua-init=@$LUA_Z2K_QUIC_SILENCE"
+#
+# z2k-tcp16.lua — рантайм обхода обрыва на 16 КБ: подстановка белого имени по
+# карте «сеть → имя» от пробы. В ротации не участвует. Грузится ПОСЛЕ
+# zapret-lib.lua и zapret-antidpi.lua (нужны blob и tls_mod); файл проверяем
+# на существование — без него инстанс z2k_sni_pick в профиле валил бы движок
+# в error на каждом пакете.
+LUA_Z2K_TCP16="$ZAPRET_BASE/lua/z2k-tcp16.lua"
+[ -f "$LUA_Z2K_TCP16" ] && LUAOPT="$LUAOPT --lua-init=@$LUA_Z2K_TCP16"
+#
+# z2k-preflight.lua — проверка DPI отдельным соединением в профиле googlevideo:
+# адреса, которые режутся по ОТВЕТУ сервера, плечами не лечатся вовсе. В ротации
+# не участвует. Грузится ПОСЛЕ zapret-lib.lua и zapret-antidpi.lua (нужны blob,
+# tls_mod, resolve_multi_pos); файл проверяем на существование — без него
+# инстанс z2k_preflight в профиле валил бы движок в error на каждом пакете.
+LUA_Z2K_PREFLIGHT="$ZAPRET_BASE/lua/z2k-preflight.lua"
+[ -f "$LUA_Z2K_PREFLIGHT" ] && LUAOPT="$LUAOPT --lua-init=@$LUA_Z2K_PREFLIGHT"
+# z2k-quic-reject.lua — отказ QUIC для тумблеров «YouTube без QUIC» и «Весь QUIC
+# через TCP». Грузится ПОСЛЕ zapret-lib.lua (direction_cutoff_opposite,
+# payload_check, replay_first); генератор ставит z2k_quic_reject только при
+# наличии файла, иначе прежний drop.
+LUA_Z2K_QUIC_REJECT="$ZAPRET_BASE/lua/z2k-quic-reject.lua"
+[ -f "$LUA_Z2K_QUIC_REJECT" ] && LUAOPT="$LUAOPT --lua-init=@$LUA_Z2K_QUIC_REJECT"
+# z2k-silence.lua — детектор «сервер молчит», жил здесь 11.09.2026 (p-84.4 …
+# p-84.6) и снят в тот же день: он ловил класс блока, который штатным признакам
+# не виден (сервер подтверждает ClientHello и молчит), но платой была ротация
+# там, где стратегия ни при чём — домен, мёртвый на всех адресах, выжигал пул.
+#
+# ЗАГРУЗКА ОСТАВЛЕНА ПЕРЕХОДНОЙ, И ЭТО НЕ ЗАБЫВЧИВОСТЬ. Патч заменяет файлы, но
+# не удаляет, поэтому на роутере остаётся и сам z2k-silence.lua, и конфиг, где
+# профили ещё ссылаются на z2k_fail_silence, — до первой перегенерации. Движок
+# на неизвестном имени детектора валится в error() НА КАЖДОМ ПАКЕТЕ профиля,
+# то есть обход стал бы пустышкой при зелёном статусе службы. Пока файл лежит,
+# он грузится и старый конфиг работает; после перегенерации на него уже никто
+# не ссылается, а следующая полная установка его снесёт (z2k.sh).
+LUA_Z2K_SILENCE="$ZAPRET_BASE/lua/z2k-silence.lua"
+[ -f "$LUA_Z2K_SILENCE" ] && LUAOPT="$LUAOPT --lua-init=@$LUA_Z2K_SILENCE"
+# Phase 6: z2k-fooling-ext.lua exports anti-ТСПУ fool functions like
+# z2k_dynamic_ttl, referenced by strategies via `fool=<name>` arg. Must
+# load after zapret-lib.lua (provides apply_fooling's extension point)
+# and before autocircular strategies that reference the new fools.
+LUA_Z2K_FOOLING="$ZAPRET_BASE/lua/z2k-fooling-ext.lua"
+[ -f "$LUA_Z2K_FOOLING" ] && LUAOPT="$LUAOPT --lua-init=@$LUA_Z2K_FOOLING"
+# z2k-nfqws1-compat.lua (23.10.2026): фулинг badseq (seq+ack, как в winws) и
+# hostfakesplit altorder=1 — приёмы winws-конфигов, которых в lua-движке нет.
+# Переопределяет глобали apply_fooling и hostfakesplit, поэтому грузится ПОСЛЕ
+# zapret-lib/zapret-antidpi и ДО z2k-range-rand.lua, чья обёртка должна лечь
+# поверх нашей.
+LUA_Z2K_NFQWS1_COMPAT="$ZAPRET_BASE/lua/z2k-nfqws1-compat.lua"
+[ -f "$LUA_Z2K_NFQWS1_COMPAT" ] && LUAOPT="$LUAOPT --lua-init=@$LUA_Z2K_NFQWS1_COMPAT"
+# Phase 7: z2k-range-rand.lua wraps upstream action functions (fake,
+# multisplit, fakedsplit, …) so strategies can use `repeats=2-6` style
+# range syntax on numeric args and get sticky per-flow randomised
+# values. MUST load AFTER zapret-antidpi.lua where the wrapped
+# functions are defined.
+LUA_Z2K_RANGE_RAND="$ZAPRET_BASE/lua/z2k-range-rand.lua"
+[ -f "$LUA_Z2K_RANGE_RAND" ] && LUAOPT="$LUAOPT --lua-init=@$LUA_Z2K_RANGE_RAND"
+# z2k-autocircular.lua АРХИВИРОВАН 2026-05-28 (archive/custom-detectors-rotation/).
+# Это была обёртка над нативным circular() (sticky-success / nld-pinning /
+# silent-retry) — давала жалобы на «прыгающую/залипающую» ротацию. Откат на
+# чистый нативный circular() из zapret-auto.lua (простая ротация fails→next).
+LUA_Z2K_MODERN_CORE="$ZAPRET_BASE/lua/z2k-modern-core.lua"
+[ -f "$LUA_Z2K_MODERN_CORE" ] && LUAOPT="$LUAOPT --lua-init=@$LUA_Z2K_MODERN_CORE"
+# z2k-http-strats.lua больше не грузится и удалён из проекта. 33 функции
+# z2k_http_* держали страты 8..40 профиля http_rkn, пока их не сняли осознанно
+# 2026-06-04 (9f63a39, сверка пулов с первоисточниками): пул сжат до
+# стандартных примитивов 1..8. Файл после этого продолжал качаться и грузиться
+# в движок при каждом старте, не будучи упомянут ни одной стратегией.
+# Сами примитивы никуда не делись — они в истории, коммит c7530ba.
+# z2k-state-persist.lua: persist-only layer over the NATIVE circular() —
+# seeds nstrategy from state.tsv on load and saves it back when it changes
+# (rate-limited, full-file rewrite). Does NOT change rotation logic. MUST be
+# lua-init'd AFTER zapret-auto.lua (which defines circular) so it can wrap it.
+LUA_Z2K_STATE_PERSIST="$ZAPRET_BASE/lua/z2k-state-persist.lua"
+[ -f "$LUA_Z2K_STATE_PERSIST" ] && LUAOPT="$LUAOPT --lua-init=@$LUA_Z2K_STATE_PERSIST"
+# z2k-dynamic-strategy.lua removed in r-15 Phase 1 — was a handler for
+# the z2k-classify generator which is itself gone.
+#
+# --bind-fix4/6: bind each raw-socket fake to the NFQUEUE-reported outgoing
+# interface. Without it, on Keenetic with policy-based routing (NDM
+# "маршрутизация по доменам" sending a domain into a WireGuard/VPN tunnel)
+# the generated desync packets leak out the wrong interface (default-gw WAN)
+# or get blocked in OUTPUT — corrupting the handshake, so a domain the user
+# routes through a tunnel won't open while z2k is on (ntc.party #4181). For
+# single-WAN / no-PBR setups it's a no-op: the fake already exits the default
+# interface. The shipped nfqws2 supports both flags on every arch (verified).
+NFQWS2_OPT_BASE="$USEROPT --fwmark=$DESYNC_MARK --bind-fix4 --bind-fix6 $LUAOPT"
+
+# Помнить, какое имя стояло в SNI у этого IP, и подставлять его при поиске
+# профиля для соединений БЕЗ SNI.
+#
+# Без этого без обхода остаётся телевизор. Замер 2026-08-18, LG webOS: часть
+# его соединений уходит с пустым hostname, профиль для них не находится, и они
+# падают в no_action — DPI работает с ними напрямую. Ключ автостейта при этом
+# не создаётся вовсе, поэтому и ротировать нечего: страта стоит, картинки не
+# грузятся, а в логе тишина.
+#
+# Опция демонская (params.cache_hostname), не профильная — потому и живёт
+# здесь, а не в строке профилей.
+NFQWS2_OPT_BASE="$NFQWS2_OPT_BASE --ipcache-hostname=1"
+
+# ПЕРЕСБОРКА TLS ClientHello ВКЛЮЧЕНА (с r-84, 11.09.2026).
+#
+# С 21.08 по 11.09 здесь стоял гейт z2k_apply_reasm_gate, добавлявший демону
+# `--reasm-disable=tls_client_hello`: большой ClientHello (не влезающий в один
+# сегмент) вис в браузере, curl при этом работал (bol-van/zapret2#229). Замер
+# 11.09 на Keenetic показал настоящую причину: виснут только серверы с
+# крошечным начальным окном (анти-DDoS reg.ru: SYN-ACK win 1448), а защита
+# движка от этого («reasm cancelled because server window size is smaller»)
+# молчала, потому что SYN-ACK IPv4 не попадал в очередь — правило NFQUEUE
+# `--connbytes 1:N --connbytes-dir reply` на этом ядре не матчит первый
+# ответный пакет (счётчик ещё 0). Починено в форке: common/ipt.sh даёт 0:N.
+# С этим пересборка работает, а без неё клон-фейки (tls_client_hello_clone) и
+# любой разбор по reasm видели только первый сегмент — 18 из 30 ClientHello на
+# линии владельца многосегментные. Гейт не возвращать.
+
+# RST-фильтры сняты 2026-08-17. Их было два, и оба отнимали больше, чем
+# давали:
+#
+#   RST_FILTER -> --rst-filter движка. Дропает входящий RST в
+#   dpi_desync_packet_play ДО диспетчеризации профиля, то есть до
+#   standard_failure_detector (lua/zapret-auto.lua) и до детектора
+#   автохостлиста. На входящем RST стоит вся ротация — ниже мы специально
+#   ставим tcp_be_liberal=1, ЧТОБЫ nfqws этот RST видел. Включение фильтра
+#   ослепляло ровно то, ради чего conntrack и настраивался.
+#
+#   DROP_DPI_RST -> правило iptables u32 по IP ID 0x0-0xF. Легитимный RST от
+#   Linux-сервера идёт с id 0 (снят с нашего же VPS: id 0, flags [DF]),
+#   поэтому правило резало нормальные ресеты: вместо мгновенного отказа
+#   клиент ждал таймаут.
+#
+# Флаг движка остаётся в бинарнике (default off) — мы его просто не передаём.
+
+# Phase 9: IP block detection + client RST (necronicle/zapret2-z2k r5+).
+# Watches outgoing ClientHello retransmits (upstream is_retransmission
+# detector) and on the 3rd confirmed retrans synthesises a RST from
+# server->client.
+#
+# DEFAULT OFF as of 2026-04-18. Rationale: ipblock's 3-retrans threshold
+# fires BEFORE circular's rotator (`fails=3:retrans=2` needs 6 retrans)
+# can accumulate enough failure signal to rotate to the next strategy.
+# Result: client gets a RST and reconnects to the same strategy, same
+# DPI block, same RST — infinite loop that looks to users like
+# "rotation only works if I manually reload the page". Master's default
+# of off, letting the TCP-retrans→circular path rotate automatically,
+# matches the "rotation felt automatic" user experience we regressed.
+#
+# Opt-in via config flag IPBLOCK_DETECT=1 for users who specifically
+# want the DNS-retry fast-fail behaviour (multi-A-record sites, where
+# one IP is blocked and others work).
+IPBLOCK_DETECT=${IPBLOCK_DETECT:-0}
+[ "$IPBLOCK_DETECT" = "1" ] && NFQWS2_OPT_BASE="$NFQWS2_OPT_BASE --ipblock-detect=on"
+
+# Load custom TLS ClientHello blob for strategies (manual: --blob is engine init option).
+TLS_MAX_RU_BLOB="$ZAPRET_BASE/files/fake/tls_clienthello_max_ru.bin"
+[ -s "$TLS_MAX_RU_BLOB" ] && NFQWS2_OPT_BASE="$NFQWS2_OPT_BASE --blob=tls_max_ru:@$TLS_MAX_RU_BLOB"
+
+TLS_14_BLOB="$ZAPRET_BASE/files/fake/tls_clienthello_14.bin"
+[ -s "$TLS_14_BLOB" ] && NFQWS2_OPT_BASE="$NFQWS2_OPT_BASE --blob=tls_clienthello_14:@$TLS_14_BLOB"
+
+TLS_GOOGLE_BLOB="$ZAPRET_BASE/files/fake/tls_clienthello_www_google_com.bin"
+[ -s "$TLS_GOOGLE_BLOB" ] && NFQWS2_OPT_BASE="$NFQWS2_OPT_BASE --blob=tls_clienthello_www_google_com:@$TLS_GOOGLE_BLOB"
+
+TLS_STUN_BLOB="$ZAPRET_BASE/files/fake/stun.bin"
+[ -s "$TLS_STUN_BLOB" ] && NFQWS2_OPT_BASE="$NFQWS2_OPT_BASE --blob=stun:@$TLS_STUN_BLOB"
+
+# ИМЯ ФАЙЛА БЛОБА ОБЯЗАНО СОВПАДАТЬ С ИМЕНЕМ БЛОБА. Валидатор конфига ищет
+# файл по имени блоба (files/fake/<имя>[.bin]) и на несовпадении даёт вето на
+# перезапуск; симлинки из install.sh кладёт только полная установка. Ровно так
+# r-80 и лёг у всех: вето валидатора, откат.
+TLS_4PDA_BLOB="$ZAPRET_BASE/files/fake/tls_clienthello_4pda_to.bin"
+[ -s "$TLS_4PDA_BLOB" ] && NFQWS2_OPT_BASE="$NFQWS2_OPT_BASE --blob=tls_clienthello_4pda_to:@$TLS_4PDA_BLOB"
+
+TLS_VK_BLOB="$ZAPRET_BASE/files/fake/tls_clienthello_vk_com.bin"
+[ -s "$TLS_VK_BLOB" ] && NFQWS2_OPT_BASE="$NFQWS2_OPT_BASE --blob=tls_clienthello_vk_com:@$TLS_VK_BLOB"
+
+TLS_GOSUSLUGI_BLOB="$ZAPRET_BASE/files/fake/tls_clienthello_gosuslugi_ru.bin"
+[ -s "$TLS_GOSUSLUGI_BLOB" ] && NFQWS2_OPT_BASE="$NFQWS2_OPT_BASE --blob=tls_clienthello_gosuslugi_ru:@$TLS_GOSUSLUGI_BLOB"
+
+TLS_ACTIVATED_BLOB="$ZAPRET_BASE/files/fake/tls_clienthello_activated.bin"
+[ -s "$TLS_ACTIVATED_BLOB" ] && NFQWS2_OPT_BASE="$NFQWS2_OPT_BASE --blob=tls_clienthello_activated:@$TLS_ACTIVATED_BLOB"
+
+SYN_PACKET_BLOB="$ZAPRET_BASE/files/fake/syn_packet.bin"
+[ -s "$SYN_PACKET_BLOB" ] && NFQWS2_OPT_BASE="$NFQWS2_OPT_BASE --blob=syn_packet:@$SYN_PACKET_BLOB"
+
+QUIC_GOOGLE_BLOB="$ZAPRET_BASE/files/fake/quic_initial_www_google_com.bin"
+[ -s "$QUIC_GOOGLE_BLOB" ] && NFQWS2_OPT_BASE="$NFQWS2_OPT_BASE --blob=quic_google:@$QUIC_GOOGLE_BLOB"
+
+QUIC5_BLOB="$ZAPRET_BASE/files/fake/quic_5.bin"
+[ -s "$QUIC5_BLOB" ] && NFQWS2_OPT_BASE="$NFQWS2_OPT_BASE --blob=quic5:@$QUIC5_BLOB"
+
+QUIC4_BLOB="$ZAPRET_BASE/files/fake/quic_4.bin"
+[ -s "$QUIC4_BLOB" ] && NFQWS2_OPT_BASE="$NFQWS2_OPT_BASE --blob=quic4:@$QUIC4_BLOB"
+
+QUIC6_BLOB="$ZAPRET_BASE/files/fake/quic_6.bin"
+[ -s "$QUIC6_BLOB" ] && NFQWS2_OPT_BASE="$NFQWS2_OPT_BASE --blob=quic6:@$QUIC6_BLOB"
+
+QUIC1_BLOB="$ZAPRET_BASE/files/fake/quic_1.bin"
+[ -s "$QUIC1_BLOB" ] && NFQWS2_OPT_BASE="$NFQWS2_OPT_BASE --blob=quic1:@$QUIC1_BLOB"
+
+# СНЯТО 26.08.2026. Сверка стратегий с первоисточниками показала, что эти
+# блобы регистрировались и грузились в движок при каждом старте, но НИ ОДНА
+# стратегия на них не ссылалась — ни в strats_new2.txt, ни в quic_strats.ini,
+# ни в config_official.sh. Проверено и на живом роутере по командной строке
+# процесса. Сторож от повторения — tests/test_blob_identifiers.sh.
+
+QUIC_RUTRACKER_BLOB="$ZAPRET_BASE/files/fake/quic_initial_rutracker_org.bin"
+[ -s "$QUIC_RUTRACKER_BLOB" ] && NFQWS2_OPT_BASE="$NFQWS2_OPT_BASE --blob=quic_rutracker:@$QUIC_RUTRACKER_BLOB"
+
+# QUIC Initial с SNI steamcommunity.com (1200 байт, MIT) — голосовой фейк
+# референсного набора с 22.07.2026, скопирован в репозиторий 25.10.2026. На нём
+# весь голосовой пул discord_udp. Прежний голосовой фейк quic_dbankcloud снят:
+# его больше не использует ни одна стратегия, а пользовательские файлы, где он
+# мог остаться, переводит _z2k_migrate_custom_voice_blob_v1 ниже.
+QUIC_STEAM_BLOB="$ZAPRET_BASE/files/fake/quic_initial_steamcommunity_com.bin"
+[ -s "$QUIC_STEAM_BLOB" ] && NFQWS2_OPT_BASE="$NFQWS2_OPT_BASE --blob=quic_initial_steamcommunity_com:@$QUIC_STEAM_BLOB"
+
+# Снимки ClientHello (MIT), скопированы в репозиторий 23.10.2026 — блобы живут
+# только у нас, извне не тянутся. sferum (661 байт, SNI www.sferum.ru, TLS 1.3 с
+# откатом на 1.2) заменяет выгоревший onetrust; у нас onetrust стоял в
+# rkn 4/16/24/47 и yt/gv 4 (файл tls_clienthello_www_onetrust_com снят).
+# sochi_park (244 байта, SNI staging-sochi-park.predict.mail.ru) и stun2
+# (120 байт, CustomSTUN) — фейки двух новых плеч rkn.
+TLS_SFERUM_BLOB="$ZAPRET_BASE/files/fake/tls_clienthello_www_sferum_ru.bin"
+[ -s "$TLS_SFERUM_BLOB" ] && NFQWS2_OPT_BASE="$NFQWS2_OPT_BASE --blob=tls_clienthello_www_sferum_ru:@$TLS_SFERUM_BLOB"
+
+TLS_SOCHI_PARK_BLOB="$ZAPRET_BASE/files/fake/tls_clienthello_sochi_park.bin"
+[ -s "$TLS_SOCHI_PARK_BLOB" ] && NFQWS2_OPT_BASE="$NFQWS2_OPT_BASE --blob=tls_clienthello_sochi_park:@$TLS_SOCHI_PARK_BLOB"
+
+STUN2_BLOB="$ZAPRET_BASE/files/fake/stun2.bin"
+[ -s "$STUN2_BLOB" ] && NFQWS2_OPT_BASE="$NFQWS2_OPT_BASE --blob=stun2:@$STUN2_BLOB"
+
+# RDP-пакет (47 байт, из набора файлов движка) — фейк плеча rkn 20: фейк не-TLS
+# протокола со сдвигом seq и мультиразрез, замер 25.10.2026 на линии Марка 32 из 33.
+RDP_BLOB="$ZAPRET_BASE/files/fake/rdp.bin"
+[ -s "$RDP_BLOB" ] && NFQWS2_OPT_BASE="$NFQWS2_OPT_BASE --blob=rdp:@$RDP_BLOB"
+
+TLS_T2_BLOB="$ZAPRET_BASE/files/fake/t2.bin"
+[ -s "$TLS_T2_BLOB" ] && NFQWS2_OPT_BASE="$NFQWS2_OPT_BASE --blob=t2:@$TLS_T2_BLOB"
+
+# Здесь регистрировался `--blob=4pda:@files/fake/4pda.bin`. Снято, и не ради
+# чистоты: nfqws2 такой идентификатор ОТВЕРГАЕТ — «bad identifier '4pda'», имя
+# не может начинаться с цифры, — и демон не стартовал вовсе.
+#
+# Строка лежала в дереве с марта и молчала лишь потому, что сам файл на роутеры
+# не приезжал: прежняя доставка возила только то, что релиз перечислил поимённо,
+# а 4pda.bin с тех пор не менялся. Как только обновление стало приводить дерево
+# к манифесту целиком, файл приехал, условие `[ -s ... ]` стало истинным — и
+# обход лёг у всех, кто перезапустил сервис.
+#
+# Сам блоб был не нужен: 4pda.bin байт-в-байт совпадал с
+# tls_clienthello_4pda_to.bin, и на имя `4pda` не ссылалась ни одна стратегия.
+# Файл удалён вместе с регистрацией. Сторож — tests/test_blob_identifiers.sh.
+
+
+
+LISTS_DIR="$ZAPRET_BASE/lists"
+EXTRA_STRATS_DIR="$ZAPRET_BASE/extra_strats"
+CONFIG_DIR="/opt/etc/zapret2"
+CUSTOM_DIR="${CUSTOM_DIR:-$ZAPRET_RW/init.d/keenetic}"
+# ORCH_SCRIPT removed: upstream orchestrator.sh deleted 2026-05-07,
+# Discord UDP rotation handled via our circular+allow_nohost (см. B1 plan).
+IPSET_CR="$ZAPRET_BASE/ipset/create_ipset.sh"
+
+# ==============================================================================
+# ФУНКЦИИ ДЛЯ РАБОТЫ С IPSET
+# ==============================================================================
+
+create_ipset()
+{
+	echo "Creating ip list table (firewall type $FWTYPE)"
+	"$IPSET_CR" "$@"
+}
+
+# ==============================================================================
+# ИСКЛЮЧЕНИЯ ИЗ ОБХОДА ПО АДРЕСАТУ (сеты nozapret / nozapret6)
+# ==============================================================================
+#
+# Локальные адреса НИКОГДА не должны попадать под десинк: между роутером и
+# 192.168.x / 10.x никакого DPI нет, обходить там нечего — а сломать можно.
+# Полевой отчёт 2026-08-06: приложение камер (EasyLive/Tiandy) не показывало
+# видео при включённом обходе, работало при выключенном и через VPN.
+#
+# Почему одной привязки правил к WAN недостаточно: в _fw_nfqws_post4 есть ветка
+# БЕЗ `-o $iface` — если WAN не определился (boot-race, CGNAT, поздний линк),
+# правило вешается на ВСЕ интерфейсы, включая локальные бриджи, и локальный
+# трафик уходит в очередь. Апстримный cut_local тут не спасает: это греп по
+# `^192\.168\.|^127\.|^10\.` (не знает ни 172.16/12, ни 169.254/16) и к списку
+# исключений он вообще не применяется.
+#
+# Сеты nozapret/nozapret6 проверяются В КАЖДОМ NFQUEUE-правиле
+# (`$IPSET_EXCLUDE dst`), поэтому засев сюда работает независимо от хостлистов
+# и профилей — в том числе для Discord/STUN-профиля, у которого хостлиста нет.
+#
+# CGNAT (100.64.0.0/10) намеренно НЕ включён: это не локалка, а адреса
+# провайдерского NAT, и у части операторов за ними живут их же сервисы.
+Z2K_LOCAL_EXCLUDE4="10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 127.0.0.0/8 169.254.0.0/16 224.0.0.0/4 255.255.255.255"
+Z2K_LOCAL_EXCLUDE6="::1/128 fc00::/7 fe80::/10 ff00::/8"
+
+z2k_seed_local_exclusions()
+{
+	exists ipset || return 0
+	local net
+	if [ "$DISABLE_IPV4" != "1" ]; then
+		ipset create nozapret hash:net -exist 2>/dev/null
+		for net in $Z2K_LOCAL_EXCLUDE4; do
+			ipset add nozapret "$net" -exist 2>/dev/null
+		done
+	fi
+	if [ "$DISABLE_IPV6" != "1" ]; then
+		ipset create nozapret6 hash:net family inet6 -exist 2>/dev/null
+		for net in $Z2K_LOCAL_EXCLUDE6; do
+			ipset add nozapret6 "$net" -exist 2>/dev/null
+		done
+	fi
+	echo "Local address ranges excluded from desync (nozapret)"
+	return 0
+}
+
+# Пользовательский файл исключений по адресату. Имя апстримное
+# (ipset/def.sh: ZUSERLIST_EXCLUDE), но читаем его ТОЛЬКО мы: засев
+# z2k_seed_user_exclusions при старте файрвола и панель. Апстримная цепочка
+# filedigger -> mdig -> create_ipset.sh в z2k не запускается: ночная задача
+# «06:00 ipset/get_config.sh» убрана из планировщика 2026-09-02, потому что
+# читала этот файл в ДРУГОЙ грамматике (строка целиком в mdig, домены
+# разрешались) и затем делала `ipset flush nozapret` — из сета исчезал и наш
+# засев локалки, и адреса с комментарием в конце строки, и записи панели.
+# Отсюда же шли «mdig stats : domains=16 success=0 error=16» в диагностике
+# (разбор 2026-08-08): mdig получал шапку из комментариев.
+#
+# Грамматика файла одна — та, что у засева и панели: комментарий после «#»
+# и пустые строки срезаются, строка-не-адрес пропускается со счётчиком в
+# выводе. Подсказка (ниже) обязана описывать ровно это; тесты
+# test_local_exclusions.sh и test_exclude_hint_truthful.sh сверяют оба.
+#
+# Подсказку кладём в файл-спутник, чтобы сам файл оставался списком, а человек
+# по SSH видел их рядом.
+z2k_ensure_user_exclude_file()
+{
+	local f="${ZAPRET_BASE}/ipset/zapret-hosts-user-exclude.txt"
+	local doc="${ZAPRET_BASE}/ipset/zapret-hosts-user-exclude.README.txt"
+	local tmp="/tmp/z2k_excl_readme.$$"
+	mkdir -p "$(dirname "$f")" 2>/dev/null || return 0
+
+	# Документация наша, не пользовательская — обновляем только при изменении текста,
+	# чтобы не изнашивать NAND/USB-флешку при каждом вызове start_fw из NDM-хука.
+	cat > "$tmp" 2>/dev/null <<'Z2KEXCL'
+Исключения из обхода — ПО АДРЕСАТУ.
+
+Файл: zapret-hosts-user-exclude.txt (рядом с этим)
+
+Всё, что в нём перечислено, z2k не трогает вообще: трафик к этим адресам не
+попадает в обработку, как будто обход выключен именно для них.
+
+Одна запись на строку — ТОЛЬКО адреса и подсети:
+  адрес          203.0.113.10
+  подсеть        203.0.113.0/24
+  адрес IPv6     2001:db8::1
+
+Комментарии после # и пустые строки допустимы — они срезаются при чтении:
+  203.0.113.10   # камера в подъезде
+
+ДОМЕНЫ ЗДЕСЬ НЕ ДЕЙСТВУЮТ. Строка с буквами не разрешается в адреса и в
+исключения не попадает; при старте z2k сообщает, сколько таких строк
+пропущено, а веб-панель показывает их отдельным списком. Домены исключаются
+в другом месте: «Исключения» → «Домены» в веб-панели (или lists/whitelist.txt).
+Причина не в лени: за одним адресом CDN стоят тысячи чужих имён, и по адресу
+отличить их невозможно.
+
+Когда вступает в силу: запись через веб-панель — сразу. Правка этого файла
+руками — после перезапуска z2k (перезагрузка роутера или
+/opt/etc/init.d/S99zapret2 restart).
+
+Зачем это нужно: некоторые приложения (камеры и домофоны с P2P, часть VoIP и
+WebRTC) ломаются от модификации их пакетов. Впишите адрес их сервиса — и
+приложение заработает, а обход для остального останется.
+
+Локальные адреса (192.168.x, 10.x, 172.16-31.x и т.п.) исключены всегда и без
+этого файла — вписывать их сюда не нужно.
+
+Удобнее всего править через веб-панель: «Исключения» → «Адреса».
+Z2KEXCL
+	if [ -f "$tmp" ]; then
+		if [ ! -f "$doc" ] || ! cmp -s "$tmp" "$doc" 2>/dev/null; then
+			cp "$tmp" "$doc" 2>/dev/null || true
+		fi
+		rm -f "$tmp" 2>/dev/null
+	fi
+
+	[ -e "$f" ] && return 0
+	: > "$f" 2>/dev/null || return 0
+	echo "Created user exclude list: $f"
+	return 0
+}
+
+# Засев пользовательских адресов в живые сеты при старте.
+#
+# Это ЕДИНСТВЕННЫЙ читатель файла, кроме панели (см. комментарий у
+# z2k_ensure_user_exclude_file: апстримная ночная пересборка убрана
+# 2026-09-02). Раньше засева не было вовсе, и адресное исключение из панели
+# жило до первой перезагрузки; потом засев появился, но ночной get_config.sh
+# по-прежнему сбрасывал сет — исключения жили до 06:00.
+#
+# Грамматика: комментарий после «#» и пробелы срезаются, пустые строки и
+# строки-комментарии не считаются. Домены игнорируются намеренно: исключение
+# по имени работает через --hostlist-exclude (lists/whitelist.txt) и в ipset
+# выражено быть не может — один адрес за CDN обслуживает тысячи чужих имён.
+# Пропуск не молчаливый: число таких строк уходит в вывод, иначе человек
+# считает исключение действующим (отчёт 2026-09-02).
+z2k_seed_user_exclusions()
+{
+	exists ipset || return 0
+	local f="${ZAPRET_BASE}/ipset/zapret-hosts-user-exclude.txt"
+	local line n4=0 n6=0 skipped=0
+	[ -f "$f" ] || return 0
+	while IFS= read -r line || [ -n "$line" ]; do
+		line="${line%%#*}"
+		line=$(printf '%s' "$line" | tr -d ' \t\r')
+		[ -n "$line" ] || continue
+		case "$line" in
+			*:*)
+				[ "$DISABLE_IPV6" = "1" ] && continue
+				ipset add nozapret6 "$line" -exist 2>/dev/null && n6=$((n6 + 1))
+				;;
+			*[!0-9./]*) skipped=$((skipped + 1)); continue ;;
+			*[0-9]*)
+				[ "$DISABLE_IPV4" = "1" ] && continue
+				ipset add nozapret "$line" -exist 2>/dev/null && n4=$((n4 + 1))
+				;;
+		esac
+	done < "$f"
+	[ "$((n4 + n6))" -gt 0 ] && echo "User address exclusions loaded: $n4 IPv4, $n6 IPv6"
+	[ "$skipped" -gt 0 ] && echo "User address exclusions: $skipped line(s) skipped, not an address (domains go to lists/whitelist.txt)"
+	return 0
+}
+
+# ==============================================================================
+# KEENETIC FIREWALL FUNCTIONS (замена OpenWrt network.sh зависимостей)
+# ==============================================================================
+
+# Shared with the self-healer so every selected main-table WAN gets the same rules.
+# shellcheck source=lib/wan.sh
+. "$ZAPRET_BASE/lib/wan.sh"
+
+get_default_ifaces4()
+{
+	z2k_wan_ifaces -4
+}
+
+get_default_ifaces6()
+{
+	z2k_wan_ifaces -6
+}
+
+get_wan_ifaces4()
+{
+	local ifaces
+	ifaces="$(z2k_wan_ifaces -4 "${WAN_IFACE:-}")" || return 1
+	ifaces="$(echo "$ifaces" | xargs)"
+	if [ -n "$ifaces" ] && exists ip; then
+		local i
+		for i in $ifaces; do
+			# /sys (не netlink) — `ip link show` виснет в D-state на WireGuard nwg0 под штормом (issue #18)
+			[ -e "/sys/class/net/$i" ] || echo "WARN: WAN iface '$i' not found" >&2
+		done
+	fi
+	[ -n "$ifaces" ] && unique $ifaces || true
+}
+
+get_wan_ifaces6()
+{
+	local ifaces
+	ifaces="$(z2k_wan_ifaces -6 "${WAN_IFACE:-}")" || return 1
+	ifaces="$(echo "$ifaces" | xargs)"
+	if [ -n "$ifaces" ] && exists ip; then
+		local i
+		for i in $ifaces; do
+			# /sys (не netlink) — `ip link show` виснет в D-state на WireGuard nwg0 под штормом (issue #18)
+			[ -e "/sys/class/net/$i" ] || echo "WARN: WAN iface '$i' not found" >&2
+		done
+	fi
+	[ -n "$ifaces" ] && unique $ifaces || true
+}
+
+# Keenetic-specific: упрощенные версии fw_nfqws_post4/post6/pre4/pre6
+# В отличие от OpenWrt, не требуют network.sh и определения WAN интерфейсов
+# Пытаемся определить WAN по default route
+
+fw_nfqws_post4()
+{
+	# $1 - 1 - add, 0 - del
+	# $2 - filter
+	# $3 - queue number
+	local wan
+	wan="$(get_wan_ifaces4)"
+	if [ -n "$wan" ]; then
+		_fw_nfqws_post4 "$1" "$2" "$3" "$wan"
+	else
+		echo "WARN: WAN iface not found (IPv4), skip applying nfqws rules"
+		return 0
+	fi
+}
+
+fw_nfqws_post6()
+{
+	# $1 - 1 - add, 0 - del
+	# $2 - filter
+	# $3 - queue number
+	[ "$DISABLE_IPV6" = "1" ] && return 0
+	local wan
+	wan="$(get_wan_ifaces6)"
+	if [ -n "$wan" ]; then
+		_fw_nfqws_post6 "$1" "$2" "$3" "$wan"
+	else
+		echo "WARN: WAN iface not found (IPv6), skip applying nfqws rules"
+		return 0
+	fi
+}
+
+fw_nfqws_pre4()
+{
+	# $1 - 1 - add, 0 - del
+	# $2 - filter
+	# $3 - queue number
+	local wan
+	wan="$(get_wan_ifaces4)"
+	if [ -n "$wan" ]; then
+		_fw_nfqws_pre4 "$1" "$2" "$3" "$wan"
+	else
+		echo "WARN: WAN iface not found (IPv4), skip applying nfqws rules"
+		return 0
+	fi
+}
+
+fw_nfqws_pre6()
+{
+	# $1 - 1 - add, 0 - del
+	# $2 - filter
+	# $3 - queue number
+	[ "$DISABLE_IPV6" = "1" ] && return 0
+	local wan
+	wan="$(get_wan_ifaces6)"
+	if [ -n "$wan" ]; then
+		_fw_nfqws_pre6 "$1" "$2" "$3" "$wan"
+	else
+		echo "WARN: WAN iface not found (IPv6), skip applying nfqws rules"
+		return 0
+	fi
+}
+
+# ==============================================================================
+# ФУНКЦИИ УПРАВЛЕНИЯ DAEMON (АДАПТИРОВАНО ДЛЯ KEENETIC БЕЗ PROCD)
+# ==============================================================================
+
+# Учёт демонов, не сумевших стартовать.
+#
+# До 2026-08-06 провал терялся полностью: run_daemon честно возвращал 1, но
+# start_daemons и start() имели ЗАХАРДКОЖЕННЫЙ `return 0`, поэтому init печатал
+# «zapret2 service started» сразу после «ERROR: Daemon 1 failed to start», а
+# веб-панель показывала зелёное «работает» при мёртвом обходе. Полевой случай:
+# юзер видит в консоли отказ, в панели — успех, кнопка «Остановить» рапортует
+# ОК и ничего не делает.
+#
+# Счётчик в ФАЙЛЕ, а не в переменной: путь start → start_daemons →
+# standard_mode_daemons → ... → run_daemon проходит через функции форка, и если
+# любое звено однажды окажется в subshell, переменная потеряется молча, а файл —
+# нет. /tmp = tmpfs, между перезапусками состояние не нужно.
+Z2K_DAEMON_FAIL_FILE="${Z2K_DAEMON_FAIL_FILE:-/tmp/.z2k-daemon-failures}"
+
+z2k_daemon_fail_reset() { : > "$Z2K_DAEMON_FAIL_FILE" 2>/dev/null || true; }
+z2k_daemon_fail_note()  { echo "$1" >> "$Z2K_DAEMON_FAIL_FILE" 2>/dev/null || true; }
+
+# Причина отказа старта. До 2026-08-13 демон запускался как `>/dev/null 2>&1`,
+# то есть nfqws2 честно писал, что именно ему не понравилось, а мы это стирали.
+# Человек получал «ERROR: Daemon 1 failed to start» и больше ни слова — по такому
+# сообщению диагностировать нечего, и полевой случай 08-13 закончился слепым
+# перезапуском роутера вместо починки.
+#
+# Ловим stderr в файл на время старта. Он нужен ровно до решения «поднялся или
+# нет»: при успехе файл удаляется (демон продолжает писать в уже отвязанный
+# inode, и /tmp = tmpfs не растёт после его смерти), при отказе — печатается.
+z2k_daemon_err_file()
+{
+    echo "/tmp/.z2k-daemon-${1}-${2}.err"
+}
+
+# Что печатать, когда демон не поднялся.
+#
+# Сначала то, что сказал сам nfqws2 — это точный ответ. Если он не сказал ничего
+# (умер до того, как успел, либо причина не в разборе параметров), повторяем
+# запуск с --dry-run: он проверяет параметры, грузит списки и блобы, но НЕ
+# занимает очередь, поэтому безопасен и в этот момент, и вообще. Пустой вывод у
+# обоих означает, что параметры верны — и тогда это единственный полезный факт,
+# который у нас есть: искать надо не в конфиге.
+z2k_daemon_explain()
+{
+    # $1 - err-файл, $2 - бинарник, $3 - аргументы
+    local _n=0
+    if [ -s "$1" ]; then
+        _n=$(wc -l < "$1" 2>/dev/null | tr -d ' \t')
+        echo "  причина (от nfqws2):"
+        tail -n 5 "$1" 2>/dev/null | sed 's/^/    /'
+        [ "${_n:-0}" -gt 5 ] && echo "    (полностью: $1)"
+        return 0
+    fi
+    local _dry
+    # shellcheck disable=SC2086  # $3 — строка аргументов, нужно словоделение
+    _dry=$("$2" --dry-run $3 2>&1)
+    if [ $? -ne 0 ]; then
+        echo "  причина (проверка параметров):"
+        # Баннер версии и пустые строки — шум: настоящая причина идёт последней,
+        # и без отсева она тонет в тех же пяти строках, что мы показываем.
+        printf '%s\n' "$_dry" \
+            | grep -viE '^loading|^Loaded |^Running as|^github version|^$' \
+            | tail -n 5 | sed 's/^/    /'
+    else
+        echo "  параметры конфигурации разобраны без ошибок — дело не в них."
+        echo "  проверьте, не занята ли очередь ${QNUM:-200} другим процессом:"
+        echo "    cat /proc/net/netfilter/nfnetlink_queue"
+    fi
+}
+z2k_daemon_fail_count() {
+    [ -f "$Z2K_DAEMON_FAIL_FILE" ] || { echo 0; return 0; }
+    wc -l < "$Z2K_DAEMON_FAIL_FILE" 2>/dev/null | tr -d ' \t' || echo 0
+}
+
+run_daemon()
+{
+    # $1 - daemon ID
+    # $2 - daemon binary
+    # $3 - daemon args
+    local DAEMONBASE
+    DAEMONBASE="$(basename "$2")"
+    local PIDFILE="$PIDDIR/${DAEMONBASE}_$1.pid"
+
+    echo "Starting daemon $1: $2 $3"
+
+    # Запуск в фоне с сохранением PID
+    local ERRFILE
+    ERRFILE=$(z2k_daemon_err_file "$DAEMONBASE" "$1")
+    : > "$ERRFILE" 2>/dev/null || true
+    $2 $3 >/dev/null 2>"$ERRFILE" &
+    local PID=$!
+
+    # Сохранить PID
+    echo $PID > "$PIDFILE"
+
+    # Проверить что процесс запустился
+    # Which queue THIS daemon was told to bind. custom.d instances
+    # (50-stun4all, 50-discord-media) pass their own --qnum, so the global
+    # $QNUM is simply wrong for them - we would wait on the main daemon's
+    # queue, find it already bound, and return without ever checking this one.
+    local _qn="$QNUM"
+    case " $3 " in
+        *" --qnum="*) _qn=${3#*--qnum=}; _qn=${_qn%% *} ;;
+    esac
+    case "$DAEMONBASE" in
+        nfqws2) z2k_wait_queue_bound "$PID" "${_qn:-200}" 3 ;;
+        *)      sleep 1 ;;
+    esac
+    # No extra settle here on purpose. A successful z2k_wait_queue_bound already
+    # proves this pid got through option parsing, lua init, blob loading AND bound
+    # its own queue - a strictly stronger start check than the old flat `sleep 1`,
+    # which verified nothing. It also returns 1 the moment the pid dies mid-wait,
+    # so a failed start is still caught below. The only case a settle would add is
+    # "bound the queue, then crashed milliseconds later", which is a runtime crash
+    # for the watchdog, not a startup failure - and paying 200 ms (a full second
+    # where usleep is absent) on every daemon start to maybe notice it is a bad
+    # trade in the path this whole change exists to shorten.
+    if z2k_pid_running "$PID"; then
+        echo "Daemon $1 started with PID $PID"
+        # Демон жив и держит fd открытым. Отвязываем файл: то, что он напишет в
+        # stderr дальше, уйдёт в inode без имени и освободится вместе с
+        # процессом — tmpfs не копится, а мусорного файла в /tmp не остаётся.
+        rm -f "$ERRFILE" 2>/dev/null || true
+        return 0
+    else
+        echo "ERROR: Daemon $1 failed to start"
+        z2k_daemon_explain "$ERRFILE" "$2" "$3"
+        z2k_daemon_fail_note "$1"
+        rm -f "$PIDFILE"
+        return 1
+    fi
+}
+
+run_nfqws()
+{
+    # $1 - instance ID
+    # $2 - nfqws options
+    # No hostlist validation here — custom.d scripts (50-stun4all, 50-discord-media)
+    # intentionally run without hostlists, relying on firewall rules (u32/nft @ih).
+    # Hostlist checks happen at config generation time (add_hostlist_line in config_official.sh).
+    #
+    # Переключателя режима ротации здесь нет и не будет. Ротация всегда
+    # нативная, как у bol-van; ветка r-49 (proof-of-life + content-gate внутри
+    # automate_failure_check) снята с вооружения 18.08.2026 вместе с
+    # управлявшей ею переменной окружения.
+    #
+    # Почему её убрали: режим выводился по подстроке — встретилось в
+    # аргументах `failure_detector=`, значит не нативный. Решение по
+    # написанию, а не по смыслу. С 10.09.2026 никаких обёрток нет вовсе:
+    # детекторы штатные, параметры — из документации (lib/config_official.sh).
+
+    run_daemon $1 "$NFQWS2" "$NFQWS2_OPT_BASE $2"
+}
+
+do_nfqws()
+{
+    # $1 - 0 (stop) or 1 (start)
+    # $2 - instance ID
+    # $3 - nfqws options
+    [ "$1" = 0 ] || { shift; run_nfqws "$@"; }
+}
+
+# Шаг z2k_preflight на IPv6 (аргумент v6) работает только там, где IPv6 идёт
+# без NAT: повторный SYN пробы движок отправляет сам, и за NAT он ушёл бы с
+# внутренним адресом устройства. У Keenetic адреса устройств по умолчанию
+# маршрутизируются как есть; если же в nat для IPv6 есть правило подмены
+# адреса — снимаем v6 со строки движка, IPv4 это не трогает.
+#
+# Штатное правило Keenetic `NETMAP ... ! --match-set _NDM_W6P_<wan> src`
+# подменой не считается: оно переводит только адреса НЕ из публичного
+# префикса провайдера, а устройства с настоящими адресами идут мимо него
+# (роутер Марка, 09.11.2026).
+z2k_preflight_v6_gate()
+{
+    case "$NFQWS2_OPT" in
+        *z2k_preflight*:v6*) ;;
+        *) return 0 ;;
+    esac
+    if [ "$DISABLE_IPV6" != "1" ] && \
+       ! ip6tables -t nat -S 2>/dev/null | grep -E -- '-j (MASQUERADE|SNAT|NETMAP)' \
+            | grep -qv -- '! --match-set _NDM_W6P'; then
+        return 0
+    fi
+    NFQWS2_OPT=$(printf '%s' "$NFQWS2_OPT" | sed 's/\(z2k_preflight:[^ ]*\):v6/\1/g')
+    echo "z2k_preflight: IPv6 за NAT или выключен — шаг только для IPv4"
+}
+
+stop_daemon_by_pidfile()
+{
+    # $1 - pidfile path
+    if [ -f "$1" ]; then
+        local PID
+        PID=$(cat "$1")
+        if [ -n "$PID" ] && kill -0 $PID 2>/dev/null; then
+            echo "Stopping daemon with PID $PID"
+            kill $PID 2>/dev/null
+            # Poll instead of a flat 3 s: nfqws2 exits on SIGTERM in ~0.05 s
+            # (measured) because nfqws.c checks bQuit right after select().
+            # Same 3 s SIGKILL deadline, just not paid when it is not needed.
+            z2k_wait_gone "$PID" 3
+            # Force kill если не остановился
+            kill -0 $PID 2>/dev/null && kill -9 $PID 2>/dev/null
+        fi
+        rm -f "$1"
+    fi
+}
+
+stop_all_nfqws()
+{
+    echo "Stopping all nfqws daemons"
+
+    # ���������� �� PID ������
+    for pidfile in $PIDDIR/nfqws2_*.pid; do
+        [ -f "$pidfile" ] && stop_daemon_by_pidfile "$pidfile"
+    done
+
+    # Демоны без PID-файла (сирота от прерванного запуска или переустановки)
+    # держат очередь, и новый запуск на ней падает. Ищем их через /proc, а не
+    # killall: его может не быть.
+    local _left _p
+    _left=$(z2k_pids_by_comm nfqws2)
+    if [ -n "$_left" ]; then
+        echo "Stopping nfqws2 without pidfile: PID" $_left
+        for _p in $_left; do kill "$_p" 2>/dev/null; done
+        for _p in $_left; do
+            z2k_wait_gone "$_p" 3 || kill -9 "$_p" 2>/dev/null
+        done
+    fi
+
+    # �������� ��� PID �����
+    rm -f $PIDDIR/nfqws2_*.pid 2>/dev/null
+}
+
+# ==============================================================================
+# ФУНКЦИИ START/STOP DAEMONS
+# ==============================================================================
+
+# Remove only the retired pool, from BOTH snapshots (Lua merges them on load).
+# Run before daemon startup, including direct start_daemons. No done marker:
+# restored backups must not bring the category back. Preserve ownership/mode.
+_z2k_retire_cf_extra_state()
+{
+    local base="${EXTRA_STRATS_DIR:-$ZAPRET_BASE/extra_strats}/cache/autocircular"
+    local fallback="${Z2K_AUTOCIRCULAR_FALLBACK_OVERRIDE:-/tmp}/z2k-autocircular-state.tsv"
+    local f tmp now stamp n failed=0 locked
+    for f in "$base/state.tsv" "$fallback"; do
+        [ -s "$f" ] || continue
+        awk -F'\t' '$1 == "cf_extra" { found=1; exit } END { exit !found }' "$f" || continue
+        n=0; locked=0
+        while [ "$n" -lt 12 ]; do
+            now=$(date +%s)
+            if [ -f "$f.lock" ]; then
+                stamp=$(cat "$f.lock" 2>/dev/null)
+                case "$stamp" in
+                    ''|*[!0-9]*) rm -f "$f.lock" ;;
+                    *) if [ "$stamp" -gt "$((now + 10))" ] || [ "$((now - stamp))" -gt 10 ]; then
+                           rm -f "$f.lock"
+                       fi ;;
+                esac
+            fi
+            if ( set -C; printf '%s' "$now" > "$f.lock" ) 2>/dev/null; then
+                locked=1; break
+            fi
+            n=$((n + 1)); sleep 1
+        done
+        [ "$locked" = 1 ] || { failed=1; continue; }
+        tmp=$(mktemp "${f}.retire.XXXXXX") || {
+            rm -f "$f.lock"; failed=1; continue
+        }
+        if cp -p "$f" "$tmp" && awk -F'\t' '$1 != "cf_extra"' "$f" > "$tmp" && mv -f "$tmp" "$f"; then
+            echo "Removed retired cf_extra rotator state"
+        else
+            failed=1
+        fi
+        rm -f "$tmp" "$f.lock"
+    done
+    return "$failed"
+}
+
+# p-87.30: gv_tcp now waits for SNI; remove obsolete automatic IP/unrelated
+# domain buckets, preserving operator freezes and both service families.
+# state/*.done is backed up/restored alongside state.tsv by lib/install.sh.
+_z2k_migrate_gv_named_state_v1()
+{
+    local base="${EXTRA_STRATS_DIR:-$ZAPRET_BASE/extra_strats}/cache/autocircular"
+    local marker="$ZAPRET_BASE/state/gv-named-state-v1.done"
+    local fallback="${Z2K_STATE_FALLBACK:-${Z2K_AUTOCIRCULAR_FALLBACK_OVERRIDE:-/tmp}/z2k-autocircular-state.tsv}"
+    [ -f "$marker" ] && return 0
+    local f tmp failed=0
+    for f in "$base/state.tsv" "$fallback"; do
+        [ -f "$f" ] || continue
+        if ( set -C; printf '%s' "$(date +%s)" > "$f.lock" ) 2>/dev/null; then
+            tmp="$f.gv-named.$$"
+            # Keep the first snapshot on retries, but always reapply the filter:
+            # the previous attempt may have failed after making its snapshot.
+            if { [ -f "$f.pre-gv-named-v1" ] || cp -p "$f" "$f.pre-gv-named-v1"; } &&
+                cp -p "$f" "$tmp" &&
+                awk -F '\t' '
+                    $1=="gv_tcp" && ($5=="auto" || $5=="") &&
+                    $2 !~ /^(googlevideo[.]com|youtube[.]com)\|[46]$/ {next}
+                    {print}
+                ' "$f" > "$tmp" && mv -f "$tmp" "$f"; then :
+            else failed=1; fi
+            rm -f "$tmp" "$f.lock"
+        else failed=1; fi
+    done
+    [ "$failed" = 0 ] || return 1
+    mkdir -p "$ZAPRET_BASE/state" && : > "$marker"
+}
+
+# Retire the broad UDP pool before any snapshot can be imported. Recheck even
+# with .done: reinstall/rollback may restore an old primary or .pre-* snapshot.
+_z2k_migrate_broad_udp_removal_v1()
+{
+    local base="${EXTRA_STRATS_DIR:-$ZAPRET_BASE/extra_strats}/cache/autocircular"
+    local fallback="${Z2K_STATE_FALLBACK:-${Z2K_AUTOCIRCULAR_FALLBACK_OVERRIDE:-/tmp}/z2k-autocircular-state.tsv}"
+    local marker="$ZAPRET_BASE/state/broad-udp-removal-v1.done"
+    local f tmp failed=0 locked="" source stamp now
+    rm -f "$marker" || return 1
+    # Direct/manual profiles may bypass Strategy.txt entirely. Never infer that
+    # their positional keys belong to the retired built-in pool.
+    if printf '%s\n' "${NFQWS2_OPT:-}" | awk '
+        {for(i=1;i<=NF;i++) {
+            token=<REDACTED>
+            if(token=="--lua-desync") token="--lua-desync=" $(++i)
+            if(token ~ /^--lua-desync=circular(:|$)/ && token !~ /:key=/) found=1
+        }} END {exit !found}
+    '; then
+        echo 'ERROR: unnamed manual circular pool: cannot safely retire positional state' >&2
+        return 1
+    fi
+    # Every built-in pool has an explicit key (generator matrix regression).
+    # User strategies can introduce unrelated positional keys. Refuse ambiguous
+    # deletion rather than erase their saved selections or claim completion.
+    for source in "$ZAPRET_BASE"/lists/custom-strategies/*.txt \
+        "${EXTRA_STRATS_DIR:-$ZAPRET_BASE/extra_strats}"/TCP/*/Strategy.txt \
+        "${EXTRA_STRATS_DIR:-$ZAPRET_BASE/extra_strats}"/UDP/*/Strategy.txt; do
+        [ -f "$source" ] || continue
+        if awk '{for(i=1;i<=NF;i++) {
+            token=<REDACTED>
+            if(token=="--lua-desync") token="--lua-desync=" $(++i)
+            if(token ~ /^--lua-desync=circular(:|$)/ && token !~ /:key=/) found=1
+        }} END {exit !found}' "$source"; then
+            echo "ERROR: unnamed custom circular pool: cannot safely retire positional state ($source)" >&2
+            return 1
+        fi
+    done
+    # Take active-file locks before touching either active file or its snapshots.
+    for f in "$base/state.tsv" "$fallback"; do
+        case " $locked " in *" $f "*) continue ;; esac
+        mkdir -p "$(dirname "$f")" || { failed=1; break; }
+        # Persistence leases expire after ten seconds, including interrupted
+        # timestamp writes. Keep live writers; reclaim only expired leases.
+        now=$(date +%s)
+        if [ -f "$f.lock" ]; then
+            stamp=$(cat "$f.lock" 2>/dev/null)
+            case "$stamp" in
+                ''|*[!0-9]*) stamp=$(date -r "$f.lock" +%s 2>/dev/null || stat -c %Y "$f.lock" 2>/dev/null || stat -f %m "$f.lock" 2>/dev/null) ;;
+            esac
+            case "$stamp" in
+                ''|*[!0-9]*) ;;
+                *) if [ "$stamp" -gt "$((now + 10))" ] || [ "$((now - stamp))" -gt 10 ]; then
+                       rm -f "$f.lock" || { failed=1; break; }
+                   fi ;;
+            esac
+        fi
+        if (set -C; printf '%s' "$(date +%s)" > "$f.lock") 2>/dev/null; then
+            locked="$locked $f"
+        else failed=1; break; fi
+    done
+    if [ "$failed" = 0 ]; then
+        for f in "$base/state.tsv" "$fallback" "$base/state.tsv".pre-* "$fallback".pre-*; do
+            [ -f "$f" ] || continue
+            tmp="$f.retire-udp.$$"
+            if cp -p "$f" "$tmp" && awk -F '\t' '
+                $1=="udp_misc" || $1 ~ /^circular_[0-9]+_[0-9]+$/ {next}
+                {print}
+            ' "$f" > "$tmp" && mv -f "$tmp" "$f"; then :
+            else failed=1; fi
+            rm -f "$tmp"
+        done
+    fi
+    for f in $locked; do rm -f "$f.lock" || failed=1; done
+    [ "$failed" = 0 ] || return 1
+    mkdir -p "$ZAPRET_BASE/state" && : > "$marker"
+}
+
+# Remove artifacts from intermediate builds; published p-87.37 had no guard.
+# Do not import, filter or rewrite state. Old configs remain startable until regen.
+_z2k_cleanup_retired_role()
+{
+    local f base="${EXTRA_STRATS_DIR:-$ZAPRET_BASE/extra_strats}/cache/autocircular"
+    local fallback="${Z2K_STATE_FALLBACK:-${Z2K_AUTOCIRCULAR_FALLBACK_OVERRIDE:-/tmp}/z2k-autocircular-state.tsv}"
+    for f in "$ZAPRET_BASE/state/"client-role*.tsv \
+             "$ZAPRET_BASE/state/"client-role-*.txt \
+             "$ZAPRET_BASE/state/"client-role-*.done \
+             "$base/"*.pre-client-role-v1 "$base/"*.client-role-quarantine.tsv \
+             "${fallback%/*}/"*.pre-client-role-v1 "${fallback%/*}/"*.client-role-quarantine.tsv \
+             "$base/config.pre-client-role" "${fallback%/*}/config.pre-client-role" \
+             "$ZAPRET_BASE/config.pre-client-role"; do
+        [ ! -f "$f" ] || rm -f "$f" 2>/dev/null || :
+    done
+    NFQWS2_OPT=$(printf '%s\n' "${NFQWS2_OPT:-}" | tr '\n' ' ' |
+        sed -E 's/--lua-d[^=[:space:]]*[=[:space:]]+z2k_client_guard[^[:space:]]*//g')
+    NFQWS2_OPT_BASE=$(printf '%s\n' "${NFQWS2_OPT_BASE:-}" |
+        awk '{for(i=1;i<=NF;i++) if($i !~ /^--lua-init=@.*\/z2k-client-role\.lua$/) {printf "%s%s",sep,$i;sep=" "}}')
+}
+
+start_daemons()
+{
+    echo "Starting zapret2 daemons"
+
+    z2k_daemon_fail_reset
+    # Direct start_daemons must stop orphan writers as well as normal restart.
+    stop_all_nfqws
+    ensure_autocircular_files
+    _z2k_migrate_broad_udp_removal_v1 || return 1
+    _z2k_cleanup_retired_role
+    _z2k_migrate_rotator_sld || {
+        echo "ERROR: не удалось перенести state на домены второго уровня; запуск остановлен. Повторите перезапуск сервиса."
+        return 1
+    }
+    _z2k_migrate_gv_named_state_v1 || {
+        echo "ERROR: не удалось очистить gv_tcp state; запуск остановлен. Повторите перезапуск сервиса."
+        return 1
+    }
+    _z2k_retire_cf_extra_state || echo "WARNING: cf_extra state cleanup failed; will retry on next start"
+    # Автолист объявлен в аргументах демона обычным хостлистом, а путь движок
+    # резолвит при разборе аргументов: нет файла — демон не стартует вовсе.
+    # start() создаёт его выше, но `start_daemons` вызывают и отдельной
+    # командой (см. разбор аргументов внизу), поэтому страхуемся здесь — как
+    # это уже сделано для autocircular строкой выше. No-op вне режима.
+    ensure_autohostlist_files
+
+    # Clean old/learned Google entries even when geosite cannot refresh offline.
+    if [ -f "$ZAPRET_BASE/z2k-geosite.sh" ]; then
+        ZAPRET2_DIR="$ZAPRET_BASE" sh "$ZAPRET_BASE/z2k-geosite.sh" clean-google || {
+            echo "ERROR: failed to clean Google bypass hostlists"
+            return 1
+        }
+    fi
+
+    z2k_preflight_v6_gate
+    # До любого запуска движка: RegisterIpset требует существующий файл.
+    z2k_gvsub_ensure_ipfile
+
+    # Использовать функции из common/linux_daemons.sh
+    # standard_mode_daemons вызывает do_nfqws
+    standard_mode_daemons 1
+
+    # ��������� custom scripts ���� ����
+    custom_runner zapret_custom_daemons 1
+
+    repair_autocircular_files_after_daemon_start
+
+    # Отдать НАСТОЯЩИЙ результат, а не безусловный 0: иначе провал старта
+    # демона не виден никому выше по стеку (см. коммент у z2k_daemon_fail_*).
+    _sd_failed=$(z2k_daemon_fail_count)
+    case "${_sd_failed:-0}" in
+        ''|0) return 0 ;;
+    esac
+    echo "ERROR: $_sd_failed daemon(s) failed to start"
+    return 1
+}
+
+stop_daemons()
+{
+    echo "Stopping zapret2 daemons"
+
+    # Остановить все nfqws процессы
+    stop_all_nfqws
+
+    # ��������� custom scripts ��� ���������
+    custom_runner zapret_custom_daemons 0
+
+    return 0
+}
+
+restart_daemons()
+{
+    stop_daemons
+    sleep 2
+    start_daemons
+}
+
+# ==============================================================================
+# ФУНКЦИИ START/STOP FIREWALL
+# ==============================================================================
+
+# Where the FIRMWARE keeps its modules.
+#
+# `modprobe` here is Entware's (/opt/sbin/modprobe) and it searches
+# /opt/lib/modules/<kver> — a directory Keenetic does not have at all. Verified on
+# a live 4.9-ndm-5 box:
+#     modprobe: FATAL: Module xt_multiport not found in directory /opt/lib/modules/4.9-ndm-5
+# so this step never actually loaded anything on any router. It only LOOKED fine
+# where NDM had already loaded the module for its own rules.
+#
+# The kernel cannot cover for us either: /proc/sys/kernel/modprobe is EMPTY and
+# /sbin/modprobe does not exist, so there is no on-demand autoload. Verified live:
+# inserting a rule whose match is not loaded fails with "No chain/target/match by
+# that name" and the module does NOT appear. A missing module therefore means the
+# RULE IS NEVER INSTALLED — for connbytes that is the packet-direction filter on
+# the NFQUEUE rules, for multiport the PPE de-offload — so the bypass degrades in
+# silence while the log says only "may be built-in".
+#
+# Two layouts are in the field: /lib/modules/<kver> (4.9-ndm-5) and
+# /lib/system-modules/<kver> (NDMS 5.1.2, reported on an NC1812). Check both, then
+# fall back to a search bounded to /lib — never /opt, where a stale copy from a
+# different kernel would be the wrong ABI.
+Z2K_MODDIRS=
+z2k_module_dirs()
+{
+    local kv d
+    if [ -z "$Z2K_MODDIRS" ]; then
+        kv=$(uname -r 2>/dev/null)
+        for d in "/lib/modules/$kv" "/lib/system-modules/$kv" /lib/modules /lib/system-modules; do
+            [ -d "$d" ] && Z2K_MODDIRS="$Z2K_MODDIRS $d"
+        done
+    fi
+    echo "$Z2K_MODDIRS"
+}
+
+# insmod $1 from the firmware tree. 0 only if a .ko was found AND accepted.
+z2k_insmod_fw()
+{
+    local m="$1" d f
+    for d in $(z2k_module_dirs); do
+        f="$d/$m.ko"
+        [ -f "$f" ] && insmod "$f" 2>/dev/null && return 0
+    done
+    f=$(find /lib -name "$m.ko" -type f 2>/dev/null | head -1)
+    [ -n "$f" ] && insmod "$f" 2>/dev/null && return 0
+    return 1
+}
+
+# Does the capability this module provides actually exist? Asked of the kernel's
+# own registry, NOT of lsmod: on stock firmware most of these are built in, where
+# lsmod never lists them and "failed to load" is pure noise — which is exactly the
+# wall of warnings that buried the one real failure in a field report.
+z2k_module_present()
+{
+    case "$1" in
+        xt_multiport)    grep -qw multiport /proc/net/ip_tables_matches 2>/dev/null ;;
+        xt_connbytes)    grep -qw connbytes /proc/net/ip_tables_matches 2>/dev/null ;;
+        xt_connmark)     grep -qw connmark  /proc/net/ip_tables_matches 2>/dev/null ;;
+        xt_CONNMARK)     grep -qw CONNMARK  /proc/net/ip_tables_targets 2>/dev/null ;;
+        xt_NFQUEUE)      grep -qw NFQUEUE   /proc/net/ip_tables_targets 2>/dev/null ;;
+        nfnetlink_queue) [ -e /proc/net/netfilter/nfnetlink_queue ] ;;
+        *)               lsmod 2>/dev/null | grep -q "^$1 " ;;
+    esac
+}
+
+load_modules()
+{
+    echo "Loading required kernel modules"
+
+    # Список необходимых модулей для работы zapret2
+    #
+    # xt_CONNMARK/xt_connmark serve one feature — Keenetic policy exclusion — and it
+    # is safe to enable only because z2k_policy_connmark_start now refuses to install
+    # its rule for a policy with no member hosts. Without that guard, making these
+    # modules loadable would resurrect the rule on firmware where the .ko exists but
+    # was not loaded, and in the default "only policy traffic" mode a memberless
+    # policy puts the exclude bit on EVERY connection — bypass gone. That is the p-59
+    # accident, and it is what the member guard exists to prevent. Do not load these
+    # without it.
+    local modules="xt_multiport xt_connbytes xt_NFQUEUE nfnetlink_queue xt_CONNMARK xt_connmark"
+
+    for module in $modules; do
+        # Built in, or already loaded: nothing to do and nothing to say.
+        if z2k_module_present "$module"; then
+            [ -n "$Z2K_DEBUG" ] && echo "DEBUG: Module already available: $module"
+            continue
+        fi
+        [ -n "$Z2K_DEBUG" ] && echo "DEBUG: Loading module: $module"
+        modprobe "$module" 2>/dev/null
+        z2k_module_present "$module" && continue
+        z2k_insmod_fw "$module"
+        # Warn ONLY when the capability is still missing after both attempts —
+        # then it is a real absence, not a modprobe that looked in the wrong place.
+        z2k_module_present "$module" || \
+            echo "Warning: $module is not available in this firmware — rules that need it will not be installed"
+    done
+
+    # Same treatment for the ipset bitmap:port module. This used to be the only
+    # place that knew Entware's modprobe cannot find firmware modules, and it
+    # hardcoded /lib/modules/<kver> — which is the path that does NOT exist on the
+    # firmware where this problem was actually reported.
+    #
+    # Then ask whether the TYPE actually works, which is not the same question as
+    # whether the module loaded: bitmap:port can be built into the kernel with no
+    # .ko to find, and it can equally be absent from the firmware altogether. Only
+    # creating a set tells them apart. Worth the two ipset calls once per start,
+    # because zport_tcp/zport_udp gate EVERY nfqws rule and the engine has no
+    # --dport fallback — an unavailable type means no bypass at all, and it used to
+    # surface only as a wall of raw "Set zport_tcp doesn't exist" from iptables
+    # with nothing pointing at the cause (issue #27, NDMS 5.1.2).
+    if ! lsmod 2>/dev/null | grep -q "^ip_set_bitmap_port "; then
+        z2k_insmod_fw ip_set_bitmap_port || true
+    fi
+    if command -v ipset >/dev/null 2>&1; then
+        ipset destroy z2k_probe_bitmap 2>/dev/null
+        if ipset create z2k_probe_bitmap bitmap:port range 0-65535 2>/dev/null; then
+            ipset destroy z2k_probe_bitmap 2>/dev/null
+        else
+            echo "WARNING: ipset type bitmap:port is not available in this firmware"
+            echo "zport_tcp/zport_udp cannot be created, so NO nfqws rules will be installed and the packet-level bypass will not work"
+        fi
+    fi
+
+    # nfnetlink_queue is the one that must genuinely be there — without it nfqws2
+    # cannot bind a queue at all. Ask the kernel, not `modinfo`: modinfo is the same
+    # Entware tool as modprobe and searches the same nonexistent /opt/lib/modules,
+    # so on a firmware where this module is BUILT IN it answers "no" and this gate
+    # would abort a perfectly working router.
+    if ! z2k_module_present nfnetlink_queue; then
+        echo "WARNING: nfnetlink_queue module not available!"
+        echo "nfqws2 may fail with 'Operation not permitted'"
+        return 1
+    fi
+
+    echo "Kernel modules loaded"
+    return 0
+}
+
+
+# Keenetic fix (as other Keenetic builds do): ensure UDP packets processed by nfqws2
+# (marked with DESYNC_MARK) still get source NAT on WAN via a dedicated nat chain.
+Z2K_IPT_NAT_CHAIN="zapret2_nat"
+
+# Connmark-based exclusion (common Keenetic-build approach):
+# - Mark connections outside selected Keenetic policy (POLICY_NAME/POLICY_EXCLUDE) with CONNMARK exclude bit.
+# - NFQUEUE rules include "-m connmark ! --mark $Z2K_CONNMARK_EXCLUDE" so excluded flows never enter NFQUEUE.
+Z2K_CONNMARK_EXCLUDE="0x20000000/0x20000000"
+Z2K_CONNMARK_OK4=0
+Z2K_CONNMARK_OK6=0
+Z2K_POLICY_MARK=""
+
+iptablesw()
+{
+    # Prefer -w (xtables lock wait). Fallback without -w for older iptables.
+    iptables -w "$@" 2>/dev/null || iptables "$@" 2>/dev/null
+}
+
+ip6tablesw()
+{
+    ip6tables -w "$@" 2>/dev/null || ip6tables "$@" 2>/dev/null
+}
+
+z2k_connmark_check_avail4()
+{
+    grep -qw connmark /proc/net/ip_tables_matches 2>/dev/null || return 1
+    grep -qw CONNMARK /proc/net/ip_tables_targets 2>/dev/null || return 1
+    return 0
+}
+
+z2k_connmark_check_avail6()
+{
+    grep -qw connmark /proc/net/ip6_tables_matches 2>/dev/null || return 1
+    grep -qw CONNMARK /proc/net/ip6_tables_targets 2>/dev/null || return 1
+    return 0
+}
+
+# Все собственные слои z2k построены на iptables: правила NFQUEUE, исключения
+# по connmark, снятие аппаратного ускорения, redirect Telegram, фильтр RST,
+# лечение udp-masquerade. На nftables ни один из них не ставится.
+#
+# Раньше каждый слой просто делал `return 0` — то есть при FWTYPE=nftables
+# сервис поднимался как ни в чём не бывало, а обхода не было вообще, и узнать
+# об этом человеку было неоткуда. Молчать здесь нельзя: это не «фича
+# недоступна», это «продукт не работает».
+#
+# Сам выбор прибит к iptables в установщике (lib/install.sh) по правилу автора
+# движка: nftables он рекомендует только с ядром от 5.15, а у Keenetic 4.9, и
+# nft-сеты требуют сотни мегабайт там, где у роутера их всего 64-256.
+z2k_fw_is_iptables()
+{
+    [ "$FWTYPE" = "iptables" ] && return 0
+    if [ -z "$Z2K_FWTYPE_COMPLAINED" ]; then
+        Z2K_FWTYPE_COMPLAINED=1
+        echo "ОШИБКА: FWTYPE='$FWTYPE', а все правила обхода z2k построены на iptables."
+        echo "        Ни одно правило не будет поставлено — обход работать НЕ БУДЕТ."
+        echo "        Поправьте FWTYPE=iptables в /opt/zapret2/config и перезапустите."
+    fi
+    return 1
+}
+
+z2k_connmark_init()
+{
+    Z2K_CONNMARK_OK4=0
+    Z2K_CONNMARK_OK6=0
+
+    z2k_fw_is_iptables || return 0
+
+    # Try to load connmark modules (may be built-in).
+    modprobe xt_CONNMARK 2>/dev/null || true
+    modprobe xt_connmark 2>/dev/null || true
+
+    exists iptables && z2k_connmark_check_avail4 && Z2K_CONNMARK_OK4=1
+    [ "$DISABLE_IPV6" = "1" ] && return 0
+    exists ip6tables && z2k_connmark_check_avail6 && Z2K_CONNMARK_OK6=1
+}
+
+z2k_detect_policy_mark()
+{
+    Z2K_POLICY_MARK=""
+
+    # Default to the usual Keenetic policy name. If policy doesn't exist, we process all traffic.
+    POLICY_NAME="${POLICY_NAME:-nfqws}"
+    POLICY_EXCLUDE="${POLICY_EXCLUDE:-0}"
+
+    # ndmc exists on Keenetic firmware (outside Entware). Use /bin/ndmc when present.
+    local ndmc_bin="ndmc"
+    [ -x /bin/ndmc ] && ndmc_bin="/bin/ndmc"
+    command -v "$ndmc_bin" >/dev/null 2>&1 || return 1
+
+    # Extract policy mark by description (handle quotes and "mark:" vs "mark =").
+    local mark
+    # LD_LIBRARY_PATH= обязателен: на KeenOS 4.3+/5.x в окружении сервиса
+    # LD_LIBRARY_PATH содержит Entware /opt/lib, ndmc грузит чужой OpenSSL и
+    # падает 0xcffd0060 -> пустой вывод -> mark пустой -> return 1 -> правило
+    # исключения не ставится МОЛЧА (webpanel actions.sh при этом показывает
+    # «политика найдена», т.к. ТАМ сброс есть). См. install.sh:241.
+    mark="$(LD_LIBRARY_PATH= "$ndmc_bin" -c "show ip policy" 2>/dev/null | awk -v name="$POLICY_NAME" '
+        function trim(s) { sub(/^[ \t\r\n]+/, "", s); sub(/[ \t\r\n]+$/, "", s); return s }
+        function unquote(s) {
+            s=trim(s)
+            if (s ~ /^\".*\"$/) { sub(/^\"/, "", s); sub(/\"$/, "", s) }
+            return s
+        }
+        function rm_trailing_colon(s) { sub(/:+$/, "", s); return s }
+        BEGIN { found=0; want=rm_trailing_colon(tolower(name)) }
+        {
+            line=tolower($0)
+            if (line ~ /description[ \t]*=/) {
+                desc=$0
+                sub(/.*description[ \t]*=[ \t]*/, "", desc)
+                # Same ordering trap as z2k_policy_id: strip the trailing colon FIRST,
+                # or a QUOTED description never matches and the policy is not found at all.
+                # trim FIRST: the line ends "X: " with a trailing space, so stripping
+                # the colon before trimming does nothing. See z2k_policy_id.
+                desc=tolower(unquote(rm_trailing_colon(trim(desc))))
+                found = (desc == want) ? 1 : 0
+                next
+            }
+            if (found && line ~ /mark[ \t]*[:=]/) {
+                m=$0
+                sub(/.*mark[ \t]*[:=][ \t]*/, "", m)
+                m=unquote(m)
+                split(m, a, /[ \t\r\n]+/)
+                print a[1]
+                exit
+            }
+        }
+    ')"
+
+    mark="${mark%%/*}"
+    mark="${mark%%;*}"
+    mark="${mark#0x}"
+    mark="${mark#0X}"
+    case "$mark" in
+        ""|*[!0-9a-fA-F]*)
+            return 1
+            ;;
+    esac
+
+    Z2K_POLICY_MARK="0x${mark}/0x0fffffff"
+    return 0
+}
+
+# Which ndmc to run. Firmware ndmc lives outside Entware; LD_LIBRARY_PATH= is
+# mandatory at every call site (Entware's OpenSSL makes it die 0xcffd0060).
+z2k_ndmc_bin()
+{
+    # Z2K_NDMC_BIN — переопределение для тестов. Абсолютный /bin/ndmc стоит
+    # первым намеренно (в PATH у Entware его может не быть), но именно поэтому
+    # подменить его в PATH нельзя: на роутере /bin/ndmc существует, и набор,
+    # подставивший свой ndmc, разговаривал с НАСТОЯЩИМ NDM. На маке файла нет,
+    # стаб выигрывал, и дыры не было видно (поймано прогоном на роутере
+    # 2026-08-27).
+    if [ -n "${Z2K_NDMC_BIN:-}" ]; then echo "$Z2K_NDMC_BIN"
+    elif [ -x /bin/ndmc ]; then echo /bin/ndmc
+    elif command -v ndmc >/dev/null 2>&1; then echo ndmc
+    else return 1; fi
+}
+
+# The NDM policy NAME (Policy0, z2ktest, ...). POLICY_NAME is matched against the
+# DESCRIPTION, but `show ip hotspot` reports membership by NAME, so both are needed:
+# the description to find the policy the user configured, the name to count who is
+# actually in it. Both live on the same line of `show ip policy`:
+#     policy, name = z2ktest, description = z2k-test-temp:
+z2k_policy_id()
+{
+    local nb="$1"
+    LD_LIBRARY_PATH= "$nb" -c "show ip policy" 2>/dev/null | awk -v want="$2" '
+        function trim(s) { sub(/^[ \t\r\n]+/, "", s); sub(/[ \t\r\n]+$/, "", s); return s }
+        function unq(s)  { s=trim(s); if (s ~ /^".*"$/) { sub(/^"/, "", s); sub(/"$/, "", s) } return s }
+        function rmc(s)  { sub(/:+$/, "", s); return s }
+        BEGIN { w = rmc(tolower(want)) }
+        /description[ \t]*=/ {
+            # rmc BEFORE unq: the box prints `description = "x":`, so the trailing
+            # colon sits OUTSIDE the closing quote and unquoting first matches nothing.
+            # trim -> rmc -> unq, in that order. The box prints `description = X: `
+            # WITH A TRAILING SPACE, so stripping the colon before trimming is a no-op
+            # and nothing ever matches; and the colon sits outside the closing quote,
+            # so unquoting before stripping it is a no-op too. Both were live bugs.
+            d=$0; sub(/.*description[ \t]*=[ \t]*/, "", d); d=tolower(unq(rmc(trim(d))))
+            if (d != w) next
+            n=$0; sub(/.*name[ \t]*=[ \t]*/, "", n); split(n, p, ","); print trim(p[1]); exit
+        }'
+}
+
+# How many hosts are bound to that policy. `show ip hotspot` prints one
+# "policy: <name>" per host, empty for hosts in no policy.
+z2k_policy_members()
+{
+    local nb="$1"
+    LD_LIBRARY_PATH= "$nb" -c "show ip hotspot" 2>/dev/null | awk -v id="$2" '
+        /^[ \t]*policy[ \t]*:/ {
+            v=$0; sub(/.*policy[ \t]*:[ \t]*/, "", v); gsub(/[ \t\r]/, "", v)
+            if (v != "" && v == id) c++
+        }
+        END { print c+0 }'
+}
+
+z2k_policy_connmark_start()
+{
+    z2k_fw_is_iptables || return 0
+    [ "$Z2K_CONNMARK_OK4" = "1" ] || return 0
+
+    z2k_detect_policy_mark || return 0
+
+    # THE MEMBER GUARD, and the reason this feature killed bypasses in the field.
+    #
+    # Measured on a live router (2026-07-26, policy z2ktest, one member): traffic
+    # from a policy member carries the policy mark at mangle POSTROUTING on EVERY
+    # packet (1013/1013 matched mark ffffaab/0x0fffffff), while traffic outside any
+    # policy carries mark 0. So the mechanism and the hook are right — the earlier
+    # conclusion that the mark "does not survive to POSTROUTING" was measured
+    # without a member in the policy and was wrong.
+    #
+    # What is NOT right is the default. POLICY_NAME defaults to "nfqws" and
+    # POLICY_EXCLUDE defaults to 0, i.e. "process ONLY policy traffic", which is
+    # implemented as "put the exclude bit on everything that is NOT in the policy".
+    # If such a policy exists but has NO member hosts, that is every connection on
+    # the router: NFQUEUE then processes nobody and the bypass dies completely,
+    # silently. That is the reported failure — the user's bypass came back the
+    # moment they deleted the policy.
+    #
+    # A policy with no members cannot express an intent either way, so install
+    # nothing and say so.
+    local nb pid members
+    nb=$(z2k_ndmc_bin) || return 0
+    pid=$(z2k_policy_id "$nb" "$POLICY_NAME")
+    if [ -z "$pid" ]; then
+        echo "Policy '$POLICY_NAME': cannot read its NDM name — not installing the exclusion rule"
+        return 0
+    fi
+    members=$(z2k_policy_members "$nb" "$pid")
+    case "$members" in ''|*[!0-9]*) members=0 ;; esac
+    if [ "$members" -lt 1 ]; then
+        echo "Policy '$POLICY_NAME' ($pid) has no member hosts — not installing the exclusion rule."
+        echo "  Assign devices to that policy in the Keenetic web UI, or the rule would"
+        echo "  exclude ALL traffic from processing and the bypass would stop working."
+        return 0
+    fi
+    echo "Policy '$POLICY_NAME' ($pid): $members member host(s)."
+
+    local pol_rule=""
+    if [ "$POLICY_EXCLUDE" = "1" ]; then
+        echo "Found policy '$POLICY_NAME'. Traffic from it will be excluded from processing."
+        pol_rule="-m mark --mark $Z2K_POLICY_MARK -j CONNMARK --set-xmark $Z2K_CONNMARK_EXCLUDE"
+    else
+        echo "Found policy '$POLICY_NAME'. Only traffic from it will be processed."
+        pol_rule="-m mark ! --mark $Z2K_POLICY_MARK -j CONNMARK --set-xmark $Z2K_CONNMARK_EXCLUDE"
+    fi
+
+    local wan iface
+    wan="$(get_wan_ifaces4)"
+    [ -n "$wan" ] || return 0
+
+    for iface in $wan; do
+        # Exclude connections outside policy by setting CONNMARK bit before NFQUEUE rules.
+        iptablesw -t mangle -C POSTROUTING -o "$iface" $pol_rule || iptablesw -t mangle -I POSTROUTING -o "$iface" $pol_rule
+    done
+
+    [ "$Z2K_CONNMARK_OK6" = "1" ] || return 0
+
+    wan="$(get_wan_ifaces6)"
+    [ -n "$wan" ] || return 0
+
+    for iface in $wan; do
+        ip6tablesw -t mangle -C POSTROUTING -o "$iface" $pol_rule || ip6tablesw -t mangle -I POSTROUTING -o "$iface" $pol_rule
+    done
+}
+
+z2k_policy_connmark_stop()
+{
+    z2k_fw_is_iptables || return 0
+    [ "$Z2K_CONNMARK_OK4" = "1" ] || return 0
+
+    z2k_detect_policy_mark || return 0
+
+    local pol_rule=""
+    if [ "$POLICY_EXCLUDE" = "1" ]; then
+        pol_rule="-m mark --mark $Z2K_POLICY_MARK -j CONNMARK --set-xmark $Z2K_CONNMARK_EXCLUDE"
+    else
+        pol_rule="-m mark ! --mark $Z2K_POLICY_MARK -j CONNMARK --set-xmark $Z2K_CONNMARK_EXCLUDE"
+    fi
+
+    local wan iface
+    wan="$(get_wan_ifaces4)"
+    [ -n "$wan" ] || return 0
+
+    for iface in $wan; do
+        while iptablesw -t mangle -C POSTROUTING -o "$iface" $pol_rule 2>/dev/null; do
+            iptablesw -t mangle -D POSTROUTING -o "$iface" $pol_rule || break
+        done
+    done
+
+    [ "$Z2K_CONNMARK_OK6" = "1" ] || return 0
+
+    wan="$(get_wan_ifaces6)"
+    [ -n "$wan" ] || return 0
+
+    for iface in $wan; do
+        while ip6tablesw -t mangle -C POSTROUTING -o "$iface" $pol_rule 2>/dev/null; do
+            ip6tablesw -t mangle -D POSTROUTING -o "$iface" $pol_rule || break
+        done
+    done
+}
+
+# Override NFQUEUE builders to respect connmark exclusion.
+_fw_nfqws_post4()
+{
+    # $1 - 1 - add, 0 - del
+    # $2 - iptable filter for ipv4
+    # $3 - queue number
+    # $4 - wan interface names space separated
+    [ "$DISABLE_IPV4" = "1" ] || [ -z "$2" ] || {
+        local i rule connchk=""
+
+        ipt_print_op $1 "$2" "nfqws postrouting (qnum $3)"
+
+        [ "$Z2K_CONNMARK_OK4" = "1" ] && connchk="-m connmark ! --mark $Z2K_CONNMARK_EXCLUDE"
+
+        rule="$(ipt_mark_filter) $connchk -m mark ! --mark $DESYNC_MARK/$DESYNC_MARK $2 $IPSET_EXCLUDE dst -j NFQUEUE --queue-num $3 --queue-bypass"
+        if [ -n "$4" ] ; then
+            for i in $4; do
+                ipt_add_del $1 POSTROUTING -t mangle -o $i $rule
+            done
+        else
+            ipt_add_del $1 POSTROUTING -t mangle $rule
+        fi
+    }
+}
+
+_fw_nfqws_post6()
+{
+    # $1 - 1 - add, 0 - del
+    # $2 - iptable filter for ipv6
+    # $3 - queue number
+    # $4 - wan interface names space separated
+    [ "$DISABLE_IPV6" = "1" ] || [ -z "$2" ] || {
+        local i rule connchk=""
+
+        ipt_print_op $1 "$2" "nfqws postrouting (qnum $3)" 6
+
+        [ "$Z2K_CONNMARK_OK6" = "1" ] && connchk="-m connmark ! --mark $Z2K_CONNMARK_EXCLUDE"
+
+        rule="$(ipt_mark_filter) $connchk -m mark ! --mark $DESYNC_MARK/$DESYNC_MARK $2 $IPSET_EXCLUDE6 dst -j NFQUEUE --queue-num $3 --queue-bypass"
+        if [ -n "$4" ] ; then
+            for i in $4; do
+                ipt6_add_del $1 POSTROUTING -t mangle -o $i $rule
+            done
+        else
+            ipt6_add_del $1 POSTROUTING -t mangle $rule
+        fi
+    }
+}
+
+# Keep the owned clamp above every inbound TCP queue, including additive NDM
+# repairs that recreate only the queue. One existing iptables transaction lock
+# covers queue insertion and clamp repositioning; never nest ipt_add_del here.
+z2k_inbound_forward_tx()
+{
+    local fam="$1" add="$2" filter="$3" iface="$4" rc
+    shift 4
+    if [ "$add" = 1 ]; then
+        _ipt_add "$fam" -I FORWARD -t mangle "$@" || return $?
+    else
+        _ipt_del "$fam" FORWARD -t mangle "$@" || :
+    fi
+    case " $filter " in *" -p tcp "*) ;; *) return 0 ;; esac
+
+    set --
+    [ -z "$iface" ] || set -- "$@" -i "$iface"
+    set -- "$@" -p tcp --tcp-flags SYN,RST SYN
+    # Retire the previous directly tagged FORWARD rule. Never delete an
+    # untagged FORWARD TCPMSS: firmware can own exactly the same match.
+    _ipt_del "$fam" FORWARD -t mangle "$@" -m comment --comment z2k-inbound-mss \
+        -j TCPMSS --clamp-mss-to-pmtu >/dev/null 2>&1 || :
+    # Own the untagged fallback through a private chain. Reposition the jump
+    # after every queue insertion, including partial NDM repairs.
+    _ipt_del "$fam" FORWARD -t mangle "$@" -j Z2K_MSS >/dev/null 2>&1 || :
+    _ipt_del "$fam" Z2K_MSS -t mangle "$@" -m comment --comment z2k-inbound-mss \
+        -j TCPMSS --clamp-mss-to-pmtu >/dev/null 2>&1 || :
+    _ipt_del "$fam" Z2K_MSS -t mangle "$@" \
+        -j TCPMSS --clamp-mss-to-pmtu >/dev/null 2>&1 || :
+    if [ "$add" = 1 ]; then
+        _ipt_cmd "$fam" -N Z2K_MSS -t mangle >/dev/null 2>&1 || :
+        if { _ipt_add "$fam" -I Z2K_MSS -t mangle "$@" -m comment --comment z2k-inbound-mss \
+                 -j TCPMSS --clamp-mss-to-pmtu >/dev/null 2>&1 ||
+             _ipt_add "$fam" -I Z2K_MSS -t mangle "$@" \
+                 -j TCPMSS --clamp-mss-to-pmtu >/dev/null 2>&1; } &&
+           _ipt_add "$fam" -I FORWARD -t mangle "$@" -j Z2K_MSS >/dev/null 2>&1; then :; else
+            rc=$?
+            logger -t z2k "WARN: IPv$fam TCPMSS clamp unavailable on ${iface:-any} (status $rc); inbound queue retained" || :
+        fi
+    else
+        # Delete only when empty and unreferenced; other WANs may still use it.
+        _ipt_cmd "$fam" -X Z2K_MSS -t mangle >/dev/null 2>&1 || :
+    fi
+    return 0
+}
+
+z2k_inbound_forward()
+{
+    _ipt_locked z2k_inbound_forward_tx "$@"
+}
+
+_fw_nfqws_pre4()
+{
+    # $1 - 1 - add, 0 - del
+    # $2 - iptable filter for ipv4
+    # $3 - queue number
+    # $4 - wan interface names space separated
+    [ "$DISABLE_IPV4" = "1" ] || [ -z "$2" ] || {
+        local i rule connchk=""
+
+        ipt_print_op $1 "$2" "nfqws input+forward (qnum $3)"
+
+        # Do NOT connmark-exclude on the REPLY/incoming rule. Z2K_CONNMARK_EXCLUDE
+        # (0x20000000) collides with zapret2's own DESYNC_MARK_POSTNAT and the NDM
+        # mark — both set ON the bypass-target connection by reply time — so an
+        # exclude here drops the incoming DPI RST/ServerHello of the very hosts we
+        # desync, and the rotator never sees the failure (0 incoming -> never
+        # rotates). Device-policy exclusion is enforced on the OUTGOING (post)
+        # rule, which is sufficient. connchk stays "" here on purpose.
+
+        rule="$connchk $2 $IPSET_EXCLUDE src -j NFQUEUE --queue-num $3 --queue-bypass"
+        if [ -n "$4" ] ; then
+            for i in $4; do
+                # iptables PREROUTING chain is before NAT. not possible to have DNATed ip's there
+                ipt_add_del $1 INPUT -t mangle -i $i $rule
+                z2k_inbound_forward 4 "$1" "$2" "$i" -i "$i" $rule
+            done
+        else
+            ipt_add_del $1 INPUT -t mangle $rule
+            z2k_inbound_forward 4 "$1" "$2" "" $rule
+        fi
+    }
+}
+
+_fw_nfqws_pre6()
+{
+    # $1 - 1 - add, 0 - del
+    # $2 - iptable filter for ipv6
+    # $3 - queue number
+    # $4 - wan interface names space separated
+    [ "$DISABLE_IPV6" = "1" ] || [ -z "$2" ] || {
+        local i rule connchk=""
+
+        ipt_print_op $1 "$2" "nfqws input+forward (qnum $3)" 6
+
+        # See _fw_nfqws_pre4: no connmark-exclude on the reply rule (the exclude
+        # bit collides with DESYNC_MARK_POSTNAT/NDM and would drop the incoming
+        # RST of bypass targets). connchk stays "" here on purpose.
+
+        rule="$connchk $2 $IPSET_EXCLUDE6 src -j NFQUEUE --queue-num $3 --queue-bypass"
+        if [ -n "$4" ] ; then
+            for i in $4; do
+                # iptables PREROUTING chain is before NAT. not possible to have DNATed ip's there
+                ipt6_add_del $1 INPUT -t mangle -i $i $rule
+                z2k_inbound_forward 6 "$1" "$2" "$i" -i "$i" $rule
+            done
+        else
+            ipt6_add_del $1 INPUT -t mangle $rule
+            z2k_inbound_forward 6 "$1" "$2" "" $rule
+        fi
+    }
+}
+
+z2k_udp_masquerade_fix_start()
+{
+    z2k_fw_is_iptables || return 0
+    exists iptables || return 0
+
+    local wan iface
+    wan="$(get_wan_ifaces4)"
+    [ -n "$wan" ] || {
+        [ -n "$Z2K_DEBUG" ] && echo "DEBUG: UDP masquerade fix: WAN iface not found, skip"
+        return 0
+    }
+
+    local mark="${DESYNC_MARK:-0x40000000}"
+    local mark_processed="${mark}/${mark}"
+
+    iptablesw -t nat -N "$Z2K_IPT_NAT_CHAIN"
+    iptablesw -t nat -F "$Z2K_IPT_NAT_CHAIN"
+    iptablesw -t nat -C POSTROUTING -j "$Z2K_IPT_NAT_CHAIN" || iptablesw -t nat -A POSTROUTING -j "$Z2K_IPT_NAT_CHAIN"
+
+    for iface in $wan; do
+        iptablesw -t nat -A "$Z2K_IPT_NAT_CHAIN" -o "$iface" -m mark --mark "$mark_processed" -p udp -j MASQUERADE
+    done
+
+    # TCP :443 в той же цепочке — для пробного соединения (lua/z2k-preflight.lua).
+    # После пробы движок сам отправляет исходный SYN клиента. Conntrack считает его
+    # новым соединением, и без MASQUERADE он ушёл бы с адресом из локальной сети.
+    # Таблица nat видит только новые соединения, поэтому фейки плеч в рамках уже
+    # установленных соединений правило не затрагивает.
+    #
+    # Условие — шаг в СОБРАННОМ конфиге, а не значение Z2K_GV_SERVER_REPLY2: флаг,
+    # изменённый без пересборки, снял бы правило при живом шаге.
+    case "$NFQWS2_OPT" in
+        *--lua-desync=z2k_preflight*)
+            for iface in $wan; do
+                iptablesw -t nat -A "$Z2K_IPT_NAT_CHAIN" -o "$iface" -m mark --mark "$mark_processed" -p tcp --dport 443 -j MASQUERADE
+            done
+            ;;
+    esac
+}
+
+z2k_udp_masquerade_fix_stop()
+{
+    z2k_fw_is_iptables || return 0
+    exists iptables || return 0
+
+    while iptablesw -t nat -C POSTROUTING -j "$Z2K_IPT_NAT_CHAIN" 2>/dev/null; do
+        iptablesw -t nat -D POSTROUTING -j "$Z2K_IPT_NAT_CHAIN" || break
+    done
+
+    iptablesw -t nat -F "$Z2K_IPT_NAT_CHAIN"
+    iptablesw -t nat -X "$Z2K_IPT_NAT_CHAIN"
+}
+
+# ==============================================================================
+# DNS YOUTUBE И GOOGLE PLAY (z2k-detect gvsub)
+# ==============================================================================
+# Ответы DNS googlevideo, gvt1 и c.youtube.com публикуются для preflight.
+# Узлы вне сетей Google исключаются из preflight.
+# --queue-bypass сохраняет DNS при остановленной службе.
+Z2K_GVSUB_BIN="${Z2K_GVSUB_BIN:-/opt/sbin/z2k-detect}"
+Z2K_GVSUB_QUEUE=210
+Z2K_GVSUB_CHAIN=Z2K_GVSUB
+Z2K_GVSUB_PID=/var/run/z2k-gvsub.pid
+Z2K_GVSUB_LOG=/tmp/z2k-log/gvsub.log
+Z2K_GVSUB_STATUS=/tmp/z2k-gvsub.json
+# Адреса googlevideo из ответов DNS для профиля движка (--ipset в профиле
+# googlevideo, lib/config_official.sh). Путь тот же, что в генераторе.
+Z2K_GVSUB_IPS=${Z2K_GVSUB_IPS:-/tmp/z2k-gv-ips.txt}
+
+# Пустой include-ipset движок считает совпадением со всеми адресами.
+# Неопределённые адреса /32 и /128 не бывают реальными назначениями HTTPS.
+z2k_gvsub_ip_sentinels()
+{
+    printf '%s\n' '0.0.0.0/32' '::/128'
+}
+
+z2k_gvsub_ensure_ipfile()
+{
+    [ -n "$Z2K_GVSUB_IPS" ] || return 0
+    # Ошибка записи не должна завершать sh (гарантия 815603e9).
+    (
+        local tmp sentinel complete=1
+        while IFS= read -r sentinel; do
+            grep -qxF "$sentinel" "$Z2K_GVSUB_IPS" 2>/dev/null || complete=0
+        done <<EOF_SENTINELS
+$(z2k_gvsub_ip_sentinels)
+EOF_SENTINELS
+        [ "$complete" = 1 ] && exit 0
+        tmp=$(mktemp "${Z2K_GVSUB_IPS}.XXXXXX") || exit 1
+        # Старые адреса сохраняем; движок видит только целый снимок.
+        if { z2k_gvsub_ip_sentinels &&
+             { [ ! -f "$Z2K_GVSUB_IPS" ] || cat "$Z2K_GVSUB_IPS"; }
+           } > "$tmp" && chmod 644 "$tmp" && mv -f "$tmp" "$Z2K_GVSUB_IPS"; then
+            exit 0
+        fi
+        rm -f "$tmp"
+        exit 1
+    ) 2>/dev/null || :
+}
+
+# DNS-наблюдение нужно для обхода по ответу сервера.
+# (у старого z2k-detect её нет — тогда тихо ничего не делаем).
+z2k_gvsub_enabled()
+{
+    [ "${Z2K_GV_SERVER_REPLY2:-1}" = "1" ] || return 1
+    [ "$FWTYPE" = "iptables" ] || return 1
+    [ -x "$Z2K_GVSUB_BIN" ] || return 1
+    "$Z2K_GVSUB_BIN" 2>&1 | grep -q "gvsub" || return 1
+    return 0
+}
+
+z2k_gvsub_dns_rule()
+{
+    # $1 — iptablesw|ip6tablesw, $2 — -C|-I|-D
+    # ! -o lo: ответы на собственные запросы службы (имена машин кластера
+    # googlevideo) идут через lo и придерживаться не должны.
+    local match=--string value=googlevideo icase=--icase
+    [ "${4:-}" != legacy ] || icase=""
+    if [ "${3:-}" = cache ]; then
+        match=--hex-string
+        value='|016307796f757475626503636f6d00|'
+    elif [ "${3:-}" = gvt1 ]; then
+        match=--hex-string
+        value='|046776743103636f6d00|'
+    fi
+    # shellcheck disable=SC2086 # optional --icase, empty for legacy deletion
+    if [ "$2" = "-I" ]; then
+        "$1" -t mangle -I OUTPUT 1 ! -o lo -p udp --sport 53 -m string --algo bm $icase "$match" "$value" \
+            -j NFQUEUE --queue-num "$Z2K_GVSUB_QUEUE" --queue-bypass
+    else
+        "$1" -t mangle "$2" OUTPUT ! -o lo -p udp --sport 53 -m string --algo bm $icase "$match" "$value" \
+            -j NFQUEUE --queue-num "$Z2K_GVSUB_QUEUE" --queue-bypass
+    fi
+}
+
+z2k_gvsub_fw_start()
+{
+    z2k_gvsub_legacy_purge
+    z2k_gvsub_enabled || { z2k_gvsub_fw_stop; return 0; }
+    grep -qw string /proc/net/ip_tables_matches 2>/dev/null || z2k_insmod_fw xt_string || true
+    local T
+    for T in iptablesw ip6tablesw; do
+        [ "$T" = ip6tablesw ] && [ "$DISABLE_IPV6" = "1" ] && continue
+        # Remove exact pre-123 match forms before adding the current rules.
+        local kind
+        for kind in video cache gvt1; do
+            while z2k_gvsub_dns_rule "$T" -D "$kind" legacy 2>/dev/null; do :; done
+        done
+        z2k_gvsub_dns_rule "$T" -C 2>/dev/null || z2k_gvsub_dns_rule "$T" -I
+        z2k_gvsub_dns_rule "$T" -C cache 2>/dev/null || z2k_gvsub_dns_rule "$T" -I cache
+        z2k_gvsub_dns_rule "$T" -C gvt1 2>/dev/null || z2k_gvsub_dns_rule "$T" -I gvt1
+    done
+    # Служба восстанавливает DNS-перехват после перестройки таблиц Keenetic.
+    [ -f "$Z2K_GVSUB_PID" ] && kill -HUP "$(cat "$Z2K_GVSUB_PID")" 2>/dev/null
+    return 0
+}
+
+# Upgrade cleanup only. The retired Lua refusal set no conntrack mark;
+# its raw replies used the engine's shared packet fwmark, never a CONNMARK.
+z2k_gvsub_legacy_purge()
+{
+    rm -f /tmp/z2k-provider-cache.lease /tmp/z2k-provider-cache.lease.tmp \
+        /tmp/z2k-provider-cache.lease.attempt4 /tmp/z2k-provider-cache.lease.attempt6
+    local T t
+    for T in iptablesw ip6tablesw; do
+        while "$T" -t filter -D FORWARD -j Z2K_GVSUB_Q 2>/dev/null; do :; done
+        "$T" -t filter -F Z2K_GVSUB_Q 2>/dev/null
+        "$T" -t filter -X Z2K_GVSUB_Q 2>/dev/null
+        for t in nat mangle; do
+            while "$T" -t "$t" -D PREROUTING -j "$Z2K_GVSUB_CHAIN" 2>/dev/null; do :; done
+            "$T" -t "$t" -F "$Z2K_GVSUB_CHAIN" 2>/dev/null
+            "$T" -t "$t" -X "$Z2K_GVSUB_CHAIN" 2>/dev/null
+        done
+    done
+    return 0
+}
+
+z2k_gvsub_fw_stop()
+{
+    z2k_gvsub_legacy_purge
+    local T
+    for T in iptablesw ip6tablesw; do
+        [ "$T" = ip6tablesw ] && [ "$DISABLE_IPV6" = "1" ] && continue
+        local kind shape
+        for kind in video cache gvt1; do
+            for shape in current legacy; do
+                while z2k_gvsub_dns_rule "$T" -D "$kind" "$shape" 2>/dev/null; do :; done
+            done
+        done
+    done
+    return 0
+}
+
+z2k_gvsub_start()
+{
+    z2k_gvsub_enabled || return 0
+    z2k_gvsub_stop
+    mkdir -p "${Z2K_GVSUB_LOG%/*}" 2>/dev/null
+    # Журнал в /tmp (tmpfs): при старте обрезаем, чтобы не копился.
+    : > "$Z2K_GVSUB_LOG" 2>/dev/null
+    local _no6=""
+    [ "$DISABLE_IPV6" = "1" ] && _no6="-no-ipv6"
+    # Каркас (цепочки, очередь DNS) служба держит и сама: хук NDM чинит правила
+    # z2k только по пропаже очереди в mangle, а nat Keenetic перестраивает и
+    # отдельно (ночь на 10.11.2026). Если init её больше не знает или
+    # обход выключен — уходит и снимает каркас за собой.
+    # shellcheck disable=SC2086  # пустой $_no6 — нет аргумента
+    "$Z2K_GVSUB_BIN" gvsub -queue "$Z2K_GVSUB_QUEUE" -status "$Z2K_GVSUB_STATUS" $_no6 \
+        -owner "$0" -config "${ZAPRET2_DIR:-/opt/zapret2}/config" -ipfile "$Z2K_GVSUB_IPS" \
+        -whitelist "${ZAPRET2_DIR:-/opt/zapret2}/lists/whitelist.txt" \
+        >>"$Z2K_GVSUB_LOG" 2>&1 </dev/null &
+    echo $! > "$Z2K_GVSUB_PID"
+    echo "gvsub: наблюдение DNS YouTube и Google Play запущено (PID $!)"
+}
+
+z2k_gvsub_stop()
+{
+    local pid i=0
+    [ -f "$Z2K_GVSUB_PID" ] || return 0
+    pid=$(cat "$Z2K_GVSUB_PID" 2>/dev/null)
+    rm -f "$Z2K_GVSUB_PID"
+    [ -n "$pid" ] || return 0
+    kill "$pid" 2>/dev/null || return 0
+    # Служба завершает обработку DNS и снимает временное состояние;
+    # выходит за ~1 с (таймаут чтения очереди).
+    while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 5 ]; do sleep 1; i=$((i+1)); done
+    kill -9 "$pid" 2>/dev/null
+    # Файл состояния не удаляем: из него служба при следующем запуске берёт
+    # адреса, которые устройства держат в своём кэше DNS (10.11.2026).
+    return 0
+}
+# ==============================================================================
+# СНЯТИЕ СТАРОГО RST-ФИЛЬТРА (DROP_DPI_RST) — только уборка, ставить нечего.
+#
+# Правило дропало входящий TCP RST с IP ID 0x0000-0x000F, паттерн взят из
+# GoodbyeDPI. На сегодняшнем интернете он несостоятелен: Linux шлёт атомарные
+# DF-датаграммы с id 0, и легитимный RST от сервера попадает в тот же диапазон
+# (снято с нашего VPS: `id 0, flags [DF] ... Flags [R.]`). Вместо мгновенного
+# отказа соединения клиент висел до таймаута.
+#
+# У тех, кто успел включить флаг, цепочка осталась в raw PREROUTING и без этой
+# уборки продолжала бы резать ресеты после обновления. Поэтому purge зовётся
+# безусловно и на старте, и на стопе.
+# ==============================================================================
+
+Z2K_RST_CHAIN="z2k_dpi_rst"
+
+z2k_rst_filter_purge()
+{
+    z2k_fw_is_iptables || return 0
+    exists iptables || return 0
+
+    while iptablesw -t raw -C PREROUTING -j "$Z2K_RST_CHAIN" 2>/dev/null; do
+        iptablesw -t raw -D PREROUTING -j "$Z2K_RST_CHAIN" || break
+    done
+    iptablesw -t raw -F "$Z2K_RST_CHAIN" 2>/dev/null
+    iptablesw -t raw -X "$Z2K_RST_CHAIN" 2>/dev/null
+}
+
+# Conntrack tuning so nfqws SEES incoming DPI RSTs (the rotator needs them to
+# rotate off a blocked strategy). bol-van auto-sets be_liberal only in
+# autohostlist mode (common/linux_fw.sh); we run hostlist, so set it ourselves.
+#  - tcp_be_liberal=1: RU DPI sends RST,ACK with a wrong ACK; strict conntrack
+#    marks it INVALID and the connbytes rule never passes it to nfqws.
+#  - checksum=0: with HW offload the NIC computes the L4 checksum, so the kernel
+#    sees a "bad" checksum -> conntrack marks INVALID (other Keenetic builds ship an S00 fix).
+#  - fastnat=0: the NDM software fastpath (RTCACHE) routes flows PAST conntrack,
+#    so on an offloaded flow nfqws gets "ctrack disabled" and SKIPS every desync
+#    ("out pos ... beyond range a0-sN") -> YouTube/RKN silently NOT bypassed on
+#    the affected device even though nfqws sees its ClientHello. fastnat=0 forces
+#    full conntrack so the range/rotator/desync work. This is the layer that
+#    `no ppe` (hardware PPE) does NOT clear (proven 2026-06-08).
+# Каталог сисктлов netfilter и каталог драйвера аппаратного NAT — переопределяемы
+# для тестов.
+Z2K_NF_SYSCTL="${Z2K_NF_SYSCTL:-/proc/sys/net/netfilter}"
+Z2K_HWNAT_DIR="${Z2K_HWNAT_DIR:-/proc/driver/hw_nat}"
+
+# МАРШРУТНЫЙ КЭШ (nf_conntrack_fastroute). С 18.09 по 07.11.2026 мы гасили его на
+# старте там, где нет драйвера аппаратного NAT (портированная KeeneticOS на Cudy),
+# считая, что он прячет от обхода повторы и сбросы. Это было заблуждение:
+# причина жалоб была в другом. Теперь кэш не трогаем, а заводскую единицу,
+# снятую прежними версиями, возвращаем один раз — по маркеру, чтобы не
+# перетирать то, что человек выставит руками потом.
+z2k_fastroute_retire_once()
+{
+    local d="$Z2K_NF_SYSCTL" mark="${ZAPRET2_DIR:-/opt/zapret2}/state/fastroute-retired.done"
+    [ -f "$mark" ] && return 0
+    if [ ! -d "$Z2K_HWNAT_DIR" ] && [ -w "$d/nf_conntrack_fastroute" ] \
+       && [ "$(cat "$d/nf_conntrack_fastroute" 2>/dev/null)" = "0" ]; then
+        echo 1 > "$d/nf_conntrack_fastroute" 2>/dev/null \
+            && echo "fastroute=1: маршрутный кэш возвращён в заводское состояние"
+    fi
+    mkdir -p "${mark%/*}" 2>/dev/null
+    touch "$mark" 2>/dev/null
+    return 0
+}
+
+z2k_conntrack_tune_start()
+{
+    local d="$Z2K_NF_SYSCTL"
+    [ -w "$d/nf_conntrack_tcp_be_liberal" ] && echo 1 > "$d/nf_conntrack_tcp_be_liberal" 2>/dev/null
+    [ -w "$d/nf_conntrack_checksum" ] && echo 0 > "$d/nf_conntrack_checksum" 2>/dev/null
+    [ -w "$d/nf_conntrack_fastnat" ] && echo 0 > "$d/nf_conntrack_fastnat" 2>/dev/null
+    [ -w "$d/nf_conntrack_fastnat_xfrm" ] && echo 0 > "$d/nf_conntrack_fastnat_xfrm" 2>/dev/null
+    z2k_fastroute_retire_once
+    return 0
+}
+
+z2k_conntrack_tune_stop()
+{
+    local d="$Z2K_NF_SYSCTL"
+    [ -w "$d/nf_conntrack_tcp_be_liberal" ] && echo 0 > "$d/nf_conntrack_tcp_be_liberal" 2>/dev/null
+    [ -w "$d/nf_conntrack_checksum" ] && echo 1 > "$d/nf_conntrack_checksum" 2>/dev/null
+    [ -w "$d/nf_conntrack_fastnat" ] && echo 1 > "$d/nf_conntrack_fastnat" 2>/dev/null
+    [ -w "$d/nf_conntrack_fastnat_xfrm" ] && echo 1 > "$d/nf_conntrack_fastnat_xfrm" 2>/dev/null
+    return 0
+}
+
+start_fw()
+{
+    echo "Applying zapret2 firewall rules"
+
+    # DEBUG: проверить FWTYPE после linux_fwtype
+    [ -n "$Z2K_DEBUG" ] && echo "DEBUG: в start_fw() после linux_fwtype - FWTYPE='$FWTYPE'"
+
+    # Определить тип firewall (iptables/nftables)
+    linux_fwtype
+
+    # DEBUG: проверить FWTYPE после linux_fwtype
+    [ -n "$Z2K_DEBUG" ] && echo "DEBUG: в start_fw() после linux_fwtype - FWTYPE='$FWTYPE'"
+
+    echo "Detected firewall type: $FWTYPE"
+
+    # Использовать официальную функцию из common/linux_fw.sh
+    z2k_connmark_init
+    z2k_conntrack_tune_start
+    z2k_sweep_stale_wan_nfqueue
+    zapret_apply_firewall
+    # Локалка — мимо десинка всегда (см. коммент у z2k_seed_local_exclusions).
+    # После apply_firewall: сеты к этому моменту созданы апстримом, а `-exist`
+    # делает вызов безопасным и когда их ещё нет.
+    z2k_ensure_user_exclude_file
+    z2k_seed_local_exclusions
+    z2k_seed_user_exclusions
+    z2k_policy_connmark_start
+    z2k_udp_masquerade_fix_start
+    z2k_rst_filter_purge
+
+    # Game WARP mode — bring up the usque (MASQUE) tunnel + game-ipset split-tunnel
+    # when enabled. Backgrounded so a slow usque registration never stalls the
+    # firewall apply; z2k-warp.sh selfheal (scheduler, minute-cadence) is the net.
+    # PPE-разгрузку ставим ЗДЕСЬ, а не только раз в 55 секунд из планировщика:
+    # иначе после старта до минуты идёт окно, где nfqws2 уже работает, а потоки
+    # ещё в железе — ровно те первые пакеты, ради которых разгрузка и заведена.
+    if [ -r "${ZAPRET2_DIR:-/opt/zapret2}/z2k-ppe-deoffload.sh" ]; then
+        ( . "${ZAPRET2_DIR:-/opt/zapret2}/z2k-ppe-deoffload.sh"
+          z2k_ppe_ensure_rules ) >/dev/null 2>&1
+    fi
+
+    if [ "$(grep -m1 '^GAME_WARP_ENABLED=' "${ZAPRET2_DIR:-/opt/zapret2}/config" 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d ' ')" = "1" ] && [ -r "${ZAPRET2_DIR:-/opt/zapret2}/z2k-warp.sh" ]; then
+        ( sh "${ZAPRET2_DIR:-/opt/zapret2}/z2k-warp.sh" enable --if-idle >/dev/null 2>&1 ) &
+    fi
+
+    # Последним: цепочки подмены обязаны стоять ПЕРВЫМИ в PREROUTING, а
+    # PPE-разгрузка выше вставляет свои правила в начало mangle.
+    z2k_gvsub_fw_start
+
+    return 0
+}
+
+stop_fw()
+{
+    echo "Removing zapret2 firewall rules"
+
+    # Определить тип firewall
+    linux_fwtype
+
+    z2k_rst_filter_purge
+    # Использовать официальную функцию
+    z2k_connmark_init
+    z2k_gvsub_fw_stop
+    z2k_udp_masquerade_fix_stop
+    z2k_policy_connmark_stop
+    z2k_conntrack_tune_stop
+    zapret_unapply_firewall
+    z2k_sweep_orphan_nfqueue
+
+    # PPE-разгрузка снимается вместе с остальным. Раньше не снималась НИКЕМ:
+    # её ставят установщик, панель, меню, планировщик и хук NDM, а убирает
+    # только удаление z2k. Роутер с остановленным обходом продолжал гонять
+    # начало каждого соединения через процессор впустую (найдено Марком
+    # 05.09.2026, проверено на его роутере: после stop правил остаётся 4).
+    if [ -r "${ZAPRET2_DIR:-/opt/zapret2}/z2k-ppe-deoffload.sh" ]; then
+        ( . "${ZAPRET2_DIR:-/opt/zapret2}/z2k-ppe-deoffload.sh"
+          z2k_ppe_remove_rules ) >/dev/null 2>&1
+    fi
+
+    return 0
+}
+
+# ------------------------------------------------------------------------------
+# Orphaned NFQUEUE rules
+# ------------------------------------------------------------------------------
+# zapret_unapply_firewall deletes by REBUILDING the rule text from the CURRENT
+# WAN interface list, so a rule installed under a different interface set is
+# never matched and stays forever. That is not hypothetical: until the
+# get_default_ifaces4 fix below, BusyBox `ip route show default` returned every
+# LAN bridge as a WAN, so live routers carry NFQUEUE rules on br0/br1. After the
+# fix stop_fw only knows about ppp0, so those 12 rules would be stranded - still
+# queueing LAN-to-LAN traffic into nfqws2 forever.
+#
+# Sweep them by OUR queue number only. --queue-num $QNUM is z2k's own; other
+# software's NFQUEUE rules use different numbers and are left alone. Rules are
+# turned from `-A` into `-D` and fed back, which is exact - no pattern guessing.
+# Additive NDM/self-heal starts remove rules bound to WANs no longer selected by
+# the same main-table discovery used to add them. A successful nonempty route
+# read is required; unknown or empty state is never grounds for deletion.
+z2k_sweep_stale_wan_nfqueue()
+{
+    local qn="${QNUM:-200}" save restore fam rule dev selected chain dir
+    for fam in 4 6; do
+        selected=$(z2k_wan_ifaces "-$fam" "${WAN_IFACE:-}") || continue
+        [ -n "$selected" ] || continue
+        if [ "$fam" = 4 ]; then save=iptables-save; restore=iptables; else save=ip6tables-save; restore=ip6tables; fi
+        command -v "$save" >/dev/null 2>&1 || continue
+        "$save" -t mangle 2>/dev/null | awk -v q="$qn" '
+            $1=="-A" {
+                if($2=="Z2K_MSS") {gsub(/"/, ""); print; next}
+                for(i=1;i<NF;i++) {
+                    if($2=="FORWARD" && $i=="-j" && $(i+1)=="Z2K_MSS") {print; break}
+                    if($i=="--queue-num" && $(i+1)==q) {print; break}
+                    if($2=="FORWARD" && $i=="--comment" && $(i+1) ~ /^"?z2k-inbound-mss"?$/) {
+                        gsub(/"/, "", $(i+1)); print; break
+                    }
+                }
+            }
+        ' | while IFS= read -r rule; do
+            chain=$(printf '%s\n' "$rule" | awk '{print $2}')
+            case "$chain" in
+                POSTROUTING) dir=-o ;;
+                INPUT|FORWARD|Z2K_MSS) dir=-i ;;
+                *) continue ;;
+            esac
+            dev=$(printf '%s\n' "$rule" | awk -v d="$dir" '{for(i=3;i<NF;i++) if($i==d) {print $(i+1); exit}}')
+            [ -n "$dev" ] || continue
+            case " $selected " in *" $dev "*) continue ;; esac
+            # Rule text originates from iptables-save, not user input.
+            # shellcheck disable=SC2086
+            "$restore" -w -t mangle -D ${rule#-A } 2>/dev/null ||
+                "$restore" -t mangle -D ${rule#-A } 2>/dev/null || true
+        done
+    done
+    return 0
+}
+
+z2k_sweep_orphan_nfqueue()
+{
+    local qn="${QNUM:-200}" save restore fam
+    for fam in 4 6; do
+        if [ "$fam" = 4 ]; then save=iptables-save; restore=iptables; else save=ip6tables-save; restore=ip6tables; fi
+        command -v "$save" >/dev/null 2>&1 || continue
+        "$save" -t mangle 2>/dev/null | awk -v q="$qn" '
+            $1=="-A" {
+                if($2=="Z2K_MSS") {gsub(/"/, ""); print; next}
+                for(i=1;i<NF;i++) {
+                    if($2=="FORWARD" && $i=="-j" && $(i+1)=="Z2K_MSS") {print; break}
+                    if($i=="--queue-num" && $(i+1)==q) {print; break}
+                    if($2=="FORWARD" && $i=="--comment" && $(i+1) ~ /^"?z2k-inbound-mss"?$/) {
+                        gsub(/"/, "", $(i+1)); print; break
+                    }
+                }
+            }
+        ' | while IFS= read -r rule; do
+            case "$rule" in
+                -A*) ;;
+                *)   continue ;;
+            esac
+            # shellcheck disable=SC2086
+            $restore -w -t mangle -D ${rule#-A } 2>/dev/null ||                 $restore -t mangle -D ${rule#-A } 2>/dev/null || true
+        done
+        "$restore" -w -t mangle -F Z2K_MSS 2>/dev/null || :
+        "$restore" -w -t mangle -X Z2K_MSS 2>/dev/null || :
+    done
+    return 0
+}
+
+restart_fw()
+{
+    stop_fw
+    sleep 1
+    start_fw
+}
+
+# ==============================================================================
+# OPTIONAL NFTABLES HELPERS (IF AVAILABLE)
+# ==============================================================================
+
+reload_ifsets()
+{
+    existf zapret_reload_ifsets || {
+        echo "reload_ifsets not available (nftables functions not loaded)"
+        return 1
+    }
+    zapret_reload_ifsets
+}
+
+list_ifsets()
+{
+    existf zapret_list_ifsets || {
+        echo "list_ifsets not available (nftables functions not loaded)"
+        return 1
+    }
+    zapret_list_ifsets
+}
+
+list_table()
+{
+    existf zapret_list_table || {
+        echo "list_table not available (nftables functions not loaded)"
+        return 1
+    }
+    zapret_list_table
+}
+
+# ==============================================================================
+# ОСНОВНЫЕ ФУНКЦИИ START/STOP/RESTART
+# ==============================================================================
+
+# ПЕРЕВОД ПЛАНИРОВЩИКА НА НОВЫЙ КОД ПОСЛЕ ОБНОВЛЕНИЯ.
+#
+# Путь сходимости (r-80+) выполняет только объявленные релизом шаги, и
+# перезапуска планировщика среди них нет. Старый patch-путь его делал по
+# changed_files (p-28), сходимость — нет. Поэтому новый z2k-scheduler.sh
+# приезжал на диск, а в памяти оставался старый процесс — до перезагрузки
+# роутера, то есть неделями.
+#
+# Ценой этого было ВСЁ, что планировщик обязан сделать один раз после
+# обновления: одноразовая чистка записей ip host и первая проба линии на блок
+# по объёму. У пользователя на r-81.6 (диагностика 31.08.2026) это выглядело
+# как «проба линии: не измерялась (механизм выключен)» — механизм приехал и не
+# включился ни у кого.
+#
+# Почему правка именно здесь. Этот файл обновление и доставляет, и ЗАПУСКАЕТ
+# заново с диска на шаге restart-service — значит правка действует на том же
+# обновлении, которое её привезло. Правка в lib/auto_update.sh так не умеет:
+# обновление исполняет ПРЕДЫДУЩАЯ версия апдейтера, уже загруженная в память.
+_z2k_scheduler_sync()
+{
+    _sch="${Z2K_SCHED_FILE:-/opt/zapret2/z2k-scheduler.sh}"
+    _sch_probe="${Z2K_SCHED_PROBE:-/opt/zapret2/z2k-tcp16-probe.sh}"
+    _sch_init="${Z2K_SCHED_INIT:-/opt/etc/init.d/S99z2k-scheduler}"
+    _sch_stamp="${Z2K_SCHED_STAMP:-/tmp/z2k-scheduler.mtime}"
+    _sch_log="${Z2K_SCHED_LOG:-/opt/var/log/z2k-scheduler.log}"
+
+    # ПРОПУСК ОБЯЗАН БЫТЬ СЛЫШЕН. Раньше здесь стоял голый `|| return 0`, и на
+    # роутере без исполняемого init'а планировщика функция уходила молча: в
+    # журнале обновления «перезапускаю сервис», а планировщик остаётся старым,
+    # и механизм не включается. Со стороны это неотличимо от «фикс не работает»
+    # (диагностика 31.08.2026, p-81.9). Пишем причину в журнал планировщика —
+    # именно его печатает диагностика.
+    _z2k_sched_say() { printf '%s scheduler-sync: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$_sch_log" 2>/dev/null; }
+
+    if [ ! -f "$_sch" ]; then
+        _z2k_sched_say "нет файла планировщика ($_sch) — перезапускать нечего"
+        return 0
+    fi
+    if [ ! -x "$_sch_init" ]; then
+        _z2k_sched_say "init планировщика недоступен ($_sch_init) — новый код не подхватится"
+        return 0
+    fi
+
+    # Считаем время по ОБОИМ файлам: планировщику и пробе, которую он запускает.
+    # Выпуск, меняющий только пробу, иначе не перезапустил бы ничего, и новая
+    # проба ждала бы ночного слота. Ровно это и вышло с p-81.9: починку пробы
+    # выпустили, а запустить её было некому.
+    #
+    # busybox на Entware не знает у stat ни -c, ни -f, поэтому первым идёт
+    # `date -r ФАЙЛ +%s`. Здесь стоял голый stat, и выражение всегда отдавало
+    # пусто: перезапуск не случался ни разу (роутер 06.09.2026). Подробности —
+    # у второй копии приёма, _z2k_mtime в z2k-scheduler.sh.
+    _z2k_sched_mtime() {
+        date -r "$1" +%s 2>/dev/null \
+            || stat -c %Y "$1" 2>/dev/null \
+            || stat -f %m "$1" 2>/dev/null
+    }
+    _want=$(_z2k_sched_mtime "$_sch")
+    if [ -f "$_sch_probe" ]; then
+        _wp=$(_z2k_sched_mtime "$_sch_probe")
+        [ -n "$_wp" ] && [ "$_wp" -gt "${_want:-0}" ] 2>/dev/null && _want="$_wp"
+    fi
+    # НЕ СМОГЛИ ПРОЧЕСТЬ ВРЕМЯ — ПЕРЕЗАПУСКАЕМ, А НЕ ПРОПУСКАЕМ.
+    #
+    # Прежде здесь стоял выход, и это отказ в неверную сторону: цена лишнего
+    # перезапуска планировщика — доли секунды, цена пропуска — планировщик,
+    # навсегда застрявший на старом коде, причём молча. Именно так проба блока
+    # по объёму не запускалась у людей неделями.
+    if [ -z "$_want" ]; then
+        _z2k_sched_say "не читается время файлов — перезапускаю на всякий случай"
+        _want="unknown-$(date '+%Y%m%d%H%M' 2>/dev/null || echo 0)"
+    fi
+    _have=$(cat "$_sch_stamp" 2>/dev/null)
+    [ "$_want" = "$_have" ] && return 0
+
+    echo "scheduler: код обновился — перезапускаю"
+    _z2k_sched_say "код обновился — перезапускаю планировщик"
+    # Отметку ставим ДО перезапуска, а не по факту успешного старта. Службу
+    # дёргают часто — NDM на каждое переподключение, self-heal тоже, — и без
+    # отметки вперёд получился бы шторм перезапусков планировщика. Планировщик
+    # при старте пишет эту же отметку сам, так что значения сходятся.
+    echo "$_want" > "$_sch_stamp" 2>/dev/null
+    "$_sch_init" restart >/dev/null 2>&1 || "$_sch_init" start >/dev/null 2>&1
+    return 0
+}
+
+# ОБЕЗВРЕДИТЬ СТОКОВЫЙ lighttpd, ЕСЛИ ОН МЕТИТ НА 80-й ПОРТ.
+#
+# Пакет lighttpd мы ставим ради своей панели, а он приносит собственный
+# автостартующий init со стоковым конфигом: там нет ни server.port, ни
+# server.bind, то есть 0.0.0.0:80. На Keenetic 80-й принадлежит самому роутеру,
+# и при загрузке начинается гонка: S80lighttpd стартует раньше нашего S96, и
+# если он успевает первым, nginx прошивки не может занять НИ ОДИН адрес.
+#
+# Поле 01.09.2026: `0.0.0.0:80 LISTEN 1353/lighttpd` при порте нашей панели
+# 8088, а в журнале роутера — bind() failed на всех адресах подряд, включая
+# петлевой, и «Service: Nginx: unexpectedly stopped». Интернет при этом жив:
+# маршрутизация в ядре, а морду отдаёт упавшая служба.
+#
+# ПОЧЕМУ ЗДЕСЬ, А НЕ В УСТАНОВЩИКЕ ПАНЕЛИ. В установщике это тоже исправлено,
+# но его при обычном обновлении никто не запускает — шаги обновления только
+# обновляют бинарники и перезапускают сервис. А этот файл обновление исполняет
+# СВЕЖИМ С ДИСКА на шаге restart-service, поэтому правка срабатывает на том же
+# обновлении, а не через одно, и повторяется при каждом старте.
+#
+# Переименование обратимо и совпадает по имени с тем, что делает установщик:
+# штатное удаление z2k возвращает файл на место.
+_z2k_disarm_stock_lighttpd()
+{
+    _dsl_init=""
+    for _dsl_c in /opt/etc/init.d/S*lighttpd; do
+        [ -e "$_dsl_c" ] || continue
+        case "$_dsl_c" in *z2k*) continue ;; esac
+        _dsl_init="$_dsl_c"
+        break
+    done
+    [ -n "$_dsl_init" ] || return 0
+
+    # Порт берём из конфига; НЕТ записи — значит умолчание lighttpd, то есть 80.
+    _dsl_port=""
+    for _dsl_f in /opt/etc/lighttpd/lighttpd.conf /opt/etc/lighttpd/conf.d/*.conf; do
+        [ -f "$_dsl_f" ] || continue
+        _dsl_port=$(sed -n 's/^[[:space:]]*server\.port[[:space:]]*=[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$_dsl_f" | head -1)
+        [ -n "$_dsl_port" ] && break
+    done
+    [ -n "$_dsl_port" ] || _dsl_port=80
+    [ "$_dsl_port" = "80" ] || return 0
+
+    _dsl_dst="${_dsl_init%/*}/.${_dsl_init##*/}.disabled-by-z2k"
+    if [ -e "$_dsl_dst" ]; then
+        # Уже обезврежен раньше, а файл вернулся — значит пакет переустановили.
+        _dsl_dst="${_dsl_dst}.$$"
+    fi
+    "$_dsl_init" stop >/dev/null 2>&1
+    if mv "$_dsl_init" "$_dsl_dst" 2>/dev/null; then
+        echo "z2k: отключён штатный $( basename "$_dsl_init" ) — он занимал 80-й порт вебморды роутера"
+    else
+        echo "z2k: не смог отключить $_dsl_init — он может отнять 80-й порт у вебморды роутера" >&2
+    fi
+}
+
+start()
+{
+    # ДО проверки ENABLED: мина наша независимо от того, включён ли обход.
+    _z2k_disarm_stock_lighttpd
+
+    if [ "$ENABLED" != "1" ]; then
+        echo "zapret2 is disabled in config"
+        return 1
+    fi
+
+    echo "Starting zapret2 service"
+
+    # 1. Загрузить необходимые модули ядра
+    load_modules || echo "Warning: Some modules failed to load"
+
+    # 2. ��������� firewall �������
+    [ "$INIT_APPLY_FW" = "1" ] && start_fw
+
+    # 2.1. ����������� autohostlist ����� (���� ��������)
+    ensure_autohostlist_files
+    sync_autohostlist_to_rkn
+
+    # 2.2. autocircular cache/debug files: start_daemons() re-runs
+    # ensure_autocircular_files immediately before spawning the daemon, and
+    # nothing between here and there touches that directory - so this pass was
+    # pure duplication. The start_daemons/restart_daemons CLI verbs stay covered
+    # by the call inside start_daemons.
+
+    # traffic debug (optional): nfqws2 debug log + tcpdump pcap capture
+    ensure_traffic_debug_files
+    traffic_debug_prepare
+    traffic_debug_rotate
+    traffic_debug_enable_nfqws2_log
+    traffic_debug_tcpdump_start
+
+    # 3. Запустить daemon процессы
+    # Результат больше НЕ игнорируется: раньше здесь стоял голый вызов, и ниже
+    # безусловно печаталось «service started» + return 0 — отсюда зелёная панель
+    # при мёртвом обходе.
+    _z2k_whitelist_keenetic
+    _z2k_whitelist_tiktok
+
+    # Перенос ключа пула QUIC — строго ДО подъёма демона: он читает state.tsv
+    # при старте, и правка файла под работающим демоном была бы гонкой с его
+    # собственным снимком.
+    stop_all_nfqws
+    _z2k_cleanup_retired_role
+    _z2k_migrate_quic_pool_key
+    # Перенумерация TCP-пулов 23.10.2026 — тоже строго до подъёма демона.
+    _z2k_migrate_pool_renumber_v1
+    _z2k_migrate_pool_renumber_v2
+    _z2k_migrate_pool_renumber_v3
+    _z2k_migrate_pool_renumber_v5
+    _z2k_migrate_custom_voice_blob_v1
+    _z2k_restore_state_after_rerun_v1
+
+    if ! start_daemons; then
+        echo "ERROR: zapret2 service NOT started — обход не работает"
+        echo "Проверьте конфигурацию: sh /opt/zapret2/z2k-config-validator.sh"
+        return 1
+    fi
+
+    # Orchestrator start removed: upstream'овский daemon удалён 2026-05-07.
+
+    # Планировщик — после того, как обход поднят: первая проба линии меряет
+    # блокировку на живой службе, а не на поднимающейся.
+    _z2k_scheduler_sync
+
+    z2k_gvsub_start
+
+    echo "zapret2 service started"
+    return 0
+}
+
+stop()
+{
+    echo "Stopping zapret2 service"
+
+    traffic_debug_tcpdump_stop
+    # Orchestrator stop removed: upstream daemon удалён 2026-05-07.
+
+    # Раньше остальных: служба отпускает придержанные ответы DNS и снимает подмены.
+    z2k_gvsub_stop
+
+    # 1. Остановить daemon процессы
+    stop_daemons
+
+    # Sync auto-detected domains after runtime updates.
+    sync_autohostlist_to_rkn
+
+    # 2. ������� firewall �������
+    [ "$INIT_APPLY_FW" = "1" ] && stop_fw
+
+    echo "zapret2 service stopped"
+    return 0
+}
+
+restart()
+{
+    stop
+    # stop() now waits for the daemon to actually exit, so this is a short settle
+    # for the netfilter teardown rather than a blind guess at death latency.
+    if z2k_fracsleep_avail; then usleep 200000 2>/dev/null || sleep 1; else sleep 1; fi
+    start
+}
+
+status()
+{
+    echo "Checking zapret2 status..."
+
+    # Проверить процессы по PID файлам
+    local running=0
+    for pidfile in $PIDDIR/nfqws2_*.pid; do
+        if [ -f "$pidfile" ]; then
+            local PID
+            PID=$(cat "$pidfile")
+            if z2k_pid_running "$PID"; then
+                echo "nfqws2 daemon running (PID $PID)"
+                running=$((running + 1))
+            else
+                echo "Stale PID file: $pidfile"
+            fi
+        fi
+    done
+
+    if [ $running -gt 0 ]; then
+        echo "zapret2 is running ($running daemons)"
+
+        # Показать процессы
+        echo "Processes:"
+        pgrep -af nfqws2
+
+        return 0
+    else
+        echo "zapret2 is not running"
+        return 1
+    fi
+}
+
+# ==============================================================================
+# MAIN
+# ==============================================================================
+
+case "$1" in
+    start|stop|restart)
+        for _bl in $(z2k_restore_busybox_links); do
+            echo "Restored missing command: $_bl (busybox)"
+        done
+        ;;
+esac
+
+case "$1" in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    restart)
+        restart
+        ;;
+    status)
+        status
+        ;;
+    start_fw)
+        start_fw
+        ;;
+    stop_fw)
+        stop_fw
+        ;;
+    restart_fw)
+        restart_fw
+        ;;
+    start_daemons)
+        start_daemons
+        ;;
+    stop_daemons)
+        stop_daemons
+        ;;
+    restart_daemons)
+        restart_daemons
+        ;;
+    reload_ifsets)
+        reload_ifsets
+        ;;
+    list_ifsets)
+        list_ifsets
+        ;;
+    list_table)
+        list_table
+        ;;
+    debug_rotate)
+        # Потолок отладочного лога. Зовётся раз в минуту планировщиком: сам по
+        # себе traffic_debug_rotate срабатывал ТОЛЬКО при старте сервиса, а лог
+        # с 19.08.2026 живёт в tmpfs, то есть в оперативке. Флаг, забытый
+        # включённым на ночь без единого рестарта, съедал память до OOM —
+        # замеренные 475 МБ за 17 часов при 500 МБ ОЗУ на роутере.
+        traffic_debug_prepare
+        traffic_debug_rotate
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status|start_fw|stop_fw|restart_fw|start_daemons|stop_daemons|restart_daemons|reload_ifsets|list_ifsets|list_table|debug_rotate}"
+        exit 1
+        ;;
+esac
+
+exit $?

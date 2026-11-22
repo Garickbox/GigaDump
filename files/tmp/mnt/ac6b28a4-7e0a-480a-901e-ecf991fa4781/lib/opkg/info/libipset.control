@@ -1,0 +1,15 @@
+Package: libipset
+Version: 7.24-1
+Depends: libc, libssp, librt, libpthread, libmnl
+Provides: libipset-any
+Source: feeds/base/network/utils/ipset
+SourceName: ipset
+License: GPL-2.0
+Section: net
+SourceDateEpoch: 1747489949
+URL: http://ipset.netfilter.org/
+CPE-ID: cpe:/a:netfilter:ipset
+Maintainer: Jo-Philipp Wich <jo@mein.io>
+Architecture: aarch64-3.10
+Installed-Size: 225280
+Description:  IPset administration utility

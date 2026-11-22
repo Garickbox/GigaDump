@@ -1,0 +1,17 @@
+Package: zlib
+Version: 2.3.3-2
+Depends: libc, libssp, librt, libpthread
+Provides: zlib-any
+Source: feeds/base/libs/zlib
+SourceName: zlib
+License: Zlib
+LicenseFiles: LICENSE.md
+Section: libs
+SourceDateEpoch: 1770153003
+URL: https://github.com/zlib-ng/zlib-ng
+CPE-ID: cpe:/a:zlib-ng:zlib-ng
+Architecture: aarch64-3.10
+Installed-Size: 143360
+Description:  zlib is a lossless data-compression library.
+ This package builds zlib-ng with the zlib-compatible API and ABI.
+ This package includes the shared library.

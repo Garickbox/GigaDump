@@ -1,0 +1,26 @@
+#!/opt/bin/busybox sh
+
+bb_fc=`/opt/bin/busybox readlink -f /opt/bin/busybox`
+
+# Entware specific: Preserve the old BusyBox binary and redirect its applet symlinks during upgrade
+if [ "$PKG_UPGRADE" = "1" ]; then
+    /opt/bin/busybox ln -f /opt/bin/busybox /opt/bin/.busybox.opkg-keep || exit 1
+    for file in /opt/bin/* /opt/sbin/*; do
+        if [ -L "$file" ] && [ "`/opt/bin/busybox readlink -f "$file"`" = "$bb_fc" ]; then
+           /opt/bin/busybox ln -snf /opt/bin/.busybox.opkg-keep "$file" || exit 1
+        fi
+    done
+    exit 0
+fi
+
+for file in /opt/bin/*; do
+    if [ -L $file  -a "`/opt/bin/busybox readlink -f $file`" = $bb_fc ]; then
+       /opt/bin/busybox rm -f $file
+    fi
+done
+
+for file in /opt/sbin/*; do
+    if [ -L $file  -a "`/opt/bin/busybox readlink -f $file`" = $bb_fc ]; then
+       /opt/bin/busybox rm -f $file
+    fi
+done

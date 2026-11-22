@@ -1,0 +1,108 @@
+Chain PREROUTING (policy ACCEPT 8 packets, 424 bytes)
+ pkts bytes target     prot opt in     out     source               destination         
+    0     0 REDIRECT   tcp  --  *      *       0.0.0.0/0            168.119.95.238       tcp dpt:80 redir ports 1444
+  277 16620 REDIRECT   tcp  --  *      *       0.0.0.0/0            0.0.0.0/0            tcp dpt:443 match-set z2k_tg_dc dst redir ports 1443
+    0     0 REDIRECT   tcp  --  *      *       0.0.0.0/0            10.171.171.171       tcp dpt:443 redir ports 1445
+20075 3736K _NDM_DNAT  all  --  *      *       0.0.0.0/0            0.0.0.0/0           
+20075 3736K _NDM_DNS_REDIRECT  all  --  *      *       0.0.0.0/0            0.0.0.0/0           
+20075 3736K _NDM_EZ_BYPASS  all  --  *      *       0.0.0.0/0            0.0.0.0/0           
+14289 3344K _NDM_UPNP_REDIRECT_SYS  all  --  *      *       0.0.0.0/0            0.0.0.0/0            ndmmark match 0x0/0x8
+
+Chain INPUT (policy ACCEPT 2 packets, 149 bytes)
+ pkts bytes target     prot opt in     out     source               destination         
+
+Chain OUTPUT (policy ACCEPT 4 packets, 1357 bytes)
+ pkts bytes target     prot opt in     out     source               destination         
+    0     0 REDIRECT   tcp  --  *      *       0.0.0.0/0            168.119.95.238       tcp dpt:80 redir ports 1444
+  131  7860 REDIRECT   tcp  --  *      *       0.0.0.0/0            0.0.0.0/0            tcp dpt:443 match-set z2k_tg_dc dst redir ports 1443
+    0     0 REDIRECT   tcp  --  *      *       0.0.0.0/0            10.171.171.171       tcp dpt:443 redir ports 1445
+11931 1843K _NDM_DNAT  all  --  *      *       0.0.0.0/0            0.0.0.0/0           
+
+Chain POSTROUTING (policy ACCEPT 4 packets, 240 bytes)
+ pkts bytes target     prot opt in     out     source               destination         
+   13   780 MASQUERADE  all  --  *      *       100.64.0.0/10        0.0.0.0/0           
+23464 3980K _NDM_IPSEC_POSTROUTING_NAT  all  --  *      *       0.0.0.0/0            0.0.0.0/0           
+23464 3980K _NDM_SNAT  all  --  *      *       0.0.0.0/0            0.0.0.0/0           
+23170 3946K _NDM_SNAT_MAPT  all  --  *      *       0.0.0.0/0            0.0.0.0/0           
+23170 3946K _NDM_MASQ  all  --  *      *       0.0.0.0/0            0.0.0.0/0           
+11270 1571K zapret2_nat  all  --  *      *       0.0.0.0/0            0.0.0.0/0           
+
+Chain _NDM_DNAT (2 references)
+ pkts bytes target     prot opt in     out     source               destination         
+  121 37670 RETURN     udp  --  *      *       0.0.0.0/0            0.0.0.0/0            ndmmark match 0x4/0x0 udp spt:67 dpt:68
+   38 12674 RETURN     udp  --  *      *       0.0.0.0/0            0.0.0.0/0            ndmmark match 0x4/0x0 udp spt:68 dpt:67
+31847 5529K _NDM_STATIC_DNAT  all  --  *      *       0.0.0.0/0            0.0.0.0/0           
+
+Chain _NDM_DNS_FLT_REDIR (1 references)
+ pkts bytes target     prot opt in     out     source               destination         
+
+Chain _NDM_DNS_REDIRECT (1 references)
+ pkts bytes target     prot opt in     out     source               destination         
+20075 3736K _NDM_DNS_FLT_REDIR  all  --  *      *       0.0.0.0/0            0.0.0.0/0           
+20075 3736K _NDM_IC_REDIRECT  all  --  *      *       0.0.0.0/0            0.0.0.0/0           
+20075 3736K _NDM_HOTSPOT_DNSREDIR  all  --  *      *       0.0.0.0/0            0.0.0.0/0           
+
+Chain _NDM_EZ_BYPASS (1 references)
+ pkts bytes target     prot opt in     out     source               destination         
+ 5786  392K ACCEPT     all  --  *      *       0.0.0.0/0            192.168.1.1         
+
+Chain _NDM_EZ_DNAT (9 references)
+ pkts bytes target     prot opt in     out     source               destination         
+
+Chain _NDM_HOTSPOT_DNSREDIR (1 references)
+ pkts bytes target     prot opt in     out     source               destination         
+
+Chain _NDM_IC_REDIRECT (1 references)
+ pkts bytes target     prot opt in     out     source               destination         
+
+Chain _NDM_IPSEC_POSTROUTING_NAT (1 references)
+ pkts bytes target     prot opt in     out     source               destination         
+
+Chain _NDM_MASQ (1 references)
+ pkts bytes target     prot opt in     out     source               destination         
+23170 3946K _NDM_MASQ_BYPASS  all  --  *      *       0.0.0.0/0            0.0.0.0/0           
+11308 2123K MASQUERADE  all  --  *      !br0    192.168.1.0/24       0.0.0.0/0            ndmmark match 0x4/0x0
+
+Chain _NDM_MASQ_BYPASS (1 references)
+ pkts bytes target     prot opt in     out     source               destination         
+    0     0 ACCEPT     all  --  *      *       224.0.0.0/4          0.0.0.0/0           
+  517  248K ACCEPT     all  --  *      *       0.0.0.0/0            224.0.0.0/4         
+
+Chain _NDM_SL_PRIVATE (0 references)
+ pkts bytes target     prot opt in     out     source               destination         
+    0     0 _NDM_EZ_DNAT  all  --  ra14   *       0.0.0.0/0            0.0.0.0/0           
+    0     0 _NDM_EZ_DNAT  all  --  ra6    *       0.0.0.0/0            0.0.0.0/0           
+    0     0 _NDM_EZ_DNAT  all  --  ra12   *       0.0.0.0/0            0.0.0.0/0           
+    0     0 _NDM_EZ_DNAT  all  --  ra5    *       0.0.0.0/0            0.0.0.0/0           
+    0     0 _NDM_EZ_DNAT  all  --  ra4    *       0.0.0.0/0            0.0.0.0/0           
+    0     0 _NDM_EZ_DNAT  all  --  ra13   *       0.0.0.0/0            0.0.0.0/0           
+    0     0 _NDM_EZ_DNAT  all  --  ra11   *       0.0.0.0/0            0.0.0.0/0           
+    0     0 _NDM_EZ_DNAT  all  --  ra3    *       0.0.0.0/0            0.0.0.0/0           
+    0     0 _NDM_EZ_DNAT  all  --  br0    *       0.0.0.0/0            0.0.0.0/0           
+
+Chain _NDM_SNAT (1 references)
+ pkts bytes target     prot opt in     out     source               destination         
+23464 3980K _NDM_STATIC_LOOP  all  --  *      *       0.0.0.0/0            0.0.0.0/0           
+22405 3681K _NDM_STATIC_SNAT  all  --  *      eth3    0.0.0.0/0            0.0.0.0/0           
+
+Chain _NDM_SNAT_MAPT (1 references)
+ pkts bytes target     prot opt in     out     source               destination         
+
+Chain _NDM_STATIC_DNAT (1 references)
+ pkts bytes target     prot opt in     out     source               destination         
+
+Chain _NDM_STATIC_LOOP (1 references)
+ pkts bytes target     prot opt in     out     source               destination         
+  294 34667 SNAT       all  --  *      br0     192.168.1.0/24       192.168.1.0/24       to:192.168.1.1
+    0     0 SNAT       all  --  *      br0     192.168.1.0/24       0.0.0.0/0            ndmmark match 0x4/0x0 to:192.168.1.1
+
+Chain _NDM_STATIC_SNAT (1 references)
+ pkts bytes target     prot opt in     out     source               destination         
+
+Chain _NDM_UPNP_REDIRECT_SYS (1 references)
+ pkts bytes target     prot opt in     out     source               destination         
+
+Chain zapret2_nat (1 references)
+ pkts bytes target     prot opt in     out     source               destination         
+  170  209K MASQUERADE  udp  --  *      eth3    0.0.0.0/0            0.0.0.0/0            mark match 0x40000000/0x40000000
+  708 42192 MASQUERADE  tcp  --  *      eth3    0.0.0.0/0            0.0.0.0/0            mark match 0x40000000/0x40000000 tcp dpt:443

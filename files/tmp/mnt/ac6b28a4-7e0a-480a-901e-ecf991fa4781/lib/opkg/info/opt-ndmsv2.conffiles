@@ -1,0 +1,5 @@
+/opt/etc/group
+/opt/etc/passwd
+/opt/etc/profile
+/opt/etc/shells
+/opt/root/.profile

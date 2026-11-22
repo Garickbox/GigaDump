@@ -1,0 +1,13 @@
+Package: libgcc
+Version: 8.4.0-12
+Provides: libgcc-any
+Source: feeds/base/libs/toolchain
+SourceName: toolchain
+License: GPL-3.0-with-GCC-exception
+Section: libs
+SourceDateEpoch: 1793487135
+URL: https://gcc.gnu.org/
+Maintainer: Felix Fietkau <nbd@nbd.name>
+Architecture: aarch64-3.10
+Installed-Size: 81920
+Description:  GCC support library

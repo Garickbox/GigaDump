@@ -1,0 +1,253 @@
+2026/11/21 21:17:14.725802 [info] starting adguard home version="AdGuard Home, version v0.107.79"
+2026/11/21 21:17:14.727909 [info] this is the first time adguard home has been launched
+2026/11/21 21:17:14.727995 [info] checking if adguard home has the necessary permissions
+2026/11/21 21:17:14.728483 [error] failed to bind to port 53; binding to port 53 is required for a dns server err="listen tcp 127.0.0.1:53: bind: address already in use"
+2026/11/21 21:17:14.728569 [info] adguard home can bind to port 53
+2026/11/21 21:17:14.921848 [info] tls_manager: using default ciphers
+2026/11/21 21:17:14.933397 [info] webapi: initializing
+2026/11/21 21:17:14.933591 [info] webapi: This is the first launch of AdGuard Home, redirecting everything to /install.html
+2026/11/21 21:17:14.934010 [info] permcheck: warning: found unexpected permissions type=directory path=/opt/etc/AdGuardHome perm=0755 want=0700
+2026/11/21 21:17:14.934252 [info] webapi: AdGuard Home is available at the following addresses:
+2026/11/21 21:17:14.941104 [info] webapi: serving url=http://127.0.0.1:3000
+2026/11/21 21:17:14.941203 [info] webapi: serving url=http://[::1]:3000
+2026/11/21 21:17:14.941241 [info] webapi: serving url=http://198.51.100.37:3000
+2026/11/21 21:17:14.941274 [info] webapi: serving url=http://[2001:2::c633:6425]:3000
+2026/11/21 21:17:14.941310 [info] webapi: serving url=http://[fe80::d69c:53ff:fe0c:1839%25eth2]:3000
+2026/11/21 21:17:14.941341 [info] webapi: serving url=http://10.16.20.23:3000
+2026/11/21 21:17:14.941374 [info] webapi: serving url=http://[fe80::cae7:d8ff:fe85:905b%25eth3]:3000
+2026/11/21 21:17:14.941407 [info] webapi: serving url=http://[fe80::d69c:53ff:fe0c:1839%25ra0]:3000
+2026/11/21 21:17:14.941458 [info] webapi: serving url=http://[fe80::d49c:53ff:fe2c:1839%25ra2]:3000
+2026/11/21 21:17:14.941491 [info] webapi: serving url=http://[fe80::d49c:53ff:fe7c:1839%25ra7]:3000
+2026/11/21 21:17:14.941525 [info] webapi: serving url=http://[fe80::d49c:53ff:fe8c:1839%25ra8]:3000
+2026/11/21 21:17:14.941558 [info] webapi: serving url=http://[fe80::d49c:53ff:feac:1839%25ra10]:3000
+2026/11/21 21:17:14.941591 [info] webapi: serving url=http://[fe80::d49c:53ff:fefc:1839%25ra15]:3000
+2026/11/21 21:17:14.941623 [info] webapi: serving url=http://[fe80::681f:aaff:fe1c:3c8d%25ntce0]:3000
+2026/11/21 21:17:14.941657 [info] webapi: serving url=http://[fe80::d69c:53ff:fe0c:1839%25eth2.1]:3000
+2026/11/21 21:17:14.941690 [info] webapi: serving url=http://[fe80::d49c:53ff:fe0c:1838%25eth2.3]:3000
+2026/11/21 21:17:14.941721 [info] webapi: serving url=http://192.168.1.1:3000
+2026/11/21 21:17:14.941752 [info] webapi: serving url=http://[fd51:9c02:2b2d:0:d69c:53ff:fe0c:1839]:3000
+2026/11/21 21:17:14.941785 [info] webapi: serving url=http://[fe80::d69c:53ff:fe0c:1839%25br0]:3000
+2026/11/21 21:17:14.941815 [info] webapi: serving url=http://10.1.30.1:3000
+2026/11/21 21:17:14.941847 [info] webapi: serving url=http://[fe80::d49c:53ff:fe7c:1839%25ra7.1]:3000
+2026/11/21 21:17:14.941880 [info] webapi: serving url=http://[fe80::d49c:53ff:fefc:1839%25ra15.1]:3000
+2026/11/21 21:17:14.941912 [info] webapi: serving url=http://[fe80::d49c:53ff:fe7c:1839%25ra7.2]:3000
+2026/11/21 21:17:14.941944 [info] webapi: serving url=http://[fe80::d49c:53ff:fefc:1839%25ra15.2]:3000
+2026/11/21 21:17:14.942120 [info] starting plain server server=plain addr=0.0.0.0:3000
+2026/11/21 21:17:15.765681 [info] webapi: warning: http error host=127.0.0.1:3000 method=POST raddr=127.0.0.1:56678 request_uri=/control/install/configure status=400 err="listen udp 192.168.1.1:5353: bind: address already in use"
+2026/11/21 21:17:17.803268 [info] signalhdlr: received signal signal=terminated
+2026/11/21 21:17:17.803590 [info] webapi: stopping http server
+2026/11/21 21:17:17.803939 [info] webapi: stopped http server
+2026/11/21 21:17:17.804037 [info] signalhdlr: stopping adguard home
+2026/11/21 21:17:17.804447 [info] signalhdlr: stopped
+2026/11/21 21:21:38.231292 [info] starting adguard home version="AdGuard Home, version v0.107.79"
+2026/11/21 21:21:38.239119 [info] this is the first time adguard home has been launched
+2026/11/21 21:21:38.239216 [info] checking if adguard home has the necessary permissions
+2026/11/21 21:21:38.239864 [error] failed to bind to port 53; binding to port 53 is required for a dns server err="listen tcp 127.0.0.1:53: bind: address already in use"
+2026/11/21 21:21:38.239946 [info] adguard home can bind to port 53
+2026/11/21 21:21:38.304698 [info] tls_manager: using default ciphers
+2026/11/21 21:21:38.305401 [info] webapi: initializing
+2026/11/21 21:21:38.305533 [info] webapi: This is the first launch of AdGuard Home, redirecting everything to /install.html
+2026/11/21 21:21:38.305785 [info] permcheck: warning: found unexpected permissions type=directory path=/opt/etc/AdGuardHome perm=0755 want=0700
+2026/11/21 21:21:38.305909 [info] webapi: AdGuard Home is available at the following addresses:
+2026/11/21 21:21:38.311856 [info] webapi: serving url=http://127.0.0.1:3000
+2026/11/21 21:21:38.311951 [info] webapi: serving url=http://[::1]:3000
+2026/11/21 21:21:38.311989 [info] webapi: serving url=http://198.51.100.37:3000
+2026/11/21 21:21:38.312023 [info] webapi: serving url=http://[2001:2::c633:6425]:3000
+2026/11/21 21:21:38.312059 [info] webapi: serving url=http://[fe80::d69c:53ff:fe0c:1839%25eth2]:3000
+2026/11/21 21:21:38.312090 [info] webapi: serving url=http://10.16.20.23:3000
+2026/11/21 21:21:38.312124 [info] webapi: serving url=http://[fe80::cae7:d8ff:fe85:905b%25eth3]:3000
+2026/11/21 21:21:38.312157 [info] webapi: serving url=http://[fe80::d69c:53ff:fe0c:1839%25ra0]:3000
+2026/11/21 21:21:38.312191 [info] webapi: serving url=http://[fe80::d49c:53ff:fe2c:1839%25ra2]:3000
+2026/11/21 21:21:38.312223 [info] webapi: serving url=http://[fe80::d49c:53ff:fe7c:1839%25ra7]:3000
+2026/11/21 21:21:38.312257 [info] webapi: serving url=http://[fe80::d49c:53ff:fe8c:1839%25ra8]:3000
+2026/11/21 21:21:38.312290 [info] webapi: serving url=http://[fe80::d49c:53ff:feac:1839%25ra10]:3000
+2026/11/21 21:21:38.312323 [info] webapi: serving url=http://[fe80::d49c:53ff:fefc:1839%25ra15]:3000
+2026/11/21 21:21:38.312356 [info] webapi: serving url=http://[fe80::681f:aaff:fe1c:3c8d%25ntce0]:3000
+2026/11/21 21:21:38.312389 [info] webapi: serving url=http://[fe80::d69c:53ff:fe0c:1839%25eth2.1]:3000
+2026/11/21 21:21:38.312446 [info] webapi: serving url=http://[fe80::d49c:53ff:fe0c:1838%25eth2.3]:3000
+2026/11/21 21:21:38.312480 [info] webapi: serving url=http://192.168.1.1:3000
+2026/11/21 21:21:38.312513 [info] webapi: serving url=http://[fd51:9c02:2b2d:0:d69c:53ff:fe0c:1839]:3000
+2026/11/21 21:21:38.312546 [info] webapi: serving url=http://[fe80::d69c:53ff:fe0c:1839%25br0]:3000
+2026/11/21 21:21:38.312577 [info] webapi: serving url=http://10.1.30.1:3000
+2026/11/21 21:21:38.312610 [info] webapi: serving url=http://[fe80::d49c:53ff:fe7c:1839%25ra7.1]:3000
+2026/11/21 21:21:38.312642 [info] webapi: serving url=http://[fe80::d49c:53ff:fefc:1839%25ra15.1]:3000
+2026/11/21 21:21:38.312675 [info] webapi: serving url=http://[fe80::d49c:53ff:fe7c:1839%25ra7.2]:3000
+2026/11/21 21:21:38.312707 [info] webapi: serving url=http://[fe80::d49c:53ff:fefc:1839%25ra15.2]:3000
+2026/11/21 21:21:38.312890 [info] starting plain server server=plain addr=0.0.0.0:3000
+2026/11/21 21:21:39.670195 [info] dnsproxy: upstream mode is set mode=load_balance
+2026/11/21 21:21:39.670296 [info] dnsproxy: cache enabled size=4096
+2026/11/21 21:21:39.670345 [info] dnsproxy: max goroutines is set count=300
+2026/11/21 21:21:39.670482 [info] dnsproxy: server will refuse requests of type any
+2026/11/21 21:21:39.670526 [info] dnsproxy: upstream mode is set mode=load_balance
+2026/11/21 21:21:39.670578 [info] dnsproxy: cache enabled size=4194304
+2026/11/21 21:21:39.670619 [info] dnsproxy: max goroutines is set count=300
+2026/11/21 21:21:39.672023 [info] addrproc: processing addresses
+2026/11/21 21:21:39.695306 [info] dnsproxy: starting dns proxy server
+2026/11/21 21:21:39.695436 [info] dnsproxy: creating udp server socket addr=192.168.1.1:15353
+2026/11/21 21:21:39.695744 [info] dnsproxy: listening to udp addr=192.168.1.1:15353
+2026/11/21 21:21:39.695815 [info] dnsproxy: creating tcp server socket addr=192.168.1.1:15353
+2026/11/21 21:21:39.695994 [info] dnsproxy: listening to tcp addr=192.168.1.1:15353
+2026/11/21 21:21:39.696322 [info] dnsproxy: entering udp listener loop addr=192.168.1.1:15353
+2026/11/21 21:21:39.696706 [info] dnsproxy: entering listener loop proto=tcp addr=192.168.1.1:15353
+2026/11/21 21:21:39.710602 [info] webapi: serving url=http://192.168.1.1:3080
+2026/11/21 21:21:39.710776 [info] starting plain server server=plain addr=192.168.1.1:3080
+2026/11/21 21:21:42.124842 [info] dnsforward: starting reconfiguring server
+2026/11/21 21:21:42.124915 [info] dnsproxy: stopping server
+2026/11/21 21:21:42.125227 [info] dnsproxy: stopped dns proxy server
+2026/11/21 21:21:42.225964 [info] dnsproxy: upstream mode is set mode=parallel
+2026/11/21 21:21:42.226060 [info] dnsproxy: cache enabled size=4096
+2026/11/21 21:21:42.226106 [info] dnsproxy: max goroutines is set count=300
+2026/11/21 21:21:42.226261 [info] dnsproxy: server will refuse requests of type any
+2026/11/21 21:21:42.226302 [info] dnsproxy: upstream mode is set mode=parallel
+2026/11/21 21:21:42.226332 [info] dnsproxy: cache enabled size=4194304
+2026/11/21 21:21:42.226371 [info] dnsproxy: max goroutines is set count=300
+2026/11/21 21:21:42.227226 [info] dnsproxy: starting dns proxy server
+2026/11/21 21:21:42.227330 [info] dnsproxy: creating udp server socket addr=192.168.1.1:15353
+2026/11/21 21:21:42.227568 [info] dnsproxy: listening to udp addr=192.168.1.1:15353
+2026/11/21 21:21:42.227623 [info] dnsproxy: creating tcp server socket addr=192.168.1.1:15353
+2026/11/21 21:21:42.227757 [info] dnsproxy: listening to tcp addr=192.168.1.1:15353
+2026/11/21 21:21:42.227947 [info] dnsforward: finished reconfiguring server
+2026/11/21 21:21:42.231007 [info] addrproc: processing addresses
+2026/11/21 21:21:42.231184 [info] addrproc: finished processing addresses
+2026/11/21 21:21:42.231365 [info] dnsproxy: entering udp listener loop addr=192.168.1.1:15353
+2026/11/21 21:21:42.231662 [info] dnsproxy: entering listener loop proto=tcp addr=192.168.1.1:15353
+2026/11/21 21:21:42.249722 [info] signalhdlr: received signal signal=terminated
+2026/11/21 21:21:42.249963 [info] webapi: stopping http server
+2026/11/21 21:21:42.250362 [info] webapi: stopped http server
+2026/11/21 21:21:42.250460 [info] signalhdlr: stopping adguard home
+2026/11/21 21:21:42.250508 [info] dnsproxy: stopping server
+2026/11/21 21:21:42.250742 [info] dnsproxy: stopped dns proxy server
+2026/11/21 21:21:42.267763 [error] closing query log: flushing log buffer: nothing to write to a file
+2026/11/21 21:21:42.268166 [info] signalhdlr: stopped
+2026/11/21 21:21:46.895165 [info] starting adguard home version="AdGuard Home, version v0.107.79"
+2026/11/21 21:21:46.966968 [info] tls_manager: using default ciphers
+2026/11/21 21:21:46.978021 [info] webapi: initializing
+2026/11/21 21:21:46.980477 [info] dnsproxy: upstream mode is set mode=parallel
+2026/11/21 21:21:46.980575 [info] dnsproxy: cache enabled size=4096
+2026/11/21 21:21:46.980619 [info] dnsproxy: max goroutines is set count=300
+2026/11/21 21:21:46.980846 [info] dnsproxy: server will refuse requests of type any
+2026/11/21 21:21:46.980920 [info] dnsproxy: upstream mode is set mode=parallel
+2026/11/21 21:21:46.980954 [info] dnsproxy: cache enabled size=4194304
+2026/11/21 21:21:46.980990 [info] dnsproxy: max goroutines is set count=300
+2026/11/21 21:21:46.982195 [info] addrproc: processing addresses
+2026/11/21 21:21:46.982491 [info] permcheck: changed permissions type=directory path=/opt/etc/AdGuardHome
+2026/11/21 21:21:46.982578 [info] permcheck: changed permissions type=file path=/opt/etc/AdGuardHome/AdGuardHome.yaml
+2026/11/21 21:21:46.983601 [info] permcheck: changed permissions type=directory path=/opt/etc/AdGuardHome/data
+2026/11/21 21:21:46.983827 [info] permcheck: changed permissions type=directory path=/opt/etc/AdGuardHome/data/filters
+2026/11/21 21:21:46.983908 [info] permcheck: changed permissions type=file path=/opt/etc/AdGuardHome/data/sessions.db
+2026/11/21 21:21:46.984042 [info] permcheck: changed permissions type=file path=/opt/etc/AdGuardHome/data/stats.db
+2026/11/21 21:21:46.984299 [info] webapi: AdGuard Home is available at the following addresses:
+2026/11/21 21:21:46.984424 [info] webapi: serving url=http://192.168.1.1:3080
+2026/11/21 21:21:46.984568 [info] starting plain server server=plain addr=192.168.1.1:3080
+2026/11/21 21:21:47.006050 [info] dnsproxy: starting dns proxy server
+2026/11/21 21:21:47.006171 [info] dnsproxy: creating udp server socket addr=127.0.0.1:53
+2026/11/21 21:21:47.006447 [info] dnsproxy: listening to udp addr=127.0.0.1:53
+2026/11/21 21:21:47.006507 [info] dnsproxy: creating udp server socket addr=192.168.1.1:53
+2026/11/21 21:21:47.006650 [info] dnsproxy: listening to udp addr=192.168.1.1:53
+2026/11/21 21:21:47.006692 [info] dnsproxy: creating tcp server socket addr=127.0.0.1:53
+2026/11/21 21:21:47.006827 [info] dnsproxy: listening to tcp addr=127.0.0.1:53
+2026/11/21 21:21:47.006867 [info] dnsproxy: creating tcp server socket addr=192.168.1.1:53
+2026/11/21 21:21:47.006953 [info] dnsproxy: listening to tcp addr=192.168.1.1:53
+2026/11/21 21:21:47.007275 [info] dnsproxy: entering udp listener loop addr=192.168.1.1:53
+2026/11/21 21:21:47.007553 [info] dnsproxy: entering udp listener loop addr=127.0.0.1:53
+2026/11/21 21:21:47.007854 [info] dnsproxy: entering listener loop proto=tcp addr=127.0.0.1:53
+2026/11/21 21:21:47.008046 [info] dnsproxy: entering listener loop proto=tcp addr=192.168.1.1:53
+2026/11/21 21:21:59.161061 [info] filtering: saving contents id=1 path=/opt/etc/AdGuardHome/data/filters/1.txt
+2026/11/21 21:21:59.268682 [info] filtering: filter updated id=1 bytes_written=4632073 rules_count=192079
+2026/11/21 21:21:59.268799 [info] filtering: updated filter id=1 rules_count=192079 prev_rules_count=0
+2026/11/21 21:45:38.348032 [info] signalhdlr: received signal signal=terminated
+2026/11/21 21:45:38.349555 [info] webapi: stopping http server
+2026/11/21 21:45:38.349933 [info] webapi: stopped http server
+2026/11/21 21:45:38.350018 [info] signalhdlr: stopping adguard home
+2026/11/21 21:45:38.350057 [info] dnsproxy: stopping server
+2026/11/21 21:45:38.354849 [info] dnsproxy: stopped dns proxy server
+2026/11/21 21:45:38.393822 [info] signalhdlr: stopped
+2026/11/21 21:45:39.518885 [info] starting adguard home version="AdGuard Home, version v0.107.79"
+2026/11/21 21:45:39.629632 [info] tls_manager: using default ciphers
+2026/11/21 21:45:39.645656 [info] webapi: initializing
+2026/11/21 21:45:39.786225 [info] dnsproxy: upstream mode is set mode=parallel
+2026/11/21 21:45:39.786334 [info] dnsproxy: cache enabled size=4096
+2026/11/21 21:45:39.786383 [info] dnsproxy: max goroutines is set count=300
+2026/11/21 21:45:39.786527 [info] dnsproxy: server will refuse requests of type any
+2026/11/21 21:45:39.786570 [info] dnsproxy: upstream mode is set mode=parallel
+2026/11/21 21:45:39.786603 [info] dnsproxy: cache enabled size=4194304
+2026/11/21 21:45:39.786641 [info] dnsproxy: max goroutines is set count=300
+2026/11/21 21:45:39.787693 [info] addrproc: processing addresses
+2026/11/21 21:45:39.788168 [info] permcheck: changed permissions type=directory path=/opt/etc/AdGuardHome
+2026/11/21 21:45:39.788268 [info] permcheck: changed permissions type=file path=/opt/etc/AdGuardHome/AdGuardHome.yaml
+2026/11/21 21:45:39.788381 [info] permcheck: changed permissions type=directory path=/opt/etc/AdGuardHome/data
+2026/11/21 21:45:39.788470 [info] permcheck: changed permissions type=directory path=/opt/etc/AdGuardHome/data/filters
+2026/11/21 21:45:39.788551 [info] permcheck: changed permissions type=file path=/opt/etc/AdGuardHome/data/sessions.db
+2026/11/21 21:45:39.788618 [info] permcheck: changed permissions type=file path=/opt/etc/AdGuardHome/data/querylog.json
+2026/11/21 21:45:39.788912 [info] permcheck: changed permissions type=file path=/opt/etc/AdGuardHome/data/stats.db
+2026/11/21 21:45:39.789165 [info] webapi: AdGuard Home is available at the following addresses:
+2026/11/21 21:45:39.789325 [info] webapi: serving url=http://192.168.1.1:3080
+2026/11/21 21:45:39.789538 [info] starting plain server server=plain addr=192.168.1.1:3080
+2026/11/21 21:45:41.835174 [info] dnsproxy: starting dns proxy server
+2026/11/21 21:45:41.835340 [info] dnsproxy: creating udp server socket addr=127.0.0.1:53
+2026/11/21 21:45:41.835626 [info] dnsproxy: listening to udp addr=127.0.0.1:53
+2026/11/21 21:45:41.835690 [info] dnsproxy: creating udp server socket addr=192.168.1.1:53
+2026/11/21 21:45:41.835845 [info] dnsproxy: listening to udp addr=192.168.1.1:53
+2026/11/21 21:45:41.835887 [info] dnsproxy: creating udp server socket addr=100.81.14.2:53
+2026/11/21 21:45:41.836000 [info] dnsproxy: listening to udp addr=100.81.14.2:53
+2026/11/21 21:45:41.836042 [info] dnsproxy: creating tcp server socket addr=127.0.0.1:53
+2026/11/21 21:45:41.836168 [info] dnsproxy: listening to tcp addr=127.0.0.1:53
+2026/11/21 21:45:41.836207 [info] dnsproxy: creating tcp server socket addr=192.168.1.1:53
+2026/11/21 21:45:41.836292 [info] dnsproxy: listening to tcp addr=192.168.1.1:53
+2026/11/21 21:45:41.836325 [info] dnsproxy: creating tcp server socket addr=100.81.14.2:53
+2026/11/21 21:45:41.836417 [info] dnsproxy: listening to tcp addr=100.81.14.2:53
+2026/11/21 21:45:41.836779 [info] dnsproxy: entering udp listener loop addr=192.168.1.1:53
+2026/11/21 21:45:41.837004 [info] dnsproxy: entering udp listener loop addr=127.0.0.1:53
+2026/11/21 21:45:41.837257 [info] dnsproxy: entering listener loop proto=tcp addr=127.0.0.1:53
+2026/11/21 21:45:41.837455 [info] dnsproxy: entering udp listener loop addr=100.81.14.2:53
+2026/11/21 21:45:41.837666 [info] dnsproxy: entering listener loop proto=tcp addr=100.81.14.2:53
+2026/11/21 21:45:41.837876 [info] dnsproxy: entering listener loop proto=tcp addr=192.168.1.1:53
+2026/11/21 21:52:19.818938 [info] signalhdlr: received signal signal=terminated
+2026/11/21 21:52:19.819199 [info] webapi: stopping http server
+2026/11/21 21:52:19.819481 [info] webapi: stopped http server
+2026/11/21 21:52:19.819586 [info] signalhdlr: stopping adguard home
+2026/11/21 21:52:19.819623 [info] dnsproxy: stopping server
+2026/11/21 21:52:19.821514 [info] dnsproxy: stopped dns proxy server
+2026/11/21 21:52:19.842662 [info] signalhdlr: stopped
+2026/11/21 21:52:20.898931 [info] starting adguard home version="AdGuard Home, version v0.107.79"
+2026/11/21 21:52:20.975886 [info] tls_manager: using default ciphers
+2026/11/21 21:52:20.989752 [info] webapi: initializing
+2026/11/21 21:52:21.104793 [info] dnsproxy: upstream mode is set mode=parallel
+2026/11/21 21:52:21.104916 [info] dnsproxy: cache enabled size=4096
+2026/11/21 21:52:21.104998 [info] dnsproxy: max goroutines is set count=300
+2026/11/21 21:52:21.105187 [info] dnsproxy: server will refuse requests of type any
+2026/11/21 21:52:21.105240 [info] dnsproxy: upstream mode is set mode=parallel
+2026/11/21 21:52:21.105274 [info] dnsproxy: cache enabled size=4194304
+2026/11/21 21:52:21.105311 [info] dnsproxy: max goroutines is set count=300
+2026/11/21 21:52:21.106378 [info] addrproc: processing addresses
+2026/11/21 21:52:21.107540 [info] webapi: AdGuard Home is available at the following addresses:
+2026/11/21 21:52:21.107702 [info] webapi: serving url=http://192.168.1.1:3080
+2026/11/21 21:52:21.107952 [info] starting plain server server=plain addr=192.168.1.1:3080
+2026/11/21 21:52:23.031923 [info] dnsproxy: starting dns proxy server
+2026/11/21 21:52:23.032101 [info] dnsproxy: creating udp server socket addr=127.0.0.1:53
+2026/11/21 21:52:23.032363 [info] dnsproxy: listening to udp addr=127.0.0.1:53
+2026/11/21 21:52:23.032417 [info] dnsproxy: creating udp server socket addr=192.168.1.1:53
+2026/11/21 21:52:23.032556 [info] dnsproxy: listening to udp addr=192.168.1.1:53
+2026/11/21 21:52:23.032596 [info] dnsproxy: creating udp server socket addr=100.81.14.2:53
+2026/11/21 21:52:23.032709 [info] dnsproxy: listening to udp addr=100.81.14.2:53
+2026/11/21 21:52:23.032754 [info] dnsproxy: creating tcp server socket addr=127.0.0.1:53
+2026/11/21 21:52:23.032881 [info] dnsproxy: listening to tcp addr=127.0.0.1:53
+2026/11/21 21:52:23.032919 [info] dnsproxy: creating tcp server socket addr=192.168.1.1:53
+2026/11/21 21:52:23.033022 [info] dnsproxy: listening to tcp addr=192.168.1.1:53
+2026/11/21 21:52:23.033084 [info] dnsproxy: creating tcp server socket addr=100.81.14.2:53
+2026/11/21 21:52:23.033179 [info] dnsproxy: listening to tcp addr=100.81.14.2:53
+2026/11/21 21:52:23.033533 [info] dnsproxy: entering udp listener loop addr=127.0.0.1:53
+2026/11/21 21:52:23.033759 [info] dnsproxy: entering udp listener loop addr=100.81.14.2:53
+2026/11/21 21:52:23.033959 [info] dnsproxy: entering udp listener loop addr=192.168.1.1:53
+2026/11/21 21:52:23.034199 [info] dnsproxy: entering listener loop proto=tcp addr=127.0.0.1:53
+2026/11/21 21:52:23.034377 [info] dnsproxy: entering listener loop proto=tcp addr=100.81.14.2:53
+2026/11/21 21:52:23.034577 [info] dnsproxy: entering listener loop proto=tcp addr=192.168.1.1:53
+2026/11/21 21:59:40.296460 [error] dnsproxy: response received upstream_type=main addr=tls://1.1.1.1:853 proto=tcp status="reading response from tls://1.1.1.1:853: read tcp 10.16.20.23:60800->1.1.1.1:853: i/o timeout"
+2026/11/21 21:59:40.299616 [error] dnsproxy: response received upstream_type=main addr=tls://1.1.1.1:853 proto=tcp status="reading response from tls://1.1.1.1:853: read tcp 10.16.20.23:60786->1.1.1.1:853: i/o timeout"
+2026/11/21 21:59:40.300715 [error] dnsproxy: response received upstream_type=main addr=tls://1.1.1.1:853 proto=tcp status="reading response from tls://1.1.1.1:853: read tcp 10.16.20.23:60772->1.1.1.1:853: i/o timeout"
+2026/11/21 22:26:07.454521 [error] dnsproxy: response received upstream_type=main addr=tls://1.1.1.1:853 proto=tcp status="reading response from tls://1.1.1.1:853: read tcp 10.16.20.23:50580->1.1.1.1:853: i/o timeout"
+2026/11/22 00:36:28.121669 [error] dnsproxy: response received upstream_type=main addr=tls://1.1.1.1:853 proto=tcp status="reading response from tls://1.1.1.1:853: read tcp 10.16.20.23:60106->1.1.1.1:853: i/o timeout"
+2026/11/22 14:56:23.506950 [error] dnsproxy: response received upstream_type=main addr=tls://1.1.1.1:853 proto=tcp status="reading response from tls://1.1.1.1:853: read tcp 10.16.20.23:57386->1.1.1.1:853: i/o timeout"
+2026/11/22 15:25:18.891875 [error] dnsproxy: response received upstream_type=main addr=tls://1.1.1.1:853 proto=tcp status="reading response from tls://1.1.1.1:853: read tcp 10.16.20.23:58848->1.1.1.1:853: i/o timeout"
+2026/11/22 18:48:10.724514 [error] dnsproxy: reading msg proto=tcp err="reading len: read tcp 100.81.14.2:53->100.123.8.123:55410: read: connection reset by peer"
+2026/11/22 20:42:27.136075 [error] dnsproxy: reading msg proto=tcp err="reading len: read tcp 100.81.14.2:53->100.123.8.123:23777: read: connection reset by peer"

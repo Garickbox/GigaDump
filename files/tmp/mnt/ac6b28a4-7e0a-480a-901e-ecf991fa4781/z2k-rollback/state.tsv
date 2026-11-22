@@ -1,0 +1,23 @@
+# z2k autocircular state (persisted circular nstrategy)
+# key	host	strategy	ts	mode	sni
+rkn_tcp	instagram.com|4	1	1795281868	auto	
+rkn_tcp	whatsapp.com|4	1	1795281880	auto	
+rkn_tcp	whatsapp.net|4	1	1795281884	auto	
+rkn_tcp	doubleclick.net|4	1	1795282074	auto	
+rkn_tcp	facebook.com|4	1	1795281880	auto	
+rkn_tcp	cdninstagram.com|4	1	1795281874	auto	
+rkn_tcp	cloudfront.net|4	1	1795281896	auto	
+http_rkn	cloudfront.net|4	1	1795281897	auto	
+gv_tcp	googlevideo.com|4	1	1795282055	auto	
+quic	googlevideo.com|4	1	1795282054	auto	
+quic	googleapis.com|4	1	1795282052	auto	
+quic	ytimg.com|4	1	1795282052	auto	
+quic	ggpht.com|4	1	1795282055	auto	
+quic	youtube.com|4	1	1795282054	auto	
+quic	gvt1.com|4	1	1795282077	auto	
+quic	googleusercontent.com|4	1	1795282055	auto	
+quic	doubleclick.net|4	1	1795282076	auto	
+yt_tcp	ggpht.com|4	1	1795282056	auto	
+yt_tcp	googleapis.com|4	2	1795282058	auto	
+yt_tcp	ytimg.com|4	1	1795282052	auto	
+yt_tcp	youtube.com|4	1	1795281873	auto	

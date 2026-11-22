@@ -1,0 +1,13 @@
+Package: xtables-addons_legacy
+Version: 1.47.1-2
+Depends: libc, libssp, librt, libpthread, iptables
+Provides: xtables-addons_legacy-any
+Source: feeds/oldports/xtables-addons_legacy
+SourceName: xtables-addons_legacy
+Section: net
+SourceDateEpoch: 1350329369
+URL: https://inai.de/projects/xtables-addons/
+Maintainer: Jo-Philipp Wich <jow@openwrt.org>
+Architecture: aarch64-3.10
+Installed-Size: 276480
+Description:  Extensions not distributed in the main Xtables (1.47.1 legacy version)

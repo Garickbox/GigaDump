@@ -1,0 +1,249 @@
+#!/bin/sh
+export PATH=/opt/sbin:/opt/bin:/opt/usr/sbin:/opt/usr/bin:/sbin:/usr/sbin:/bin:/usr/bin
+
+# /opt/etc/init.d/S96z2k-rt-proxy
+#
+# RuTracker access via the official blockme.site HTTPS-CONNECT proxy pool, the
+# same mechanism the official RuTracker browser extension uses — but at the
+# router level. z2k-rt-proxy peeks the TLS SNI of redirected connections and
+# tunnels them through a health-checked, DNS-RESOLVED upstream proxy IP (the
+# operator rotates the pool via ps1.blockme.site DNS; we follow it, no hardcoded
+# IPs). RuTracker is CloudFlare-fronted on shared anycast IPs, so it cannot be
+# selected by IP — we select it by DOMAIN via an ndmc DNS-override onto a private
+# sentinel IP, then iptables-REDIRECT that sentinel to the local proxy.
+#
+# These RuTracker domains MUST be absent from the nfqws2 desync hostlist (the
+# installer drops them) — otherwise nfqws2 would mangle the client ClientHello
+# before it reaches this proxy. Companion NDM hook
+# /opt/etc/ndm/netfilter.d/92-z2k-rt-proxy-redirect.sh re-inserts the REDIRECT
+# after every NDM netfilter regen. Installed by lib/install.sh.
+
+BIN="/opt/sbin/z2k-rt-proxy"
+LOG="/tmp/z2k-log/z2k-rt-proxy.log"
+PIDFILE="/var/run/z2k-rt-proxy.pid"
+LISTEN_PORT="1445"
+# Метка исходящих сокетов моста. Берётся у d2k, если он установлен: его
+# правило `-m mark --mark <метка> -j RETURN` стоит первым в исходящей цепочке и
+# уводит помеченный пакет мимо очереди. Без метки движок обхода видит соединения
+# моста как обычную цель, подсматривает SNI ps1.blockme.site и заводит поиск
+# обхода на СОБСТВЕННЫЙ работающий туннель — трата бюджета зондов и
+# вмешательство в него (поймано 12.09.2026 по журналу d2k).
+#
+# Источник значения — сперва конфигурация d2k, затем умолчание из его же
+# init-скрипта. Своего числа здесь нет намеренно: метка принадлежит ему, и
+# зашитая копия разошлась бы молча, а исключение перестало бы работать.
+# d2k не установлен — метки нет, поведение прежнее.
+D2K_INIT="/opt/etc/init.d/S99d2k"
+SO_MARK=""
+if [ -x "$D2K_INIT" ]; then
+    SO_MARK=$(sed -n 's/^MARK=//p' /opt/d2k/config 2>/dev/null | head -1)
+    [ -n "$SO_MARK" ] || SO_MARK=$(sed -n 's/^MARK=//p' "$D2K_INIT" 2>/dev/null | head -1)
+fi
+# Принимаем и десятичную, и шестнадцатеричную запись: в конфигурации d2k метка
+# записана как 0x2d, и флаг моста разбирает обе (strconv с основанием 0).
+case "$SO_MARK" in
+    0x*|0X*) MARK_ARG="--so-mark=$SO_MARK" ;;
+    ''|*[!0-9]*) MARK_ARG="" ;;
+    *) MARK_ARG="--so-mark=$SO_MARK" ;;
+esac
+
+SENTINEL="10.171.171.171"
+# Exactly the set the OFFICIAL RuTracker extension proxies. Taken from the shipped
+# artifact, not from anyone's description of it: addons.mozilla.org add-on
+# "rutracker-add-on" v0.9.32 (publisher RuTracker), file bundle/background.js:
+#     proxies        = ['HTTPS ps1.blockme.site:443']     <- same upstream as ours
+#     proxiedDomains = [ 'rutracker.org', 'rutracker.wiki',
+#                        'api.rutracker.cc', 'rep.rutracker.cc', 'static.rutracker.cc' ]
+# and its proxyScript.js matches with proxiedDomains.includes(domain) — EXACT, not
+# suffix — so www.* is deliberately not proxied there either.
+#
+# We used to pin two extras, www.rutracker.org and rutracker.cc, and both were
+# measured dead through the proxy (000, four upstreams answering EOF in a row):
+# rutracker.cc has no A record AT ALL upstream, and blockme serves the apex but not
+# www. Pinning a host the upstream cannot serve is strictly worse than not pinning
+# it — the name is hijacked to a sentinel and the request can only fail.
+DOMAINS="rutracker.org rutracker.wiki api.rutracker.cc rep.rutracker.cc static.rutracker.cc"
+
+# Superset for CLEANUP only: every domain z2k has EVER pinned. The clear path must
+# outlive changes to the set above, or the two dropped pins would survive on every
+# already-installed router forever (S96 only unpins what it currently knows).
+DOMAINS_LEGACY="www.rutracker.org rutracker.cc"
+
+# CWE-59: keep /tmp/z2k-log a clean root-owned dir (drop a planted symlink/non-dir).
+if [ -L /tmp/z2k-log ] || { [ -e /tmp/z2k-log ] && [ ! -d /tmp/z2k-log ]; } || \
+   { [ -d /tmp/z2k-log ] && [ "$(ls -ld /tmp/z2k-log 2>/dev/null | awk '{print $3}')" != root ]; }; then
+    rm -rf /tmp/z2k-log 2>/dev/null
+fi
+mkdir -p /tmp/z2k-log 2>/dev/null && chown root /tmp/z2k-log 2>/dev/null
+chmod 700 /tmp/z2k-log 2>/dev/null
+
+# EVERY ndmc call MUST be prefixed with `LD_LIBRARY_PATH=`. Measured on the owner's
+# router (KeenOS 5.01.C.1.0-0, 2026-07-26), not taken on faith from a comment:
+#
+#   LD_LIBRARY_PATH=/opt/lib:/opt/usr/lib  ndmc -c "ip host ..."  -> rc=1, NO record
+#   (unset)                                ndmc -c "ip host ..."  -> rc=0, record created
+#
+# ndmc loads Entware's incompatible OpenSSL and dies with
+# "system failed [0xcffd0062] / Cli::Main: failed to initialize". The live rt-proxy
+# supervisor DOES carry LD_LIBRARY_PATH=/opt/lib:/opt/usr/lib in its environment
+# (checked via /proc/<pid>/environ), so these calls ran in exactly that state.
+#
+# It failed SILENTLY because of the `>/dev/null 2>&1`, and it failed only on SOME
+# invocation paths: at boot rc.unslung sets LD_LIBRARY_PATH="" so the pins got
+# written, while a restart from the scheduler, install.sh, auto-update or an ssh
+# shell inherited /opt/lib and did nothing. The damaging half is the CLEAR path -
+# a failed clear leaves rutracker pinned to the sentinel with no daemon listening,
+# so the site stays dead until someone reboots.
+dns_override_set() {
+    for d in $DOMAINS; do
+        LD_LIBRARY_PATH= ndmc -c "ip host $d $SENTINEL" >/dev/null 2>&1
+    done
+    LD_LIBRARY_PATH= ndmc -c "system configuration save" >/dev/null 2>&1
+}
+
+dns_override_clear() {
+    for d in $DOMAINS $DOMAINS_LEGACY; do
+        LD_LIBRARY_PATH= ndmc -c "no ip host $d $SENTINEL" >/dev/null 2>&1
+    done
+    LD_LIBRARY_PATH= ndmc -c "system configuration save" >/dev/null 2>&1
+}
+
+# xtables-lock-safe iptables, same wrapper as the NDM hooks. WHY IT MATTERS HERE:
+# start() runs at boot alongside NDM's own netfilter regen and z2k's firewall apply, so
+# the lock is genuinely contended. Without -w a losing insert returns EBUSY, and since
+# the result is not checked and stderr is discarded it fails SILENTLY — the sentinel
+# REDIRECT is simply absent and RuTracker is dead. There is no periodic self-heal for
+# this rule (unlike nfqueue/ppe/warp, which the scheduler re-asserts every ~55s); only
+# an NDM netfilter regen would restore it, which on a stable router can be hours away.
+# Keenetic ships iptables 1.4.21, where -w takes NO timeout argument (-w 5 is a parse
+# error), so the wait is unbounded — acceptable: it is a kernel flock released on
+# process death, and the identical bare -w is already on this same start path
+# (deoffload_add), in the NDM hooks and in the ppe layer that fires every 55s. The
+# fallback keeps the old behaviour verbatim on any build without -w.
+ipt() { iptables -w "$@" 2>/dev/null || iptables "$@" 2>/dev/null; }
+
+redirect_add() {
+    ipt -t nat -C PREROUTING -d "$SENTINEL" -p tcp --dport 443 -j REDIRECT --to-port $LISTEN_PORT || \
+        ipt -t nat -I PREROUTING 1 -d "$SENTINEL" -p tcp --dport 443 -j REDIRECT --to-port $LISTEN_PORT
+    ipt -t nat -C OUTPUT -d "$SENTINEL" -p tcp --dport 443 -j REDIRECT --to-port $LISTEN_PORT || \
+        ipt -t nat -I OUTPUT 1 -d "$SENTINEL" -p tcp --dport 443 -j REDIRECT --to-port $LISTEN_PORT
+    deoffload_add
+}
+
+# CRITICAL (Keenetic MediaTek HNAT/PPE): keep the ENTIRE sentinel flow OFF the
+# hardware flow-offload engine. The engine mis-handles DNAT to a fake IP / local
+# port and silently breaks the redirect once the flow accelerates into hardware —
+# RuTracker then hangs for minutes until ANY CPU activity (even an SSH login /
+# reading logs) de-offloads the flow and revives it (documented MT762x HNAT/DNAT
+# bug; whatsapp/ticketmaster use a real VPS IP with no local DNAT so they are
+# unaffected). Unlike the nfqws2 de-offload (`connskip N`, handshake-window only),
+# the rt-proxy DNAT must stay in software for the WHOLE connection — so NO
+# connskip. `-j PPE` (firmware ppe_tg) is silently absent / a no-op on non-PPE
+# routers, so this is harmless everywhere.
+deoffload_add() {
+    ipt -t mangle -C PREROUTING -d "$SENTINEL" -p tcp --dport 443 -j PPE || \
+        ipt -t mangle -I PREROUTING 1 -d "$SENTINEL" -p tcp --dport 443 -j PPE
+}
+
+deoffload_del() {
+    while ipt -t mangle -C PREROUTING -d "$SENTINEL" -p tcp --dport 443 -j PPE; do
+        ipt -t mangle -D PREROUTING -d "$SENTINEL" -p tcp --dport 443 -j PPE || break
+    done
+}
+
+redirect_del() {
+    while ipt -t nat -C PREROUTING -d "$SENTINEL" -p tcp --dport 443 -j REDIRECT --to-port $LISTEN_PORT; do
+        ipt -t nat -D PREROUTING -d "$SENTINEL" -p tcp --dport 443 -j REDIRECT --to-port $LISTEN_PORT || break
+    done
+    while ipt -t nat -C OUTPUT -d "$SENTINEL" -p tcp --dport 443 -j REDIRECT --to-port $LISTEN_PORT; do
+        ipt -t nat -D OUTPUT -d "$SENTINEL" -p tcp --dport 443 -j REDIRECT --to-port $LISTEN_PORT || break
+    done
+    deoffload_del
+}
+
+start() {
+    [ -x "$BIN" ] || exit 0
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat $PIDFILE 2>/dev/null)" 2>/dev/null; then
+        echo "z2k-rt-proxy already running (pid $(cat $PIDFILE))"
+        return 0
+    fi
+    echo "Starting z2k-rt-proxy supervisor on :$LISTEN_PORT..."
+    # SUPERVISOR loop (s6/runit pattern in shell — Entware has no systemd/procd):
+    # the pidfile holds the supervisor, parent of the daemon, respawning it on
+    # exit with capped backoff. trap '' HUP preserves the MIPS busybox SIGHUP fix
+    # (the daemon child inherits the ignored-HUP disposition); trap TERM/INT makes
+    # `stop` kill the daemon child.
+    (
+        trap '' HUP
+        trap 'kill "$child" 2>/dev/null; exit 0' TERM INT
+        backoff=1
+        while :; do
+            t0=$(date +%s 2>/dev/null || echo 0)
+            # GODEBUG=asyncpreemptoff=1: disable Go's SIGURG-based async goroutine
+            # preemption — it crashes the runtime on MIPS/mipsel (soft-float
+            # Keenetics), the same guard S97z2k-http-tunnel / S98tg-tunnel use.
+            GODEBUG=asyncpreemptoff=1 $BIN --listen=:$LISTEN_PORT --timeout=15m $MARK_ARG </dev/null >> "$LOG" 2>&1 &
+            child=$!
+            wait "$child"
+            t1=$(date +%s 2>/dev/null || echo 0)
+            if [ $((t1 - t0)) -ge 60 ]; then
+                backoff=1
+            else
+                backoff=$((backoff * 2)); [ "$backoff" -gt 30 ] && backoff=30
+            fi
+            echo "$(date 2>/dev/null) [supervisor] daemon exited, respawn in ${backoff}s" >> "$LOG"
+            sleep "$backoff"
+        done
+    # ВАЖНО: подоболочка отвязывается от потоков init-скрипта явно.
+    #
+    # NDM запускает /opt/etc/init.d/* по очереди и ЧИТАЕТ вывод каждого до конца
+    # потока — именно так его строки попадают в системный журнал. Фоновый
+    # надзиратель наследует этот поток и держит его открытым всё время жизни, то
+    # есть конца не наступает никогда: NDM ждёт и к следующему скрипту не
+    # переходит.
+    #
+    # Замер на роутере: с голым `) &` читатель висит бесконечно, с явным
+    # отвязыванием поток закрывается за секунду.
+    #
+    # Цена этой строки — вся загрузка. У человека из отчёта 2026-08-05 цепочка
+    # встала на S96z2k-rt-proxy, и веб-панель, http-туннель, планировщик и сам
+    # zapret2 не поднялись вовсе: он ждал двадцать минут и запускал их руками.
+    # S51z2k-warp делал это правильно с самого начала, остальные четыре — нет.
+    ) >/dev/null 2>&1 </dev/null &
+    echo $! > "$PIDFILE"
+    sleep 2
+    dns_override_set
+    redirect_add
+}
+
+stop_proxy() {
+    # Kill ONLY the supervisor/daemon. Deliberately leaves the DNS override and
+    # the REDIRECT in place: a restart must NOT drop the sentinel. If it does,
+    # any client that resolves a rutracker domain during the gap gets the REAL
+    # (CloudFlare) IP and caches it, then bypasses this proxy until that client
+    # cache expires — the "restart breaks RuTracker" bug. The override is
+    # idempotent, so start() re-asserting it over a still-present record opens
+    # no window.
+    if [ -f "$PIDFILE" ]; then
+        pid=$(cat "$PIDFILE" 2>/dev/null)
+        [ -n "$pid" ] && kill "$pid" 2>/dev/null
+        rm -f "$PIDFILE"
+    fi
+}
+
+stop() {
+    # Full teardown — only for real service stop / disable / uninstall.
+    echo "Stopping z2k-rt-proxy..."
+    stop_proxy
+    redirect_del
+    dns_override_clear
+}
+
+case "$1" in
+    start)   start ;;
+    stop)    stop ;;
+    # restart bounces the daemon ONLY; the DNS override + REDIRECT stay up the
+    # whole time, so no window opens for clients to cache the real rutracker IP.
+    restart) stop_proxy; sleep 1; start ;;
+    *)       echo "Usage: $0 {start|stop|restart}" ;;
+esac

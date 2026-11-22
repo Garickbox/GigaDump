@@ -1,0 +1,16 @@
+Package: xz-utils
+Version: 5.8.4-2
+Depends: libc, libssp, librt, libpthread
+Provides: xz-utils-any
+Source: feeds/packages/utils/xz
+SourceName: xz
+License: LGPL-2.1-or-later 0BSD
+LicenseFiles: COPYING
+Section: utils
+SourceDateEpoch: 1788964466
+URL: https://tukaani.org/xz
+CPE-ID: cpe:/a:tukaani:xz
+Maintainer: Alexandru Ardelean <ardeleanalex@gmail.com>
+Architecture: aarch64-3.10
+Installed-Size: 10240
+Description:  XZ Utils (meta)

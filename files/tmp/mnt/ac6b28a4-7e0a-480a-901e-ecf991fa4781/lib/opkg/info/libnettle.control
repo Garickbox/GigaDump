@@ -1,0 +1,15 @@
+Package: libnettle
+Version: 3.10.2-1
+Depends: libc, libssp, librt, libpthread, libgmp
+Provides: libnettle-any
+Source: feeds/base/libs/nettle
+SourceName: nettle
+License: GPL-2.0-or-later
+LicenseFiles: COPYING.LESSERv3 COPYINGv2 COPYINGv3
+Section: libs
+SourceDateEpoch: 1750962543
+URL: https://www.lysator.liu.se/~nisse/nettle/
+CPE-ID: cpe:/a:nettle_project:nettle
+Architecture: aarch64-3.10
+Installed-Size: 645120
+Description:  GNU crypto library

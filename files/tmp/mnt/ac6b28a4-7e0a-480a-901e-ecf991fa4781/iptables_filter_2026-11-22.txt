@@ -1,0 +1,218 @@
+Chain INPUT (policy DROP 46 packets, 4607 bytes)
+ pkts bytes target     prot opt in     out     source               destination         
+ 1593  505K _NDM_MULTICAST_INPUT  udp  --  *      *       0.0.0.0/0            224.0.0.0/4         
+  315 10368 ACCEPT     2    --  *      *       0.0.0.0/0            0.0.0.0/0           
+91615   61M _NDM_ACL_IN_EXCEPTIONS  all  --  *      *       0.0.0.0/0            0.0.0.0/0           
+84888   60M ACCEPT     all  --  *      *       0.0.0.0/0            0.0.0.0/0            state RELATED,ESTABLISHED
+  195 15484 ACCEPT     all  --  lo     *       0.0.0.0/0            0.0.0.0/0           
+ 6269  487K _NDM_BFD_INPUT  all  --  *      *       0.0.0.0/0            0.0.0.0/0           
+ 6269  487K _NDM_ACL_IN  all  --  *      *       0.0.0.0/0            0.0.0.0/0           
+ 6269  487K _NDM_IPSEC_INPUT_FILTER  all  --  *      *       0.0.0.0/0            0.0.0.0/0           
+ 6269  487K _NDM_TUNNELS_INPUT  all  --  *      *       0.0.0.0/0            0.0.0.0/0           
+    2    80 DROP       all  --  *      *       0.0.0.0/0            0.0.0.0/0            state INVALID
+  277 16620 ACCEPT     all  --  *      *       0.0.0.0/0            0.0.0.0/0            ctstate DNAT
+ 5990  471K _NDM_INPUT  all  --  *      *       0.0.0.0/0            0.0.0.0/0           
+ 1059  104K _NDM_SL_PRIVATE  all  --  *      *       0.0.0.0/0            0.0.0.0/0           
+
+Chain FORWARD (policy DROP 0 packets, 0 bytes)
+ pkts bytes target     prot opt in     out     source               destination         
+  672  576K ACCEPT     all  --  tailscale0 *       0.0.0.0/0            0.0.0.0/0           
+    0     0 _NDM_MULTICAST_INPUT  udp  --  *      *       0.0.0.0/0            224.0.0.0/4         
+ 300K  133M ACCEPT     all  --  *      *       0.0.0.0/0            0.0.0.0/0            state RELATED,ESTABLISHED
+16265 4084K _NDM_ACL_IN  all  --  *      *       0.0.0.0/0            0.0.0.0/0           
+16265 4084K _NDM_ACL_OUT  all  --  *      *       0.0.0.0/0            0.0.0.0/0           
+16265 4084K _NDM_IPSEC_FORWARD  all  --  *      *       0.0.0.0/0            0.0.0.0/0           
+16265 4084K _NDM_VPN_FORWARD  all  --  *      *       0.0.0.0/0            0.0.0.0/0           
+16265 4084K _NDM_FORWARD  all  --  *      *       0.0.0.0/0            0.0.0.0/0           
+  494 25136 DROP       all  --  *      *       0.0.0.0/0            0.0.0.0/0            state INVALID
+    0     0 ACCEPT     all  --  *      *       0.0.0.0/0            0.0.0.0/0            ctstate DNAT
+15771 4059K _NDM_SL_FORWARD  all  --  *      *       0.0.0.0/0            0.0.0.0/0           
+    0     0 ACCEPT     all  --  lo     *       0.0.0.0/0            0.0.0.0/0           
+    0     0 ACCEPT     all  --  br0    br0     0.0.0.0/0            0.0.0.0/0           
+
+Chain OUTPUT (policy ACCEPT 11097 packets, 5141K bytes)
+ pkts bytes target     prot opt in     out     source               destination         
+ 141K  106M _NDM_BFD_OUTPUT  all  --  *      *       0.0.0.0/0            0.0.0.0/0           
+ 141K  106M _NDM_ACL_OUT  all  --  *      *       0.0.0.0/0            0.0.0.0/0           
+ 141K  106M _NDM_IPSEC_OUTPUT_FILTER  all  --  *      *       0.0.0.0/0            0.0.0.0/0           
+ 141K  106M _NDM_OUTPUT  all  --  *      *       0.0.0.0/0            0.0.0.0/0           
+
+Chain CLOUD_UDP_SERVICE_NF_CHAIN_ (1 references)
+ pkts bytes target     prot opt in     out     source               destination         
+    0     0 ACCEPT     udp  --  *      *       31.135.14.238        10.16.20.23          udp spt:4044 dpt:4043
+
+Chain COALAGENT_NF_CHAIN_ (1 references)
+ pkts bytes target     prot opt in     out     source               destination         
+  263 15517 ACCEPT     udp  --  *      *       0.0.0.0/0            0.0.0.0/0            udp dpt:57363
+
+Chain Http_IN (1 references)
+ pkts bytes target     prot opt in     out     source               destination         
+    0     0 DROP       tcp  --  *      *       0.0.0.0/0            0.0.0.0/0            tcp dpt:80 match-set _NDM_BFD_Http4 src return-nomatch ! update-counters ! update-subcounters
+    0     0 DROP       tcp  --  *      *       0.0.0.0/0            0.0.0.0/0            tcp dpt:443 match-set _NDM_BFD_Http4 src return-nomatch ! update-counters ! update-subcounters
+
+Chain Http_OUT (1 references)
+ pkts bytes target     prot opt in     out     source               destination         
+    0     0 DROP       tcp  --  *      *       0.0.0.0/0            0.0.0.0/0            tcp spt:80 match-set _NDM_BFD_Http4 dst return-nomatch ! update-counters ! update-subcounters
+    0     0 DROP       tcp  --  *      *       0.0.0.0/0            0.0.0.0/0            tcp spt:443 match-set _NDM_BFD_Http4 dst return-nomatch ! update-counters ! update-subcounters
+
+Chain NDM_FORWARD_ACL (0 references)
+ pkts bytes target     prot opt in     out     source               destination         
+
+Chain SSH_IN (1 references)
+ pkts bytes target     prot opt in     out     source               destination         
+    0     0 DROP       tcp  --  *      *       0.0.0.0/0            0.0.0.0/0            tcp dpt:22 match-set _NDM_BFD_SSH4 src return-nomatch ! update-counters ! update-subcounters
+
+Chain SSH_OUT (1 references)
+ pkts bytes target     prot opt in     out     source               destination         
+    0     0 DROP       tcp  --  *      *       0.0.0.0/0            0.0.0.0/0            tcp spt:22 match-set _NDM_BFD_SSH4 dst return-nomatch ! update-counters ! update-subcounters
+
+Chain Telnet_IN (1 references)
+ pkts bytes target     prot opt in     out     source               destination         
+    0     0 DROP       tcp  --  *      *       0.0.0.0/0            0.0.0.0/0            tcp dpt:23 match-set _NDM_BFD_Telnet4 src return-nomatch ! update-counters ! update-subcounters
+
+Chain Telnet_OUT (1 references)
+ pkts bytes target     prot opt in     out     source               destination         
+    0     0 DROP       tcp  --  *      *       0.0.0.0/0            0.0.0.0/0            tcp spt:23 match-set _NDM_BFD_Telnet4 dst return-nomatch ! update-counters ! update-subcounters
+
+Chain _NDM_ACL_IN (2 references)
+ pkts bytes target     prot opt in     out     source               destination         
+
+Chain _NDM_ACL_IN_EXCEPTIONS (1 references)
+ pkts bytes target     prot opt in     out     source               destination         
+91615   61M COALAGENT_NF_CHAIN_  all  --  *      *       0.0.0.0/0            0.0.0.0/0           
+91352   61M CLOUD_UDP_SERVICE_NF_CHAIN_  all  --  *      *       0.0.0.0/0            0.0.0.0/0           
+
+Chain _NDM_ACL_OUT (2 references)
+ pkts bytes target     prot opt in     out     source               destination         
+
+Chain _NDM_BFD_INPUT (1 references)
+ pkts bytes target     prot opt in     out     source               destination         
+ 6269  487K Telnet_IN  all  --  *      *       0.0.0.0/0            0.0.0.0/0           
+ 6269  487K Http_IN    all  --  *      *       0.0.0.0/0            0.0.0.0/0           
+ 6269  487K SSH_IN     all  --  *      *       0.0.0.0/0            0.0.0.0/0           
+
+Chain _NDM_BFD_OUTPUT (1 references)
+ pkts bytes target     prot opt in     out     source               destination         
+ 141K  106M Telnet_OUT  all  --  *      *       0.0.0.0/0            0.0.0.0/0           
+ 141K  106M Http_OUT   all  --  *      *       0.0.0.0/0            0.0.0.0/0           
+ 141K  106M SSH_OUT    all  --  *      *       0.0.0.0/0            0.0.0.0/0           
+
+Chain _NDM_FORWARD (1 references)
+ pkts bytes target     prot opt in     out     source               destination         
+16265 4084K _NDM_HOTSPOT_FWD  all  --  *      *       0.0.0.0/0            0.0.0.0/0           
+16265 4084K _NDM_UPNP_FORWARD_SYS  all  --  *      *       0.0.0.0/0            0.0.0.0/0            ndmmark match 0x0/0x8
+
+Chain _NDM_HOTSPOT_FWD (1 references)
+ pkts bytes target     prot opt in     out     source               destination         
+    0     0 RETURN     all  --  *      *       0.0.0.0/0            0.0.0.0/0            slin ! 3 (public) slout ! 3 (public)
+    0     0 RETURN     all  --  *      *       0.0.0.0/0            0.0.0.0/0            MAC 22:58:9A:56:1E:E2
+    0     0 RETURN     all  --  ra14   *       0.0.0.0/0            0.0.0.0/0           
+    0     0 RETURN     all  --  ra1    *       0.0.0.0/0            0.0.0.0/0           
+    0     0 RETURN     all  --  ra6    *       0.0.0.0/0            0.0.0.0/0           
+    0     0 RETURN     all  --  ra12   *       0.0.0.0/0            0.0.0.0/0           
+    0     0 RETURN     all  --  ra10   *       0.0.0.0/0            0.0.0.0/0           
+    0     0 RETURN     all  --  ra5    *       0.0.0.0/0            0.0.0.0/0           
+    0     0 RETURN     all  --  ra0    *       0.0.0.0/0            0.0.0.0/0           
+    0     0 RETURN     all  --  ra2    *       0.0.0.0/0            0.0.0.0/0           
+    0     0 RETURN     all  --  ra4    *       0.0.0.0/0            0.0.0.0/0           
+    0     0 RETURN     all  --  ra13   *       0.0.0.0/0            0.0.0.0/0           
+    0     0 RETURN     all  --  ra11   *       0.0.0.0/0            0.0.0.0/0           
+    0     0 RETURN     all  --  ra8    *       0.0.0.0/0            0.0.0.0/0           
+    0     0 RETURN     all  --  ra9    *       0.0.0.0/0            0.0.0.0/0           
+    0     0 RETURN     all  --  ra3    *       0.0.0.0/0            0.0.0.0/0           
+16005 4060K RETURN     all  --  br0    *       0.0.0.0/0            0.0.0.0/0           
+    0     0 RETURN     all  --  br1    *       0.0.0.0/0            0.0.0.0/0           
+    0     0 RETURN     all  --  *      *       0.0.0.0/0            0.0.0.0/0            MAC 24:D3:37:DD:A4:2E
+    0     0 RETURN     all  --  *      *       0.0.0.0/0            0.0.0.0/0            MAC 84:9E:56:7A:F1:9D
+    0     0 RETURN     all  --  *      *       0.0.0.0/0            0.0.0.0/0            MAC EC:9C:32:5E:3B:C2
+
+Chain _NDM_INPUT (1 references)
+ pkts bytes target     prot opt in     out     source               destination         
+  103 31398 ACCEPT     udp  --  *      *       0.0.0.0/0            0.0.0.0/0            udp spt:67 dpt:68
+   22  7365 _NDM_SL_PROTECT  udp  --  *      *       0.0.0.0/0            0.0.0.0/0            udp spts:67:68 dpts:67:68
+    0     0 _NDM_IP_PUBLIC  all  --  eth3   *       0.0.0.0/0            0.0.0.0/0            match-set _NDM_I4AL_eth3 dst slin 3 (public)
+    0     0 _NDM_IP_PRIVATE  all  --  ra14   *       0.0.0.0/0            0.0.0.0/0            match-set _NDM_I4AL_ra14 dst slin 1 (private)
+    0     0 _NDM_IP_PRIVATE  all  --  ra6    *       0.0.0.0/0            0.0.0.0/0            match-set _NDM_I4AL_ra6 dst slin 1 (private)
+    0     0 _NDM_IP_PRIVATE  all  --  ra12   *       0.0.0.0/0            0.0.0.0/0            match-set _NDM_I4AL_ra12 dst slin 1 (private)
+    0     0 _NDM_IP_PRIVATE  all  --  ra5    *       0.0.0.0/0            0.0.0.0/0            match-set _NDM_I4AL_ra5 dst slin 1 (private)
+    0     0 _NDM_IP_PRIVATE  all  --  ra4    *       0.0.0.0/0            0.0.0.0/0            match-set _NDM_I4AL_ra4 dst slin 1 (private)
+    0     0 _NDM_IP_PRIVATE  all  --  ra13   *       0.0.0.0/0            0.0.0.0/0            match-set _NDM_I4AL_ra13 dst slin 1 (private)
+    0     0 _NDM_IP_PRIVATE  all  --  ra11   *       0.0.0.0/0            0.0.0.0/0            match-set _NDM_I4AL_ra11 dst slin 1 (private)
+    0     0 _NDM_IP_PRIVATE  all  --  ra3    *       0.0.0.0/0            0.0.0.0/0            match-set _NDM_I4AL_ra3 dst slin 1 (private)
+    0     0 _NDM_IP_PUBLIC  all  --  apcli0 *       0.0.0.0/0            0.0.0.0/0            match-set _NDM_I4AL_apcli0 dst slin 3 (public)
+    0     0 _NDM_IP_PUBLIC  all  --  apcli1 *       0.0.0.0/0            0.0.0.0/0            match-set _NDM_I4AL_apcli1 dst slin 3 (public)
+    0     0 _NDM_SL_PROTECT  tcp  --  *      *       0.0.0.0/0            0.0.0.0/0            tcp dpt:3517
+  150 10040 _NDM_SL_PROTECT  udp  --  *      *       0.0.0.0/0            0.0.0.0/0            udp dpt:3517
+  129  9804 _NDM_SL_PROTECT  udp  --  *      *       0.0.0.0/0            0.0.0.0/0            udp dpt:3518
+ 4657  316K _NDM_IP_PRIVATE  all  --  br0    *       0.0.0.0/0            0.0.0.0/0            match-set _NDM_I4AL_br0 dst slin 1 (private)
+    0     0 _NDM_IP_PROTECT  all  --  br1    *       0.0.0.0/0            0.0.0.0/0            match-set _NDM_I4AL_br1 dst slin 2 (protected)
+
+Chain _NDM_IPSEC_FORWARD (1 references)
+ pkts bytes target     prot opt in     out     source               destination         
+
+Chain _NDM_IPSEC_INPUT_FILTER (1 references)
+ pkts bytes target     prot opt in     out     source               destination         
+
+Chain _NDM_IPSEC_INPUT_FLT_BPS (0 references)
+ pkts bytes target     prot opt in     out     source               destination         
+
+Chain _NDM_IPSEC_OUTPUT_FILTER (1 references)
+ pkts bytes target     prot opt in     out     source               destination         
+
+Chain _NDM_IPSEC_OUTPUT_FLT_BPS (0 references)
+ pkts bytes target     prot opt in     out     source               destination         
+
+Chain _NDM_IP_PRIVATE (9 references)
+ pkts bytes target     prot opt in     out     source               destination         
+ 4657  316K _NDM_IP_PROTECT  all  --  *      *       0.0.0.0/0            0.0.0.0/0           
+
+Chain _NDM_IP_PROTECT (2 references)
+ pkts bytes target     prot opt in     out     source               destination         
+ 4657  316K _NDM_IP_PUBLIC  all  --  *      *       0.0.0.0/0            0.0.0.0/0           
+ 4527  308K _NDM_SL_PROTECT  udp  --  *      *       0.0.0.0/0            0.0.0.0/0            udp dpt:53
+    0     0 _NDM_SL_PROTECT  tcp  --  *      *       0.0.0.0/0            0.0.0.0/0            tcp dpt:53
+
+Chain _NDM_IP_PUBLIC (4 references)
+ pkts bytes target     prot opt in     out     source               destination         
+
+Chain _NDM_MULTICAST_INPUT (2 references)
+ pkts bytes target     prot opt in     out     source               destination         
+ 1593  505K ACCEPT     all  --  *      *       0.0.0.0/0            0.0.0.0/0           
+
+Chain _NDM_OUTPUT (1 references)
+ pkts bytes target     prot opt in     out     source               destination         
+
+Chain _NDM_SL_FORWARD (1 references)
+ pkts bytes target     prot opt in     out     source               destination         
+15771 4059K _NDM_SL_PROTECT  all  --  *      eth3    0.0.0.0/0            0.0.0.0/0            state NEW
+    0     0 _NDM_SL_PROTECT  all  --  *      apcli0  0.0.0.0/0            0.0.0.0/0            state NEW
+    0     0 _NDM_SL_PROTECT  all  --  *      apcli1  0.0.0.0/0            0.0.0.0/0            state NEW
+
+Chain _NDM_SL_PRIVATE (2 references)
+ pkts bytes target     prot opt in     out     source               destination         
+    0     0 ACCEPT     all  --  ra14   *       0.0.0.0/0            0.0.0.0/0            state NEW
+    0     0 ACCEPT     all  --  ra6    *       0.0.0.0/0            0.0.0.0/0            state NEW
+    0     0 ACCEPT     all  --  ra12   *       0.0.0.0/0            0.0.0.0/0            state NEW
+    0     0 ACCEPT     all  --  ra5    *       0.0.0.0/0            0.0.0.0/0            state NEW
+    0     0 ACCEPT     all  --  ra4    *       0.0.0.0/0            0.0.0.0/0            state NEW
+    0     0 ACCEPT     all  --  ra13   *       0.0.0.0/0            0.0.0.0/0            state NEW
+    0     0 ACCEPT     all  --  ra11   *       0.0.0.0/0            0.0.0.0/0            state NEW
+    0     0 ACCEPT     all  --  ra3    *       0.0.0.0/0            0.0.0.0/0            state NEW
+20561 4389K ACCEPT     all  --  br0    *       0.0.0.0/0            0.0.0.0/0            state NEW
+
+Chain _NDM_SL_PROTECT (9 references)
+ pkts bytes target     prot opt in     out     source               destination         
+20599 4394K _NDM_SL_PRIVATE  all  --  *      *       0.0.0.0/0            0.0.0.0/0           
+    0     0 ACCEPT     all  --  br1    *       0.0.0.0/0            0.0.0.0/0            state NEW
+
+Chain _NDM_TUNNELS_INPUT (1 references)
+ pkts bytes target     prot opt in     out     source               destination         
+    0     0 ACCEPT     esp  --  *      *       0.0.0.0/0            0.0.0.0/0           
+    0     0 ACCEPT     47   --  *      *       0.0.0.0/0            0.0.0.0/0           
+    0     0 ACCEPT     4    --  *      *       0.0.0.0/0            0.0.0.0/0           
+
+Chain _NDM_UPNP_FORWARD_SYS (1 references)
+ pkts bytes target     prot opt in     out     source               destination         
+
+Chain _NDM_VPN_FORWARD (1 references)
+ pkts bytes target     prot opt in     out     source               destination         

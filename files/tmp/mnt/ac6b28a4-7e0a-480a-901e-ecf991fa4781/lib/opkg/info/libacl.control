@@ -1,0 +1,17 @@
+Package: libacl
+Version: 2.4.0-1
+Depends: libc, libssp, librt, libpthread
+Provides: libacl-any
+Source: feeds/packages/utils/acl
+SourceName: acl
+License: LGPL-2.1 GPL-2.0
+LicenseFiles: doc/COPYING doc/COPYING.LGPL
+Section: libs
+SourceDateEpoch: 1782731097
+URL: https://savannah.nongnu.org/projects/acl
+CPE-ID: cpe:/a:acl_project:acl
+Maintainer: Maxim Storchak <m.storchak@gmail.com>
+Architecture: aarch64-3.10
+Installed-Size: 51200
+Description:  Access control list support
+ This package provides libacl

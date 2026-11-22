@@ -1,0 +1,13 @@
+Package: ca-bundle
+Version: 20260816-2
+Depends: libc, libssp, librt, libpthread
+Provides: ca-bundle-any, ca-certs, ca-certificates-any
+Source: feeds/base/system/ca-certificates
+SourceName: ca-certificates
+License: GPL-2.0-or-later MPL-2.0
+LicenseFiles: debian/copyright
+Section: base
+SourceDateEpoch: 1786914276
+Architecture: all
+Installed-Size: 194560
+Description:  System CA certificates as a bundle

@@ -1,0 +1,20 @@
+Package: unzip
+Version: 6.0-9
+Depends: libc, libssp, librt, libpthread
+Provides: unzip-any
+Alternatives: 300:/opt/bin/unzip:/opt/libexec/unzip
+Source: feeds/packages/utils/unzip
+SourceName: unzip
+License: BSD-4-Clause
+LicenseFiles: LICENSE
+Section: utils
+SourceDateEpoch: 1240192822
+URL: https://infozip.sourceforge.net/UnZip.html
+CPE-ID: cpe:/a:info-zip:unzip
+Maintainer: Álvaro Fernández Rojas <noltari@gmail.com>
+Architecture: aarch64-3.10
+Installed-Size: 266240
+Description:  InfoZIP's unzip program. With the exception of multi-volume archives
+ (ie, .ZIP files that are split across several disks using PKZIP's /& option),
+ this can handle any file produced either by PKZIP, or the corresponding
+ InfoZIP zip program.

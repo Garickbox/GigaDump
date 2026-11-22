@@ -1,0 +1,13 @@
+Package: zoneinfo-asia
+Version: 2026e-1
+Depends: libc, libssp, librt, libpthread, zoneinfo-core
+Provides: zoneinfo-asia-any
+Source: feeds/packages/utils/zoneinfo
+SourceName: zoneinfo
+License: Unlicense
+Section: utils
+SourceDateEpoch: 1793980901
+Maintainer: Vladimir Ulrich <admin@evl.su>
+Architecture: aarch64-3.10
+Installed-Size: 174080
+Description:  Zone Information (Asia)

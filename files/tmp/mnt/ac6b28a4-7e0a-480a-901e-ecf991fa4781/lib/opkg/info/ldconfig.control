@@ -1,0 +1,13 @@
+Package: ldconfig
+Version: 2.27-12
+Provides: ldconfig-any
+Source: feeds/base/libs/toolchain
+SourceName: toolchain
+License: GPL-3.0-with-GCC-exception
+Section: utils
+SourceDateEpoch: 1793487135
+URL: http://www.gnu.org/software/libc/
+Maintainer: Felix Fietkau <nbd@nbd.name>
+Architecture: aarch64-3.10
+Installed-Size: 573440
+Description:  Shared library path configuration

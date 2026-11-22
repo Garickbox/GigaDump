@@ -1,0 +1,16 @@
+Package: libpcre2
+Version: 10.49-2
+Depends: libc, libssp, librt, libpthread
+Provides: libpcre2-any
+Source: feeds/base/libs/pcre2
+SourceName: pcre2
+License: BSD-3-Clause
+LicenseFiles: LICENCE.md
+Section: libs
+SourceDateEpoch: 1790596947
+URL: https://www.pcre.org/
+CPE-ID: cpe:/a:pcre:pcre2
+Maintainer: Shane Peelar <lookatyouhacker@gmail.com>
+Architecture: aarch64-3.10
+Installed-Size: 624640
+Description:  A Perl Compatible Regular Expression library

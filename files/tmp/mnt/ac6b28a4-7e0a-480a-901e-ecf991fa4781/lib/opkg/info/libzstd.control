@@ -1,0 +1,17 @@
+Package: libzstd
+Version: 1.5.7-1
+Depends: libc, libssp, librt, libpthread
+Provides: libzstd-any
+Source: feeds/packages/utils/zstd
+SourceName: zstd
+License: GPL-2.0-or-later
+LicenseFiles: COPYING
+Section: libs
+SourceDateEpoch: 1739923464
+URL: https://github.com/facebook/zstd
+CPE-ID: cpe:/a:facebook:zstandard
+Maintainer: Alexandru Ardelean <ardeleanalex@gmail.com>
+Architecture: aarch64-3.10
+Installed-Size: 665600
+Description:  Zstandard - Fast real-time compression algorithm.
+ This package provides libzstd library.

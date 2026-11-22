@@ -1,0 +1,17 @@
+Package: xz
+Version: 5.8.4-2
+Depends: libc, libssp, librt, libpthread, xz-utils, liblzma
+Provides: xz-any
+Alternatives: 300:/opt/bin/xz:/opt/libexec/xz-lzmautils, 300:/opt/bin/lzcat:/opt/libexec/xz-lzmautils, 300:/opt/bin/lzma:/opt/libexec/xz-lzmautils, 300:/opt/bin/unlzma:/opt/libexec/xz-lzmautils, 300:/opt/bin/unxz:/opt/libexec/xz-lzmautils, 300:/opt/bin/xzcat:/opt/libexec/xz-lzmautils
+Source: feeds/packages/utils/xz
+SourceName: xz
+License: LGPL-2.1-or-later 0BSD
+LicenseFiles: COPYING
+Section: utils
+SourceDateEpoch: 1788964466
+URL: https://tukaani.org/xz
+CPE-ID: cpe:/a:tukaani:xz
+Maintainer: Alexandru Ardelean <ardeleanalex@gmail.com>
+Architecture: aarch64-3.10
+Installed-Size: 92160
+Description:  Contains: xz  lzcat lzma unlzma unxz xzcat

@@ -1,0 +1,1029 @@
+#!/bin/sh
+# z2k-update-lists.sh - Автоматическое обновление списков доменов
+# Предназначен для вызова из cron: 0 4 * * * sh /opt/zapret2/z2k-update-lists.sh
+#
+# При обнаружении изменений автоматически перезапускает сервис.
+
+# Cron on Entware ships PATH=/usr/bin:/bin only — awk/grep/curl/sed/etc.
+# live in /opt/bin and /opt/sbin. Without this export the entire script
+# silently dies on the first `awk` call (see reference_cron_path_entware).
+export PATH=/opt/sbin:/opt/bin:/sbin:/usr/sbin:/bin:/usr/bin
+
+ZAPRET2_DIR="/opt/zapret2"
+INIT_SCRIPT="/opt/etc/init.d/S99zapret2"
+LOG_FILE="${ZAPRET2_DIR}/update-lists.log"
+MAX_LOG_LINES=200
+
+# GITHUB_RAW is resolved in this order:
+#   1. Explicit env var (useful for manual overrides and testing)
+#   2. Z2K_GITHUB_RAW from /opt/zapret2/config (persisted at install time)
+#   3. master branch default
+# This means clean installs from a non-master branch (e.g. z2k-enhanced
+# during feature testing) continue pulling domain lists from the SAME
+# branch via cron, instead of silently drifting back to master.
+if [ -z "${GITHUB_RAW:-}" ] && [ -r "${ZAPRET2_DIR}/config" ]; then
+    _persisted_raw=$(grep '^Z2K_GITHUB_RAW=' "${ZAPRET2_DIR}/config" 2>/dev/null | head -1 | cut -d= -f2- | sed 's/^"//;s/"$//')
+    [ -n "$_persisted_raw" ] && GITHUB_RAW="$_persisted_raw"
+fi
+GITHUB_RAW="${GITHUB_RAW:-https://raw.githubusercontent.com/necronicle/z2k/z2k-enhanced}"
+
+# VPS SNI-passthrough egress для GitHub — см. z2k.sh для полного docstring.
+# RU блокирует Fastly anycast github; VPS форвардит github-хосты на реальный
+# backend с сертом github → `--resolve <host>:443:<VPS>` качает по валидному TLS.
+Z2K_VPS_GH_IP="${Z2K_VPS_GH_IP:-85.192.60.175}"
+
+# Бюджет коннекта Layer 0 и число попыток.
+#
+# Замер 2026-08-21 на живом роутере: здоровый коннект к нашему VPS — 0.075 с
+# TCP, 0.185 с вместе с TLS. При этом 13-17% попыток не устанавливаются вовсе:
+# SYN до VPS доходит, VPS отвечает SYN-ACK через 14 мкс, обратный пакет
+# теряется, а повторные SYN до VPS уже не долетают. Со --connect-timeout 10
+# каждый такой случай стоил полные 10.5 с — за одну установку 10 штук, то есть
+# 105 с из 405.
+#
+# curl(1) про --connect-timeout: "The connection phase is considered complete
+# when the DNS lookup and requested TCP, TLS or QUIC handshakes are done", то
+# есть бюджет покрывает и TLS — меряем против 0.185 с, а не против 0.075 с.
+# 3 с = 16-кратный запас к измеренному.
+#
+# Вторая попытка, а не просто короткий таймаут: Layer 0 существует ради тех, у
+# кого прямой github закрыт, и бросать основной путь из-за одного потерянного
+# пакета нельзя. Потеря SYN-ACK — событие независимое, повтор стоит 0.27 с.
+Z2K_FETCH_VPS_CONNECT_TIMEOUT="${Z2K_FETCH_VPS_CONNECT_TIMEOUT:-8}"
+Z2K_FETCH_VPS_TRIES="${Z2K_FETCH_VPS_TRIES:-2}"
+
+# z2k_host_jitter — дословная копия из lib/utils.sh (см. развёрнутый комментарий
+# там: почему нельзя звать отсутствующий на Entware cksum и почему ни один
+# запасной путь не должен возвращать 0 всем роутерам сразу). Подключить
+# lib/utils.sh здесь нельзя: скрипт вызывается из cron автономно и не сорсит
+# модули установщика (см. шапку файла и блок z2k shared shell helpers ниже).
+# Равенство обеих копий стережёт tests/test_update_jitter.sh.
+if ! command -v z2k_host_jitter >/dev/null 2>&1; then
+    z2k_host_jitter() {
+        local max="${1:-3600}" host hex j
+        case "$max" in ''|*[!0-9]*) max=3600 ;; esac
+        [ "$max" -gt 0 ] || max=3600
+        host=$(hostname 2>/dev/null)
+        [ -n "$host" ] || host=$(cat /proc/sys/kernel/hostname 2>/dev/null)
+        host="${host}$(cat /sys/class/net/*/address 2>/dev/null | head -1)"
+        hex=""
+        if command -v md5sum >/dev/null 2>&1; then
+            hex=$(printf '%s' "$host" | md5sum 2>/dev/null | cut -c1-6)
+        fi
+        case "$hex" in
+            [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+            *) hex="" ;;
+        esac
+        if [ -z "$hex" ] && command -v sha256sum >/dev/null 2>&1; then
+            hex=$(printf '%s' "$host" | sha256sum 2>/dev/null | cut -c1-6)
+            case "$hex" in
+                [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+                *) hex="" ;;
+            esac
+        fi
+        j=""
+        [ -n "$hex" ] && j=$(( 0x$hex % max )) 2>/dev/null
+        case "$j" in
+            ''|*[!0-9]*) j=$(( ($$ + $(date +%s 2>/dev/null || echo 1)) % max )) ;;
+        esac
+        echo "$j"
+    }
+fi
+
+_z2k_vps_gh_resolve() {
+    [ -n "${Z2K_VPS_GH_IP:-}" ] || return 0
+    # Извлечь реальный host (между :// и первым /), чтобы жадный glob не
+    # матчил github-хост В ПУТИ (напр. gh-proxy.com/https://raw.github...).
+    local _h="${1#*://}"; _h="${_h%%/*}"; _h="${_h%%:*}"
+    case "$_h" in
+        *.githubusercontent.com|github.com|*.github.com) ;;
+        *) return 0 ;;
+    esac
+    local h
+    for h in raw.githubusercontent.com objects.githubusercontent.com \
+             release-assets.githubusercontent.com gist.githubusercontent.com \
+             github.com codeload.github.com api.github.com; do
+        printf ' --resolve %s:443:%s' "$h" "$Z2K_VPS_GH_IP"
+    done
+}
+
+# --- z2k shared shell helpers (canonical; keep byte-identical in all 4 copies) ---
+#
+# КОПИИ, А НЕ ОБЩИЙ ФАЙЛ — по той же причине, что и у _z2k_curl_etag: z2k.sh
+# качается через `curl | sh` тогда, когда lib/utils.sh в системе ещё нет, а
+# files/z2k-update-lists.sh и files/z2k-geosite.sh запускаются из cron
+# самостоятельными скриптами и utils.sh не сорсят вовсе. Забор с этим же
+# словарём стоит вокруг awk-фильтра адресов в files/z2k-warp.sh — держим блок
+# байт в байт, расхождение стережёт тест.
+
+# z2k_uint ЗНАЧЕНИЕ ДЕФОЛТ [МИН] [МАКС] — печатает целое, годное для `test`.
+#
+# Ручки приходят из окружения (cron, install.sh, рука человека), и мусор в них
+# стоил целого слоя: Z2K_FETCH_VPS_TRIES=abc роняло `test` с «Illegal number» —
+# цикл не исполнялся ни разу; Z2K_FETCH_VPS_CONNECT_TIMEOUT="3s" заставляло curl
+# выйти с rc=2 и не напечатать ничего. В обоих случаях Layer 0 молча выключался
+# на весь прогон, а в поток установки сыпалась ошибка.
+#
+# Не-число заменяем дефолтом, а выход за границы ЗАЖИМАЕМ, а не сбрасываем в
+# дефолт: потолок обязан оставаться потолком, иначе TRIES=100000 вернулся бы к
+# двум попыткам вместо обещанных пяти. Ноль уезжает в пол по той же логике:
+# --connect-timeout 0 у curl означает «без ограничения вовсе».
+z2k_uint() {
+    local _zu_v="$1"
+    case "$_zu_v" in ''|*[!0-9]*) _zu_v="$2" ;; esac
+    if [ -n "${3:-}" ] && [ "$_zu_v" -lt "$3" ]; then _zu_v="$3"; fi
+    if [ -n "${4:-}" ] && [ "$_zu_v" -gt "$4" ]; then _zu_v="$4"; fi
+    printf '%s' "$_zu_v"
+}
+
+# z2k_connfail КОД_ВОЗВРАТА_CURL КОД_ОТВЕТА — истина, если запрос умер в ФАЗЕ
+# СОЕДИНЕНИЯ, то есть от сервера не пришло ничего. Только такой отказ имеет
+# смысл повторять: потерянный пакет рукопожатия — событие независимое.
+#
+# Раньше гейт повтора смотрел на %{time_connect}, и это ловило меньше, чем
+# обещало: time_connect считает ОДИН TCP-хендшейк, а --connect-timeout по
+# curl(1) ограничивает DNS+TCP+TLS целиком. Замер: коннект в чёрную дыру даёт
+# tc=0.000000 (повтор), а «TCP встал, TLS не ответил» — tc=0.032246, то есть
+# уходило в break, хотя это ровно тот же класс отказа, ради которого повтор и
+# заводился.
+#
+# Считаем по коду возврата curl В СВЯЗКЕ с кодом ответа: 6 (DNS), 7 (connect
+# refused), 28 (timeout), 35 (TLS) при пустом или 000 ответе означают, что
+# ответа не было. Тот же rc=28, но с кодом ответа 200 — это упор в --max-time
+# на УЖЕ идущей передаче, и повторять его нельзя: повтор просто удваивает цену
+# отказа. 5xx, 404, пустое тело и промах sha-гейта — тем более.
+z2k_connfail() {
+    case "$1" in
+        6|7|28|35) ;;
+        *) return 1 ;;
+    esac
+    case "$2" in
+        ''|000) return 0 ;;
+    esac
+    return 1
+}
+# --- end z2k shared shell helpers ---
+
+# ==============================================================================
+# z2k_fetch — загрузка файла с GitHub через цепочку зеркал.
+# ==============================================================================
+# Дублирует логику z2k.sh / lib/utils.sh для standalone cron-запуска (этот
+# скрипт не source'ит utils.sh). Слои: raw.github → jsdelivr → gh-proxy →
+# Четвёртого слоя (ndmc) больше нет — см. комментарий в теле функции.
+_z2k_curl_etag() {
+    local url="$1" dest="$2" resolve_args="$3" conn_to="${4:-10}"
+    local etag_file="${dest}.etag"
+    local hdr_file="${dest}.hdr.$$"
+    local tmp_body="${dest}.new.$$"
+    local old_etag="" http_status curl_rc
+    if [ -f "$etag_file" ] && [ -s "$dest" ]; then
+        old_etag=$(cat "$etag_file" 2>/dev/null)
+    fi
+    # $resolve_args (unquoted word-split): пусто обычно, `--resolve ...` в Layer 0.
+    # ОГРАНИЧИТЕЛЬ ЗАВИСШЕЙ ПЕРЕДАЧИ. --connect-timeout бюджетирует ТОЛЬКО
+    # рукопожатие; после него у передачи оставался один потолок — --max-time 180.
+    # Блокировка по SNI рвёт соединение сразу и стоит миллисекунды, а вот
+    # ЗАМЕДЛЕНИЕ выглядит как живой канал: байты идут, но по капле. Такой файл
+    # держал слой три минуты, и на полутора сотнях файлов обновления это часы
+    # вместо перехода к следующему зеркалу. --speed-limit/--speed-time обрывают
+    # передачу, если она пятнадцать секунд идёт медленнее килобайта в секунду:
+    # медленная, но живая загрузка не страдает, мёртвая отпускает за 15 с.
+    if [ -n "$old_etag" ]; then
+        http_status=$(curl -sSL --connect-timeout "$conn_to" --max-time 180 --speed-limit "${Z2K_FETCH_STALL_BYTES:-1024}" --speed-time "${Z2K_FETCH_STALL_SECONDS:-15}" $resolve_args \
+            -H "If-None-Match: $old_etag" -D "$hdr_file" -o "$tmp_body" \
+            -w "%{http_code} %{time_connect}" "$url" 2>/dev/null)
+        curl_rc=$?
+    else
+        http_status=$(curl -sSL --connect-timeout "$conn_to" --max-time 180 --speed-limit "${Z2K_FETCH_STALL_BYTES:-1024}" --speed-time "${Z2K_FETCH_STALL_SECONDS:-15}" $resolve_args \
+            -D "$hdr_file" -o "$tmp_body" \
+            -w "%{http_code} %{time_connect}" "$url" 2>/dev/null)
+        curl_rc=$?
+    fi
+    # Код ответа и время установления соединения приходят одной строкой — но
+    # только пока curl напечатал её целиком. На НЕПУСТОМ выводе без пробела
+    # `${x##* }` возвращает СТРОКУ ЦЕЛИКОМ: in=[200] давало CONNECT=[200], и
+    # гейт повтора принимал код ответа за время коннекта. Копия в geosite от
+    # этого страхуется подстановкой "000 0", здесь не страховало ничто.
+    # Нет пробела — значит времени коннекта нет.
+    case "$http_status" in
+        *' '*) Z2K_LAST_CONNECT="${http_status##* }" ;;
+        *)     Z2K_LAST_CONNECT=0 ;;
+    esac
+    http_status="${http_status%% *}"
+    # Отказ ФАЗЫ СОЕДИНЕНИЯ — единственный класс, который стоит повторять на
+    # Layer 0 (см. z2k_connfail). Считаем здесь и по СЫРОМУ коду ответа: ниже
+    # он местами подменяется на 000 для отчёта вызывающему, и гейт повтора
+    # принял бы оборванную на середине передачу за потерянное рукопожатие.
+    Z2K_LAST_CONNFAIL=0
+    if z2k_connfail "$curl_rc" "$http_status"; then Z2K_LAST_CONNFAIL=1; fi
+    # Статус нужен вызывающему: «файла нет у апстрима» и «зеркала не отвечают» —
+    # это разные события, а по коду возврата они неразличимы.
+    Z2K_LAST_HTTP="$http_status"
+    [ "$curl_rc" -eq 0 ] || { Z2K_LAST_HTTP="000"; rm -f "$hdr_file" "$tmp_body"; return 1; }
+    case "$http_status" in
+        304) rm -f "$hdr_file" "$tmp_body"; return 0 ;;
+        200)
+            [ ! -s "$tmp_body" ] && { rm -f "$hdr_file" "$tmp_body"; return 1; }
+            local new_etag
+            new_etag=$(grep -i '^etag:' "$hdr_file" 2>/dev/null | head -1 \
+                       | sed 's/^[^:]*:[[:space:]]*//; s/\r$//; s/[[:space:]]*$//')
+            mkdir -p "$(dirname "$dest")" 2>/dev/null
+            if ! mv -f "$tmp_body" "$dest"; then
+                # Failed mv would leave dest at old body but ETag below
+                # would still get written, producing a body/ETag mismatch
+                # next run could falsely 304 against.
+                rm -f "$hdr_file" "$tmp_body" "$etag_file"
+                return 1
+            fi
+            if [ -n "$new_etag" ]; then printf '%s\n' "$new_etag" > "$etag_file"
+            else rm -f "$etag_file"; fi
+            rm -f "$hdr_file"; return 0 ;;
+        *) rm -f "$hdr_file" "$tmp_body"; return 1 ;;
+    esac
+}
+
+# Z2K_FETCH_ALL_404=1 после неудачи означает, что КАЖДОЕ зеркало ответило 404,
+# то есть файла у апстрима нет. Это не сбой доставки и не должно выглядеть как он.
+# _z2k_ul_verify DEST — сверить только что скачанный файл с дайджестом, если
+# вызывающий его знает ($Z2K_FETCH_SHA256).
+#
+# Эта копия фетчера была ЕДИНСТВЕННОЙ без sha-гейта. В z2k.sh и lib/utils.sh
+# каждый хоп закрыт _z2k_verify_fetched, и протухший ответ зеркала там сносится
+# вместе с etag — идём на следующий источник. Здесь такой защиты не было вовсе,
+# то есть ровно тот отказ, ради которого заводилась карта сумм (issue #26:
+# человека держало на ревизии двухдневной давности пять релизов подряд),
+# на списках не ловился.
+#
+# Дайджест есть не у всего: чужие списки в карту сумм не попадают по построению.
+# Пусто — ведём себя как раньше.
+_z2k_ul_verify() {
+    local dest="$1" want="${Z2K_FETCH_SHA256:-}" got
+    [ -n "$want" ] || return 0
+    if command -v sha256sum >/dev/null 2>&1; then
+        got=$(sha256sum "$dest" 2>/dev/null | cut -d' ' -f1)
+    elif command -v openssl >/dev/null 2>&1; then
+        got=$(openssl dgst -sha256 "$dest" 2>/dev/null | sed 's/.*= *//')
+    fi
+    # Считать нечем — принимаем и предупреждаем: отказывать в обновлении списков
+    # на роутере без дайджест-тула хуже, чем принять непроверенное.
+    [ -n "$got" ] || return 0
+    [ "$got" = "$want" ] && return 0
+    printf '[lists] содержимое не совпало с ожидаемым — источник отклонён\n' >&2
+    rm -f "$dest" "${dest}.etag" 2>/dev/null
+    return 1
+}
+
+z2k_fetch() {
+    local src="$1"
+    local dest="$2"
+    local url
+    Z2K_FETCH_ALL_404=1
+    # Отдельно от «все ответили 404» — был ли АВТОРИТЕТНЫЙ 404.
+    #
+    # Единогласия требовать нельзя: у зеркал разные причины ответить не-404
+    # (jsdelivr ещё не прогрел кэш, gh-proxy моргнул, слой упал в таймаут), и
+    # один такой ответ перебивал четыре честных 404 — «файла у апстрима нет»
+    # превращалось в «all mirrors failed». Человек видел поломку там, где её
+    # нет, и шёл с ней в поддержку (поле 2026-08-24, три игры ru-gaming-blocklist).
+    #
+    # 404 от raw.githubusercontent.com — сам по себе доказательство отсутствия
+    # файла. Таймаут соседнего зеркала к этому доказательству ничего не
+    # добавляет, поэтому и отменять его не должен.
+    Z2K_FETCH_AUTH_404=0
+
+    case "$src" in
+        http://*|https://*) url="$src" ;;
+        /*) url="${GITHUB_RAW}${src}" ;;
+        *)  url="${GITHUB_RAW}/${src}" ;;
+    esac
+
+    local jsdelivr="" gh_proxy=""
+    case "$url" in
+        https://raw.githubusercontent.com/*)
+            local _rest="${url#https://raw.githubusercontent.com/}"
+            local _owner="${_rest%%/*}";  _rest="${_rest#*/}"
+            local _repo="${_rest%%/*}";   _rest="${_rest#*/}"
+            local _branch="${_rest%%/*}"; _rest="${_rest#*/}"
+            jsdelivr="https://cdn.jsdelivr.net/gh/${_owner}/${_repo}@${_branch}/${_rest}"
+            gh_proxy="https://gh-proxy.com/${url}"
+            ;;
+        https://github.com/*/releases/download/*)
+            gh_proxy="https://gh-proxy.com/${url}"
+            ;;
+    esac
+
+    # gh-proxy — только там, где результат кто-то проверит.
+    #
+    # Тот же fail-safe, что в z2k.sh и lib/utils.sh; здесь его не было вовсе.
+    # jsdelivr и gh-proxy оба терминируют TLS у себя, но jsdelivr — Fastly с
+    # юрлицом, а gh-proxy анонимный сторонний прокси. Layer 0 безопасен:
+    # там подменяется только адрес назначения, TLS остаётся сквозным до GitHub.
+    #
+    # А дайджест в ЭТОЙ копии не наполняется ничем: чужие списки в карту сумм не
+    # попадают по построению, и _z2k_ul_verify без Z2K_FETCH_SHA256 пропускает
+    # ЛЮБОЙ ответ. То есть на анонимное зеркало мы ходили за содержимым, которое
+    # потом никто не сверял, — а подменённый хостлист тихо решает, какие домены
+    # получают обход, а какие нет. Нет дайджеста — нет и этого зеркала;
+    # остальные слои (Layer 0, прямой, jsdelivr) на месте.
+    #
+    # Релиз-ассетам gh-proxy ОСТАВЛЯЕМ: они проверяются ниже по течению, и это
+    # единственное их запасное зеркало — jsdelivr релизы не зеркалит вовсе.
+    case "$url" in
+        https://raw.githubusercontent.com/*)
+            [ -z "${Z2K_FETCH_SHA256:-}" ] && gh_proxy=""
+            ;;
+    esac
+
+    # Layer 0: VPS SNI-passthrough egress — первичный путь для github (RU
+    # блокирует прямые github-IP). На сбой тихо валимся в цепочку ниже.
+    local _vps_resolve; _vps_resolve=$(_z2k_vps_gh_resolve "$url")
+    # ПРЯМОЙ GITHUB — ПЕРВЫМ, ПОКА ОН ОТВЕЧАЕТ.
+    #
+    # Раньше первым шёл наш VPS. Смысл в том, что часть провайдеров режет
+    # адреса GitHub, и таким людям прямой путь закрыт совсем. Но у этого
+    # порядка есть цена, которую видно только на масштабе: ВЕСЬ флот ходит к
+    # GitHub с ОДНОГО адреса — нашего узла, — а лимиты там считаются по адресу
+    # источника. Пока роутеров было немного, потолок не доставали; чем больше
+    # флот, тем чаще упираемся, и хуже всего в момент публикации, когда все
+    # идут разом. Замер 31.08.2026: в тишине узел получает ответ за 25 мс, под
+    # нагрузкой появляются зависания в три секунды и обрывы.
+    #
+    # Поэтому порядок обратный: сначала пробуем прямой путь — он идёт с адреса
+    # самого человека и ни с кем не делится, — и только если он не отвечает,
+    # уходим на узел.
+    #
+    # ВЕРДИКТ ВЫНОСИТСЯ ОДИН РАЗ ЗА ПРОГОН. Иначе человек с заблокированным
+    # GitHub платил бы таймаут на КАЖДОМ файле, а их в обновлении полсотни.
+    # Механизм тот же, что у размыкателя слоя VPS ниже: считаем подряд идущие
+    # отказы ФАЗЫ СОЕДИНЕНИЯ, после второго прямой путь выключается до конца
+    # прогона. Успех счётчик обнуляет.
+    #
+    # Бюджет короткий: три секунды на решение «жив или нет». Это не загрузка,
+    # это проба; здоровое соединение укладывается в десятки миллисекунд.
+    #
+    # Z2K_FETCH_DIRECT_FIRST=0 возвращает прежний порядок одной переменной.
+    if [ -n "$_vps_resolve" ] && [ "${Z2K_FETCH_DIRECT_FIRST:-1}" = "1" ] \
+       && [ "${Z2K_FETCH_DIRECT_OUT:-0}" != "1" ]; then
+        local _d_ct
+        _d_ct=$(z2k_uint "${Z2K_FETCH_DIRECT_CONNECT_TIMEOUT:-3}" 3 1 30)
+        if _z2k_curl_etag "$url" "$dest" "" "$_d_ct" \
+           && _z2k_ul_verify "$dest"; then
+            Z2K_FETCH_DIRECT_CONNFAILS=0; export Z2K_FETCH_DIRECT_CONNFAILS
+            return 0
+        fi
+        # Отказ по СОДЕРЖИМОМУ сюда не идёт: там виноват не путь, и выключать
+        # его из-за одного расхождения значит терять быстрый путь на ровном
+        # месте. Считаем только отказы соединения — как и у слоя VPS.
+        if [ "${Z2K_LAST_CONNFAIL:-0}" = "1" ]; then
+            Z2K_FETCH_DIRECT_CONNFAILS=$(( ${Z2K_FETCH_DIRECT_CONNFAILS:-0} + 1 ))
+            export Z2K_FETCH_DIRECT_CONNFAILS
+            if [ "$Z2K_FETCH_DIRECT_CONNFAILS" -ge "$(z2k_uint "${Z2K_FETCH_DIRECT_GIVEUP:-2}" 2 1 20)" ]; then
+                Z2K_FETCH_DIRECT_OUT=1; export Z2K_FETCH_DIRECT_OUT
+                printf '[z2k_fetch] прямой GitHub не отвечает %s раз подряд — дальше через VPS\n' \
+                    "$Z2K_FETCH_DIRECT_CONNFAILS" >&2
+            fi
+        fi
+    fi
+
+    # Слой 0 отключён размыкателем ниже, если VPS не отвечал подряд.
+    if [ -n "$_vps_resolve" ] && [ "${Z2K_FETCH_VPS_OUT:-0}" != "1" ]; then
+        local _vps_tries _vps_ct
+        # --- z2k layer0 vps knobs (canonical; keep byte-identical in all 4 copies) ---
+        # Санитайз ручек — в z2k_uint: мусор → дефолт, выход за границы → зажим.
+        # Потолок в 5 попыток держит Layer 0 от превращения в многочасовой
+        # последовательный перебор ДО того, как будет испробован прямой путь.
+        # Вложенность у четвёртой копии своя — сравнивать без ведущих пробелов.
+        _vps_tries=$(z2k_uint "${Z2K_FETCH_VPS_TRIES:-2}" 2 1 5)
+        _vps_ct=$(z2k_uint "${Z2K_FETCH_VPS_CONNECT_TIMEOUT:-8}" 8 1)
+        # --- end z2k layer0 vps knobs ---
+        local _vps_try=0
+        while [ "$_vps_try" -lt "$_vps_tries" ]; do
+            _vps_try=$((_vps_try + 1))
+            if _z2k_curl_etag "$url" "$dest" "$_vps_resolve" \
+                   "$_vps_ct" \
+               && _z2k_ul_verify "$dest"; then
+                Z2K_FETCH_VPS_CONNFAILS=0; export Z2K_FETCH_VPS_CONNFAILS
+                return 0
+            fi
+            # --- z2k layer0 retry gate (canonical; keep byte-identical in all 4 copies) ---
+            # Повторяем ТОЛЬКО отказ фазы соединения (см. z2k_connfail).
+            # Вложенность у четвёртой копии своя — сравнивать без ведущих пробелов.
+            [ "${Z2K_LAST_CONNFAIL:-0}" = "1" ] || break
+            # --- end z2k layer0 retry gate ---
+        done
+        # --- z2k layer0 breaker (canonical; keep byte-identical in all 4 copies) ---
+        # Мёртвый VPS не должен стоить бюджета НА КАЖДОМ файле. Обновление тянет
+        # полторы сотни файлов, и при 8 с в две попытки это сорок минут чистого
+        # ожидания там, где ответ известен уже после первого. Считаем ПОДРЯД
+        # идущие отказы ФАЗЫ СОЕДИНЕНИЯ; после второго слой 0 отключается до
+        # конца прогона, любой его успех счётчик обнуляет.
+        #
+        # Отказ по СОДЕРЖИМОМУ сюда не идёт намеренно: там виноват не канал, и
+        # следующий файл с того же VPS может прийти целым. Отключать слой из-за
+        # одного расхождения значит терять первичный путь на ровном месте.
+        if [ "${Z2K_LAST_CONNFAIL:-0}" = "1" ]; then
+            # Считаем ПОПЫТКИ, а не вызовы: две подряд и есть исчерпанный
+            # бюджет слоя. По вызовам порог не взводился бы на первом файле,
+            # то есть ровно там, где ответ уже известен.
+            Z2K_FETCH_VPS_CONNFAILS=$(( ${Z2K_FETCH_VPS_CONNFAILS:-0} + _vps_try ))
+            export Z2K_FETCH_VPS_CONNFAILS
+            if [ "$Z2K_FETCH_VPS_CONNFAILS" -ge "$(z2k_uint "${Z2K_FETCH_VPS_GIVEUP:-2}" 2 1 20)" ]; then
+                Z2K_FETCH_VPS_OUT=1; export Z2K_FETCH_VPS_OUT
+                printf '[z2k_fetch] VPS не отвечает %s раз подряд — слой 0 отключён до конца прогона\n' \
+                    "$Z2K_FETCH_VPS_CONNFAILS" >&2
+            fi
+        fi
+        # --- end z2k layer0 breaker ---
+        # Статус последней попытки: настоящий 404 отдаётся на обеих.
+        # Слой 0 — сквозной проход к raw.githubusercontent.com, его 404 авторитетен.
+        if [ "${Z2K_LAST_HTTP:-}" = "404" ]; then Z2K_FETCH_AUTH_404=1; else Z2K_FETCH_ALL_404=0; fi
+    fi
+
+    if _z2k_curl_etag "$url" "$dest" && _z2k_ul_verify "$dest"; then return 0; fi
+    # Прямой raw — тоже авторитетный источник.
+    if [ "${Z2K_LAST_HTTP:-}" = "404" ]; then Z2K_FETCH_AUTH_404=1; else Z2K_FETCH_ALL_404=0; fi
+    if [ -n "$jsdelivr" ]; then
+        _z2k_curl_etag "$jsdelivr" "$dest" && _z2k_ul_verify "$dest" && return 0
+        [ "${Z2K_LAST_HTTP:-}" = "404" ] || Z2K_FETCH_ALL_404=0
+    fi
+    if [ -n "$gh_proxy" ]; then
+        _z2k_curl_etag "$gh_proxy" "$dest" && _z2k_ul_verify "$dest" && return 0
+        [ "${Z2K_LAST_HTTP:-}" = "404" ] || Z2K_FETCH_ALL_404=0
+    fi
+
+    # ЧЕТВЁРТЫЙ СЛОЙ (ndmc "ip host") УБРАН 30.08.2026 — он писал ПОСТОЯННЫЕ
+    # записи в конфиг роутера пользователя. Подробности в z2k.sh; здесь важно,
+    # что это КРОНОВАЯ копия: она ходила без человека, раз в сутки, и мусор
+    # копила молча. Накопленное вычищает z2k_ndmc_cleanup().
+
+    return 1
+}
+
+# ==============================================================================
+# ETag preservation across cron runs
+# ==============================================================================
+# z2k_fetch's _z2k_curl_etag reads/writes ETag at "${dest}.etag" where dest
+# is whatever path it's called with. Updaters pass a per-run mktemp path,
+# so without these helpers each cron run starts with no ETag baseline and
+# always issues a full GET (no 304 optimization), plus orphaned *.etag
+# crumbs accumulate next to the temp files.
+#
+# Pattern per updater function:
+#   _etag_prep "$dest" "$tmp"         # before z2k_fetch — primes 304 layer
+#   ... fetch + validate ...
+#   _etag_finalize "$tmp" "$dest"     # after successful mv tmp → dest
+#   _etag_cleanup "$tmp"              # in place of rm -f "$tmp"
+_etag_prep() {
+    # Copy dest body + dest.etag into tmp so z2k_fetch can hit 304.
+    # ETag is only carried over if the body copy succeeded — otherwise
+    # we'd leave a valid ETag pointing at a torn/partial body, and a
+    # subsequent 304 would falsely validate that broken body.
+    local src="$1" tmp="$2"
+    [ -f "$src" ] && [ -s "$src" ] || return 0
+    cp -f "$src" "$tmp" 2>/dev/null || return 0
+    [ -f "${src}.etag" ] && cp -f "${src}.etag" "${tmp}.etag" 2>/dev/null
+    return 0
+}
+_etag_finalize() {
+    # Carry the freshly-fetched ETag to the final dest so next run reuses it.
+    # If the 200 response carried no ETag header, _z2k_curl_etag deletes
+    # tmp.etag — in that case we must also drop the stale dest.etag, or
+    # next cron sends a phantom If-None-Match that no longer matches the
+    # body we just installed.
+    local tmp="$1" dest="$2"
+    if [ -f "${tmp}.etag" ]; then
+        mv -f "${tmp}.etag" "${dest}.etag" 2>/dev/null
+    else
+        rm -f "${dest}.etag"
+    fi
+}
+_etag_cleanup() {
+    rm -f "$1" "${1}.etag"
+}
+
+# ==============================================================================
+# ЛОГИРОВАНИЕ
+# ==============================================================================
+
+log_msg() {
+    local msg
+    msg="$(date '+%Y-%m-%d %H:%M:%S') $1"
+    echo "$msg" >> "$LOG_FILE" 2>/dev/null
+
+    # Ротация лога
+    if [ -f "$LOG_FILE" ]; then
+        local lines
+        lines=$(wc -l < "$LOG_FILE" 2>/dev/null || echo 0)
+        if [ "$lines" -gt "$MAX_LOG_LINES" ]; then
+            local tmp
+            tmp=$(mktemp "${LOG_FILE}.XXXXXX") || return
+            tail -n "$((MAX_LOG_LINES / 2))" "$LOG_FILE" > "$tmp" 2>/dev/null
+            mv -f "$tmp" "$LOG_FILE" 2>/dev/null || rm -f "$tmp"
+        fi
+    fi
+}
+
+# ==============================================================================
+# ОБНОВЛЕНИЕ СПИСКОВ
+# ==============================================================================
+
+update_list() {
+    local name=$1
+    local url=$2
+    local dest=$3
+
+    if [ -z "$url" ] || [ -z "$dest" ]; then
+        return 1
+    fi
+
+    local tmp
+    tmp=$(mktemp "${dest}.XXXXXX") || return 1
+    _etag_prep "$dest" "$tmp"
+
+    if ! z2k_fetch "$url" "$tmp"; then
+        # Апстрим ru-gaming-blocklist перечисляет в индексе игры, для которых
+        # файла ещё нет: на 2026-08-05 таких три (Fallout76_AWS, GearsOfWar,
+        # MagicTheGathering). Раньше это писалось как «all mirrors failed» и
+        # всплывало в диагностике под «errors across all logs» — то есть человек
+        # видел поломку там, где её нет, и шёл с ней в поддержку.
+        if [ "${Z2K_LIST_QUIET_MISSING:-0}" = "1" ]; then
+            # Состав игровых списков задаёт ЧУЖОЙ репозиторий, и он живой: игры
+            # появляются, исчезают и переименовываются без предупреждения. Для
+            # такого источника «файла нет» — это не поломка, а новость, и в
+            # журнал она идёт строкой, а не ошибкой.
+            #
+            # Разбор по слоям здесь не помогает и был снят. Признак «все ответили
+            # 404» гасился любым молчащим зеркалом, а признак «авторитетный 404»
+            # требовал ответа от raw.githubusercontent — у человека с выключенным
+            # слоем 0 и заблокированным raw не было ни того, ни другого, и три
+            # несуществующие игры каждую ночь писались как FAIL (диагностика
+            # 31.08.2026). Итог держит сводная строка прогона: сколько списков
+            # обновилось и сколько оказалось недоступно.
+            log_msg "$name: у апстрима нет или недоступен, пропускаю"
+        elif [ "${Z2K_FETCH_ALL_404:-0}" = "1" ] || [ "${Z2K_FETCH_AUTH_404:-0}" = "1" ]; then
+            log_msg "$name: у апстрима такого файла нет (404), пропускаю"
+        else
+            log_msg "FAIL: download $name from $url (all mirrors failed)"
+        fi
+        _etag_cleanup "$tmp"
+        return 1
+    fi
+
+    # Проверить что файл не пустой
+    if [ ! -s "$tmp" ]; then
+        log_msg "FAIL: $name is empty"
+        _etag_cleanup "$tmp"
+        return 1
+    fi
+
+    # Убрать CRLF
+    sed -i 's/\r$//' "$tmp" 2>/dev/null
+
+    # Content guard. A CDN/GitHub edge serving an error page returns HTTP 200
+    # with an HTML/JSON body, which passes z2k_fetch and the non-empty check.
+    # Without this, update_list would replace a live ipset source with a
+    # "<html>404</html>" blob (update_cf_cidrs_v4 already guards this; update_list
+    # did not, yet its callers feed --ipset matches). Reject markup/JSON,
+    # an all-comment/empty result, and a sudden massive shrink vs the live file.
+    if head -8 "$tmp" | grep -qiE '<!doctype|<html|<head|<body|^[[:space:]]*[{[]'; then
+        log_msg "FAIL: $name looks like HTML/JSON, not a list — keeping old"
+        _etag_cleanup "$tmp"
+        return 1
+    fi
+    local _new_n
+    _new_n=$(grep -cvE '^[[:space:]]*(#|$)' "$tmp" 2>/dev/null)
+    : "${_new_n:=0}"
+    if [ "$_new_n" -eq 0 ]; then
+        log_msg "FAIL: $name has no content lines — keeping old"
+        _etag_cleanup "$tmp"
+        return 1
+    fi
+    if [ -f "$dest" ]; then
+        local _old_n
+        _old_n=$(grep -cvE '^[[:space:]]*(#|$)' "$dest" 2>/dev/null)
+        : "${_old_n:=0}"
+        if [ "$_old_n" -gt 0 ] && [ "$((_new_n * 100 / _old_n))" -lt 50 ]; then
+            log_msg "FAIL: $name shrunk >50% ($_old_n → $_new_n content lines) — keeping old"
+            _etag_cleanup "$tmp"
+            return 1
+        fi
+    fi
+
+    # Сравнить с текущим
+    if [ -f "$dest" ]; then
+        local old_hash new_hash
+        if command -v md5sum >/dev/null 2>&1; then
+            old_hash=$(md5sum "$dest" 2>/dev/null | awk '{print $1}')
+            new_hash=$(md5sum "$tmp" 2>/dev/null | awk '{print $1}')
+        else
+            old_hash=$(wc -c < "$dest" 2>/dev/null)
+            new_hash=$(wc -c < "$tmp" 2>/dev/null)
+        fi
+
+        if [ "$old_hash" = "$new_hash" ]; then
+            _etag_finalize "$tmp" "$dest"
+            _etag_cleanup "$tmp"
+            return 0  # Без изменений
+        fi
+    fi
+
+    # Обновить
+    mkdir -p "$(dirname "$dest")" 2>/dev/null
+    if ! mv -f "$tmp" "$dest"; then
+        log_msg "FAIL: $name mv tmp → dest failed"
+        _etag_cleanup "$tmp"
+        return 1
+    fi
+    _etag_finalize "$tmp" "$dest"
+    log_msg "OK: $name updated ($(wc -l < "$dest") lines)"
+    return 2  # Код 2 = есть изменения
+}
+
+# WARP game lists — ONE FILE PER GAME, pulled from the community-maintained
+# YOZH3G/ru-gaming-blocklist (the reviewed, conservative fork).
+#
+# We used to pull the original repo's combined `medvedeff-game-ipset.txt` and load it
+# whole. Measured on the shipped snapshot: 14297 entries covering 643 million
+# addresses — 15% of all IPv4 — including 10.0.0.0/8, 127.0.0.0/8 and
+# 192.168.0.0/16, i.e. private space and the user's own LAN routed into a
+# Cloudflare tunnel. Switching WARP on therefore took down far more than the
+# games it was meant to help, and every tunnel hiccup read as "the internet is
+# down" (issue #26).
+#
+# The fork publishes per-game lists under games/. Its global IP set has no
+# per-game ownership, so it is deliberately not loaded for a game toggle.
+# Which lists are loaded is the user's choice (see .enabled in z2k-warp.sh); on a fresh
+# install, none.
+#
+# These files are UPSTREAM data, not user data: overwritten wholesale on every
+# refresh, no 3-way merge. That machinery (.base/.removed ancestor tracking)
+# existed because the aggregate doubled as the user's own editable list. Per-game
+# lists are read-only in the panel, and users keep their own entries in their own
+# lists beside games/, which this function never touches.
+#
+# Top-level (not nested in main) so the unit tests can drive it against a
+# stubbed update_list.
+update_warp_game_list() {
+    local base_url="${Z2K_WARP_BASE_URL:-https://raw.githubusercontent.com/YOZH3G/ru-gaming-blocklist/main}"
+    local wdir="${ZAPRET2_DIR}/lists/warp"
+    local gdir="$wdir/games"
+    local idx="$wdir/.games-index.json"
+    mkdir -p "$gdir" 2>/dev/null || return 1
+
+    # The index goes through z2k_fetch and NOT update_list: the latter rejects
+    # anything starting with `{` as "HTML/JSON, not a list", which is precisely
+    # what sources.json is.
+    if ! z2k_fetch "$base_url/sources.json" "$idx" 2>/dev/null || [ ! -s "$idx" ]; then
+        log_msg "FAIL: warp games index unavailable — keeping current lists"
+        return 1
+    fi
+
+    # Names come from the index rather than a hardcoded list, so a game added
+    # upstream shows up without a z2k release. game_map's values are arrays and
+    # never objects, so [^}] stops exactly at the end of that map. Upstream keeps
+    # spaces in some keys but underscores in the filenames.
+    local names
+    names=$(tr -d '\n' < "$idx" \
+        | sed -n 's/.*"game_map"[[:space:]]*:[[:space:]]*{\([^}]*\)}.*/\1/p' \
+        | grep -oE '"[^"]+"[[:space:]]*:' \
+        | sed 's/^"//; s/"[[:space:]]*:$//' \
+        | tr ' ' '_')
+    if [ -z "$names" ]; then
+        log_msg "FAIL: warp games index has no game_map — keeping current lists"
+        return 1
+    fi
+
+    # Просеиваем имена ОДИН раз, до первого использования.
+    #
+    # Они приходят из чужого JSON, становятся ИМЕНАМИ ФАЙЛОВ и подставляются в
+    # циклы ниже без кавычек. Глоббинг на время просева гасим: слово `*` в
+    # индексе — это не имя, а шаблон, и голое раскрытие развернуло бы его по
+    # рабочему каталогу cron-процесса (у cron это `/`). Ниже по коду это стоило
+    # бы удаления ЧУЖИХ списков: уборка сносит всё, чего нет в keep-множестве.
+    # Набор символов — тот же, что принимает панель.
+    local _sane_names _sn _oldglob
+    _oldglob=$-
+    set -f
+    _sane_names=""
+    for _sn in $names; do
+        case "$_sn" in
+            ''|.*|-*) continue ;;
+            *[!A-Za-z0-9._-]*) continue ;;
+        esac
+        _sane_names="$_sane_names $_sn"
+    done
+    case "$_oldglob" in *f*) ;; *) set +f ;; esac
+    names="$_sane_names"
+    if [ -z "$names" ]; then
+        log_msg "FAIL: warp games index has no usable game names — keeping current lists"
+        return 1
+    fi
+
+    # A source switch must not reuse the previous owner's .raw body or ETag.
+    # The cleaned fork is intentionally much smaller (e.g. Warframe), so the
+    # generic >50% shrink guard would otherwise reject it and keep old data.
+    # Preserve the visible .txt files until each new download succeeds.
+    local source_file="$wdir/.games-source" _cache _source_tmp
+    if [ "$(cat "$source_file" 2>/dev/null)" != "$base_url" ]; then
+        for _cache in "$gdir"/.*.raw "$gdir"/.*.raw.etag; do
+            [ -f "$_cache" ] || continue
+            rm -f "$_cache" || { log_msg "FAIL: cannot clear previous game-list cache"; return 1; }
+        done
+        _source_tmp="${source_file}.new.$$"
+        printf '%s\n' "$base_url" > "$_source_tmp" && mv -f "$_source_tmp" "$source_file" \
+            || { rm -f "$_source_tmp"; log_msg "FAIL: cannot save game-list source"; return 1; }
+        log_msg "WARP game-list source changed: cache reset"
+    fi
+
+    # Z2K_LIST_QUIET_MISSING объявлен local НАМЕРЕННО: в ash local виден и
+    # вызываемым функциям, поэтому update_list его увидит, а остальные загрузки
+    # в этом же прогоне — нет. Пропажа игры у апстрима не ошибка (см. update_list),
+    # но пропажа списка РКН — ошибка, и глушить её этим флагом нельзя.
+    local n rc raw san ok=0 skipped=0 Z2K_LIST_QUIET_MISSING=1
+    for n in $names; do
+        # Deliberately not shipped: a catch-all bucket nobody asked for.
+        [ "$n" = "Other_Games" ] && continue
+        # Same charset the panel enforces — the name becomes a filename.
+        case "$n" in
+            ''|.*|-*) continue ;;
+            *[!A-Za-z0-9._-]*) continue ;;
+        esac
+
+        raw="$gdir/.$n.raw"
+        update_list "warp-game-$n" "$base_url/games/$n.txt" "$raw"
+        rc=$?
+        # 0 = unchanged, 2 = updated, 1 = failed. A game named in the index but
+        # not yet published as a file 404s here — normal (upstream has three such
+        # today) and must not abort the rest.
+        if [ "$rc" = "1" ]; then
+            skipped=$((skipped + 1))
+            continue
+        fi
+
+        # Sanitize even when unchanged: the cached .raw is a dotfile and the
+        # reinstall carries forward only games/*.txt, so the .txt can be missing
+        # while the raw is still cached. (Раньше здесь стояло «games/ is not
+        # preserved across a reinstall» — с тех пор переносится, но вывод тот
+        # же: раздельная судьба .raw и .txt требует санитайза при unchanged.)
+        san="$gdir/.$n.san"
+        if ! awk -v mode=save -f "$ZAPRET2_DIR/z2k-warp-list-filter.awk" "$raw" > "$san" 2>/dev/null; then
+            rm -f "$san"; skipped=$((skipped + 1)); continue
+        fi
+        if [ -s "$san" ]; then
+            mv -f "$san" "$gdir/$n.txt" && chmod 644 "$gdir/$n.txt" 2>/dev/null
+            ok=$((ok + 1))
+        else
+            # Everything filtered out, or upstream published an empty file: leave
+            # no list rather than an empty one for the panel to show.
+            rm -f "$san" "$gdir/$n.txt"
+        fi
+    done
+
+    # Уборка списков, которых больше нет в апстрим-индексе.
+    #
+    # Раньше сборщиком мусора работала переустановка: дерево уезжало в .old, и
+    # games/ пересевался с нуля по свежему sources.json. Теперь каталог
+    # переносится через реинсталл, значит игра, выпавшая из индекса или
+    # переименованная, осталась бы в нём навсегда — светилась бы в панели и
+    # продолжала подмешиваться в ipset WARP.
+    #
+    # Трогаем только .txt и только когда индекс реально прочитан ($names
+    # непуст): пустой индекс — это отказ загрузки, а не «игр больше нет».
+    #
+    # ПУТЬ БЕЗУСЛОВНО ДЕСТРУКТИВНЫЙ (rm по .txt + .raw + .raw.etag), поэтому
+    # ни одно имя здесь не имеет права работать как шаблон. $names уже просеян
+    # выше при глушёном глоббинге, а имя файла из каталога раньше подставлялось
+    # прямо в ШАБЛОН case — то есть `*`, `?`, `[` в нём сходились с чужими
+    # именами. Сравниваем через `=`, обе стороны литеральные.
+    if [ -n "$names" ]; then
+        local _f _base _n _hit _pruned=0
+        for _f in "$gdir"/*.txt; do
+            [ -f "$_f" ] || continue
+            _base="${_f##*/}"; _base="${_base%.txt}"
+            _hit=0
+            for _n in $names; do
+                if [ "$_n" = "$_base" ]; then _hit=1; break; fi
+            done
+            [ "$_hit" = "1" ] && continue
+            rm -f "$_f" "$gdir/.$_base.raw" "$gdir/.$_base.raw.etag" 2>/dev/null \
+                && _pruned=$((_pruned + 1))
+        done
+        [ "$_pruned" -gt 0 ] && log_msg "pruned $_pruned game list(s) no longer in upstream index"
+    fi
+
+    log_msg "OK: warp game lists refreshed ($ok lists, $skipped unavailable)"
+
+    # WARP is routing-only — reload the ipset live if the mode is on.
+    if [ "$(grep -m1 '^GAME_WARP_ENABLED=' "${ZAPRET2_DIR}/config" 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d ' ')" = "1" ] \
+       && [ -x "${ZAPRET2_DIR}/z2k-warp.sh" ]; then
+        sh "${ZAPRET2_DIR}/z2k-warp.sh" ipset >>"$LOG_FILE" 2>&1
+    fi
+    return 0
+}
+
+# ==============================================================================
+# ОСНОВНОЙ ПРОЦЕСС
+# ==============================================================================
+
+main() {
+    # Убедиться что директория для логов существует
+    mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null
+
+    log_msg "--- Update lists started ---"
+
+    local changes=0
+
+    # Phase 12: domain lists (RKN / Discord / YouTube TCP / YouTube QUIC)
+    # are now pulled from runetfreedom/russia-blocked-geosite release
+    # assets via z2k-geosite.sh. ETag-aware, RAM-adaptive RKN variant,
+    # atomic rename, sub-80% size guard. The old GitHub raw fetches
+    # from necronicle/z2k shipped snapshots are retired; they remain
+    # as first-install fallback via lib/install.sh step_download_domain_lists.
+    if [ -x "${ZAPRET2_DIR}/z2k-geosite.sh" ]; then
+        log_msg "Running z2k-geosite fetch (runetfreedom)..."
+        _geo_log_off=0
+        if [ -f "$LOG_FILE" ]; then
+            _geo_log_off=$(wc -c < "$LOG_FILE" 2>/dev/null | tr -d ' \t')
+            case "$_geo_log_off" in ''|*[!0-9]*) _geo_log_off=0 ;; esac
+        fi
+        if sh "${ZAPRET2_DIR}/z2k-geosite.sh" fetch >>"$LOG_FILE" 2>&1; then
+            # z2k-geosite handles atomic rename + service-safe writes;
+            # count a change whenever at least one asset was applied.
+            # ETag cache makes 304-only runs a no-op; inspect only bytes
+            # appended during THIS run so a short log tail cannot pick up
+            # ": applied," from the previous night right after a list update.
+            if tail -c +"$((_geo_log_off + 1))" "$LOG_FILE" 2>/dev/null | grep -q ': applied,'; then
+                changes=$((changes + 1))
+                log_msg "geosite: applied changes detected"
+            else
+                log_msg "geosite: all assets unchanged (ETag match)"
+            fi
+        else
+            log_msg "WARN: geosite fetch partial/failed"
+        fi
+    else
+        log_msg "z2k-geosite.sh missing, skipping list refresh"
+    fi
+
+    # cdn_ips fetcher удалён 2026-04-27 вместе с cdn_tls профилем.
+
+
+
+    rm -f "${ZAPRET2_DIR}/lists/"*_discord_voice_hosts.txt \
+          "${ZAPRET2_DIR}/z2k-discord-voice-pin.sh" 2>/dev/null
+
+    # Cloudflare canonical IPv4 CIDR list. Source: cloudflare.com/ips-v4
+    # (already used by install.sh:step_install_z2k_classify at install-time).
+    # Без cron-а файл протухает за месяцы — CF добавляет/убирает диапазоны.
+    # Пишем атомарно с базовыми guard'ами: список маленький (~25 строк),
+    # поэтому floor=10 и shrink-guard 50% от существующего.
+    update_cf_cidrs_v4() {
+        local dest="${ZAPRET2_DIR}/lists/cf-cidrs-v4.txt"
+        local url="https://www.cloudflare.com/ips-v4"
+        local tmp
+        tmp=$(mktemp "${dest}.XXXXXX") || return 1
+        _etag_prep "$dest" "$tmp"
+
+        if ! z2k_fetch "$url" "$tmp"; then
+            log_msg "FAIL: cf_cidrs_v4 download (all mirrors failed)"
+            _etag_cleanup "$tmp"
+            return 1
+        fi
+
+        if [ ! -s "$tmp" ]; then
+            log_msg "FAIL: cf_cidrs_v4 empty"
+            _etag_cleanup "$tmp"
+            return 1
+        fi
+
+        sed -i 's/\r$//' "$tmp" 2>/dev/null
+
+        # CF endpoint иногда возвращает HTML-error через CDN — отсекаем.
+        if head -8 "$tmp" | grep -qiE '<!doctype|<html|<head|<body|^[[:space:]]*[{[]'; then
+            log_msg "FAIL: cf_cidrs_v4 looks like HTML/JSON, not CIDR list"
+            _etag_cleanup "$tmp"
+            return 1
+        fi
+
+        local total_lines cidr_lines
+        total_lines=$(grep -cvE '^[[:space:]]*(#|$)' "$tmp" 2>/dev/null)
+        cidr_lines=$(grep -cE '^[[:space:]]*([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?[[:space:]]*$' "$tmp" 2>/dev/null)
+        if [ -z "$total_lines" ] || [ "$total_lines" -lt 1 ]; then
+            log_msg "FAIL: cf_cidrs_v4 has no content lines"
+            _etag_cleanup "$tmp"
+            return 1
+        fi
+        if [ "$((cidr_lines * 100 / total_lines))" -lt 80 ]; then
+            log_msg "FAIL: cf_cidrs_v4 CIDR ratio low ($cidr_lines/$total_lines)"
+            _etag_cleanup "$tmp"
+            return 1
+        fi
+        # Floor: actual CF list ~17-25 entries; ниже 10 = upstream сломан.
+        if [ "$total_lines" -lt 10 ]; then
+            log_msg "FAIL: cf_cidrs_v4 too small ($total_lines lines, expected ≥10)"
+            _etag_cleanup "$tmp"
+            return 1
+        fi
+
+        if [ -f "$dest" ] && [ -s "$dest" ]; then
+            local old_lines
+            old_lines=$(grep -cvE '^[[:space:]]*(#|$)' "$dest" 2>/dev/null)
+            if [ -n "$old_lines" ] && [ "$old_lines" -gt 0 ]; then
+                if [ "$((total_lines * 100 / old_lines))" -lt 50 ]; then
+                    log_msg "FAIL: cf_cidrs_v4 shrunk >50% ($old_lines → $total_lines), keeping old"
+                    _etag_cleanup "$tmp"
+                    return 1
+                fi
+            fi
+        fi
+
+        if [ -f "$dest" ] && cmp -s "$tmp" "$dest" 2>/dev/null; then
+            _etag_finalize "$tmp" "$dest"
+            _etag_cleanup "$tmp"
+            return 0
+        fi
+
+        mkdir -p "$(dirname "$dest")" 2>/dev/null
+        if ! mv -f "$tmp" "$dest"; then
+            log_msg "FAIL: cf_cidrs_v4 mv tmp → dest failed"
+            _etag_cleanup "$tmp"
+            return 1
+        fi
+        _etag_finalize "$tmp" "$dest"
+        log_msg "OK: cf_cidrs_v4 updated ($total_lines lines)"
+        return 2
+    }
+    update_cf_cidrs_v4
+    [ $? -eq 2 ] && changes=$((changes + 1))
+
+    update_warp_game_list
+
+    if [ "$changes" -gt 0 ]; then
+        log_msg "Changes detected ($changes lists), restarting service..."
+        if [ -x "$INIT_SCRIPT" ]; then
+            "$INIT_SCRIPT" restart 2>/dev/null
+            if [ $? -eq 0 ]; then
+                log_msg "Service restarted successfully"
+            else
+                log_msg "FAIL: Service restart failed"
+            fi
+        fi
+    else
+        log_msg "No changes detected"
+    fi
+
+    # Refresh Instagram/cdninstagram ndmc records from a live DNS lookup on
+    # the EU VPS. The script self-skips on non-Keenetic systems, when the
+    # user disabled it (Z2K_INSTA_IP_REFRESH=0), or when the user already
+    # cleared all insta records via menu [I].
+    if [ -x "${ZAPRET2_DIR}/z2k-insta-ip-refresh.sh" ]; then
+        log_msg "Running insta-ip refresh..."
+        sh "${ZAPRET2_DIR}/z2k-insta-ip-refresh.sh" >/dev/null 2>&1 || \
+            log_msg "WARN: insta-ip refresh exited non-zero"
+    fi
+
+    # Compatibility entrypoint: removes retired redirector pins, never adds DNS.
+    if [ -x "${ZAPRET2_DIR}/z2k-redirector-ip-refresh.sh" ]; then
+        sh "${ZAPRET2_DIR}/z2k-redirector-ip-refresh.sh" >/dev/null 2>&1 || \
+            log_msg "FAIL: legacy redirector DNS cleanup failed"
+    fi
+
+    log_msg "--- Update lists finished ---"
+}
+
+# Source-guard: tests set Z2K_UL_SOURCE_ONLY=1 to load the functions
+# (update_warp_game_list etc.) without running the full cron cycle.
+#
+# With no argument this is the nightly cycle, as before. `warp-games` refreshes
+# ONLY the per-game WARP lists, and exists so an update can pull them straight
+# away: without it a freshly updated router shows an empty WARP page until the
+# next nightly run, which is up to a day of "the feature does nothing". Running
+# the whole cycle there instead is not an option — it fetches the geosite and
+# RKN lists and would stretch every update by minutes for the sake of a couple
+# of dozen small files.
+if [ -z "${Z2K_UL_SOURCE_ONLY:-}" ]; then
+    case "${1:-}" in
+        warp-games)
+            mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null
+            update_warp_game_list
+            ;;
+        ''|all)
+            # Разброс 0..60 мин. Ночной цикл — самое тяжёлое, что z2k делает на
+            # роутере (скачать списки, пересобрать ipset'ы на десятки тысяч
+            # записей), и без разброса это делал ВЕСЬ флот ровно в 04:00:
+            # одновременный удар и по роутерам, и по зеркалам. Только плановый
+            # путь: stdin не tty; из меню и установки ждать нечего.
+            if [ ! -t 0 ] && [ "${Z2K_UL_NO_JITTER:-0}" != "1" ] \
+               && command -v z2k_host_jitter >/dev/null 2>&1; then
+                _ul_j=$(z2k_host_jitter 3600)
+                log_msg "ночной разброс: жду ${_ul_j}с"
+                sleep "$_ul_j"
+            fi
+            main "$@"
+            ;;
+        *)
+            echo "usage: z2k-update-lists.sh [all|warp-games]" >&2
+            exit 1
+            ;;
+    esac
+fi

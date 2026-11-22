@@ -1,0 +1,36 @@
+#!/opt/bin/busybox sh
+
+bb_fc=`/opt/bin/busybox readlink -f /opt/bin/busybox`
+for file in /opt/bin/*; do
+    if [ -L $file  -a "`/opt/bin/busybox readlink -f $file`" = $bb_fc ]; then
+       /opt/bin/busybox rm -f $file
+    fi
+done
+
+for file in /opt/sbin/*; do
+    if [ -L $file  -a "`/opt/bin/busybox readlink -f $file`" = $bb_fc ]; then
+       /opt/bin/busybox rm -f $file
+    fi
+done
+
+# Entware specific: Remove applet symlinks pointing to the preserved BusyBox binary
+if [ -f /opt/bin/.busybox.opkg-keep ]; then
+    keep_fc=`/opt/bin/busybox readlink -f /opt/bin/.busybox.opkg-keep`
+    for file in /opt/bin/* /opt/sbin/*; do
+        if [ -L "$file" ] && [ "`/opt/bin/busybox readlink -f "$file"`" = "$keep_fc" ]; then
+           /opt/bin/busybox rm -f "$file"
+        fi
+    done
+    /opt/bin/busybox rm -f /opt/bin/.busybox.opkg-keep
+fi
+
+cd /opt
+for applet in $(/opt/bin/busybox cat share/busybox_applets.lst.dist)
+do
+    if [ ! -e $applet ]
+    then
+       /opt/bin/busybox ln -s /opt/bin/busybox $applet
+    else
+       echo "Warning: '/opt/$applet' is already exists, skipping."
+    fi
+done

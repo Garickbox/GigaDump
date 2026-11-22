@@ -1,0 +1,18 @@
+Package: tar
+Version: 1.35-2
+Depends: libc, libssp, librt, libpthread, bzip2, libacl, libattr, libzstd, xz
+Provides: tar-any
+Alternatives: 300:/opt/bin/tar:/opt/libexec/tar-gnu
+Source: feeds/packages/utils/tar
+SourceName: tar
+License: GPL-3.0-or-later
+LicenseFiles: COPYING
+Section: utils
+SourceDateEpoch: 1689663323
+URL: https://www.gnu.org/software/tar/
+CPE-ID: cpe:/a:gnu:tar
+Maintainer: Álvaro Fernández Rojas <noltari@gmail.com>
+Architecture: aarch64-3.10
+Installed-Size: 491520
+Description:  Tar is a program for packaging a set of files as a
+ single archive in tar format.

@@ -1,0 +1,2 @@
+root:$1$6vKOV7zs$d2EqNYGvlBWEYoFD7FFkr0:0:0:Root:/opt/root:/opt/bin/sh
+nobody:*:65534:65534:user "nobody"::/opt/bin/nologin

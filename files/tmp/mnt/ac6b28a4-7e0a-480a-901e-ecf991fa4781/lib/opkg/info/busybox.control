@@ -1,0 +1,20 @@
+Package: busybox
+Version: 1.38.0-5
+Depends: libc, libssp, librt, libpthread
+Conflicts: busybox-selinux
+Provides: busybox-any
+Source: feeds/base/utils/busybox
+SourceName: busybox
+License: GPL-2.0
+LicenseFiles: LICENSE archival/libarchive/bz/LICENSE
+Section: base
+Require-User: ntp=123:ntp=123
+SourceDateEpoch: 1778638799
+URL: https://busybox.net/
+CPE-ID: cpe:/a:busybox:busybox
+Essential: yes
+Maintainer: Felix Fietkau <nbd@nbd.name>
+Architecture: aarch64-3.10
+Installed-Size: 583680
+Description:  The Swiss Army Knife of embedded Linux.
+ It slices, it dices, it makes Julian Fries.

@@ -1,0 +1,15 @@
+Package: curl
+Version: 8.23.0-1
+Depends: libc, libssp, librt, libpthread, libcurl
+Provides: curl-any
+Source: feeds/packages/net/curl
+SourceName: curl
+License: MIT
+LicenseFiles: COPYING
+Section: net
+SourceDateEpoch: 1791957245
+URL: https://curl.se/
+CPE-ID: cpe:/a:haxx:libcurl
+Architecture: aarch64-3.10
+Installed-Size: 194560
+Description:  A client-side URL transfer utility

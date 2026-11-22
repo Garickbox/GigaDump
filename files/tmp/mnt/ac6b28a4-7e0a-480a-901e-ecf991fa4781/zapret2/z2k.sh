@@ -1,0 +1,1993 @@
+#!/bin/sh
+# z2k.sh - Bootstrap скрипт для z2k v2.0
+# Модульный установщик zapret2 для роутеров Keenetic
+# https://github.com/necronicle/z2k
+
+set -e
+
+# Установка не должна умирать от SIGHUP.
+#
+# Обновление через кнопку в вебпанели запускается фоновой задачей из-под CGI, а
+# CGI-обёртка обязана завершиться немедленно — она возвращает браузеру job_id.
+# busybox ash в этот момент шлёт HUP фоновым детям; вдобавок установка сама
+# перезапускает панель, под которой эта задача и живёт. По умолчанию sh от HUP
+# умирает, и установка обрывалась примерно на пятом шаге из двенадцати — ровно
+# там, где переезжает дерево /opt/zapret2. Роутер оставался с переименованным
+# деревом, без панели и без обхода; сообщить о провале было уже некому, снаружи
+# это выглядело как «панель ответила 404, чем кончилась задача неизвестно».
+#
+# Защита стоит ЗДЕСЬ, а не только в панели, и это принципиально: панель на
+# роутере старая до тех пор, пока обновление не доедет, а вот z2k.sh при каждой
+# переустановке скачивается с ветки заново. То есть эта строка защищает и тех,
+# кто обновляется СТАРОЙ панелью, — иначе первый же их переход через r-74
+# остался бы уязвимым, а починить его задним числом нечем.
+#
+# Игнорируем только HUP: TERM и INT работают как прежде, прервать установку
+# по-прежнему можно.
+trap '' HUP
+
+# ==============================================================================
+# КОНСТАНТЫ
+# ==============================================================================
+
+Z2K_VERSION="2.0.1"
+WORK_DIR="/tmp/z2k"
+LIB_DIR="${WORK_DIR}/lib"
+
+# Display version = the installed RELEASE TAG (e.g. p-59.1) — the SAME source the
+# webpanel and diag show, so every surface reports one consistent version. Falls
+# back to the product constant only if the tag file isn't present yet (fresh
+# install before the tag is written / pre-versioning install).
+z2k_display_version() {
+    local t
+    t=$(head -1 "${ZAPRET2_DIR:-/opt/zapret2}/.z2k-installed-tag" 2>/dev/null | tr -d ' \r\n')
+    [ -n "$t" ] && printf '%s' "$t" || printf '%s' "$Z2K_VERSION"
+}
+# Default branch URL — matches the branch this z2k.sh was fetched from.
+# On merge to master this line is updated to master. Overridable via
+# GITHUB_RAW env var for cross-branch testing.
+GITHUB_RAW="${GITHUB_RAW:-https://raw.githubusercontent.com/necronicle/z2k/z2k-enhanced}"
+
+# Экспортировать переменные для использования в функциях
+export WORK_DIR
+export LIB_DIR
+export GITHUB_RAW
+
+# VPS SNI-passthrough egress для GitHub. RU IP-блокирует Fastly anycast
+# (185.199.108-111.133) за raw/objects/release-assets.githubusercontent.com,
+# поэтому прямые github-IP (и DoH-пины на них) перестали доходить по стране.
+# Наш VPS (nginx ssl_preread) форвардит SNI-совпавшие github(usercontent)
+# хосты на реальный backend через EU-egress, отдавая СОБСТВЕННЫЙ сертификат
+# GitHub — значит обычный `--resolve <githubhost>:443:<VPS>` качает по TLS с
+# валидным сертом, без pin/конфига. Транзиентно per-request (в отличие от
+# лишней тяжёлой попытки скачивания). Overridable через env.
+Z2K_VPS_GH_IP="${Z2K_VPS_GH_IP:-85.192.60.175}"
+export Z2K_VPS_GH_IP
+
+# Бюджет коннекта Layer 0 и число попыток.
+#
+# Замер 2026-08-21 на живом роутере: здоровый коннект к нашему VPS — 0.075 с
+# TCP, 0.185 с вместе с TLS. При этом 13-17% попыток не устанавливаются вовсе:
+# SYN до VPS доходит, VPS отвечает SYN-ACK через 14 мкс, обратный пакет
+# теряется, а повторные SYN до VPS уже не долетают. Со --connect-timeout 10
+# каждый такой случай стоил полные 10.5 с — за одну установку 10 штук, то есть
+# 105 с из 405.
+#
+# curl(1) про --connect-timeout: "The connection phase is considered complete
+# when the DNS lookup and requested TCP, TLS or QUIC handshakes are done", то
+# есть бюджет покрывает и TLS — меряем против 0.185 с, а не против 0.075 с.
+# 3 с = 16-кратный запас к измеренному.
+#
+# Вторая попытка, а не просто короткий таймаут: Layer 0 существует ради тех, у
+# кого прямой github закрыт, и бросать основной путь из-за одного потерянного
+# пакета нельзя. Потеря SYN-ACK — событие независимое, повтор стоит 0.27 с.
+Z2K_FETCH_VPS_CONNECT_TIMEOUT="${Z2K_FETCH_VPS_CONNECT_TIMEOUT:-8}"
+Z2K_FETCH_VPS_TRIES="${Z2K_FETCH_VPS_TRIES:-2}"
+export Z2K_FETCH_VPS_CONNECT_TIMEOUT Z2K_FETCH_VPS_TRIES
+
+# Echo `--resolve h:443:<VPS> ...` для КАЖДОГО github-хоста в цепочке
+# редиректов (release-download: github.com → 302 → objects/release-assets),
+# но ТОЛЬКО для URL'ов, чей origin-хост VPS реально passthrough-роутит
+# (*.githubusercontent.com и github.com/*.github.com). Пусто для
+# jsdelivr/gh-proxy/прочих — они доходят на своих хостах и пинить их к VPS
+# нельзя. Пустой Z2K_VPS_GH_IP (=явно отключён) → пусто, Layer 0 пропускается.
+_z2k_vps_gh_resolve() {
+    [ -n "${Z2K_VPS_GH_IP:-}" ] || return 0
+    # Извлечь реальный host (между :// и первым /), чтобы жадный glob не
+    # матчил github-хост В ПУТИ (напр. gh-proxy.com/https://raw.github...).
+    local _h="${1#*://}"; _h="${_h%%/*}"; _h="${_h%%:*}"
+    case "$_h" in
+        *.githubusercontent.com|github.com|*.github.com) ;;
+        *) return 0 ;;
+    esac
+    local h
+    for h in raw.githubusercontent.com objects.githubusercontent.com \
+             release-assets.githubusercontent.com gist.githubusercontent.com \
+             github.com codeload.github.com api.github.com; do
+        printf ' --resolve %s:443:%s' "$h" "$Z2K_VPS_GH_IP"
+    done
+}
+
+# Список модулей для загрузки
+MODULES="utils install strategies config config_official webpanel menu auto_update wan"
+
+# ==============================================================================
+# ВСТРОЕННЫЕ FALLBACK ФУНКЦИИ
+# ==============================================================================
+# Минимальные функции для работы до загрузки модулей
+
+print_info() {
+    printf "[i] %s\n" "$1"
+}
+
+print_success() {
+    printf "[[OK]] %s\n" "$1"
+}
+
+print_error() {
+    printf "[[FAIL]] %s\n" "$1" >&2
+}
+
+die() {
+    print_error "$1"
+    [ -n "$2" ] && exit "$2" || exit 1
+}
+
+clear_screen() {
+    if [ -t 1 ]; then
+        clear 2>/dev/null || printf "\033c"
+    fi
+}
+
+print_header() {
+    printf "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    printf "  %s\n" "$1"
+    printf "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+}
+
+print_separator() {
+    printf "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+}
+
+confirm() {
+    local prompt=${1:-"Продолжить?"}
+    local default=${2:-"Y"}
+    local answer=""
+
+    # Non-interactive контекст (webpanel apply / auto-update / SSH без -t /
+    # pipe `curl | sh`): установка обязана идти полностью автоматически,
+    # без участия юзера (Mark policy 2026-05-28). Авто-выбираем default
+    # вместо зависания/падения на read </dev/tty. Y→0 (да), N→1 (нет).
+    if [ ! -t 0 ] || [ ! -r /dev/tty ]; then
+        printf "%s [%s] (авто: non-interactive)\n" "$prompt" "$default"
+        [ "$default" = "Y" ] && return 0
+        return 1
+    fi
+
+    while true; do
+        if [ "$default" = "Y" ]; then
+            printf "%s [Y/n]: " "$prompt"
+        else
+            printf "%s [y/N]: " "$prompt"
+        fi
+
+        if ! read -r answer </dev/tty; then
+            return 1
+        fi
+
+        answer=$(printf '%s' "$answer" | tr -d "$(printf '\r\b\177')" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+
+        case "$answer" in
+            "")
+                [ "$default" = "Y" ] && return 0
+                return 1
+                ;;
+            *[Yy]|*[Yy][Ee][Ss]|*[Дд]|*[Дд][Аа])
+                return 0
+                ;;
+            *[Nn]|*[Nn][Oo]|*[Нн][Ее][Тт])
+                return 1
+                ;;
+            *)
+                print_info "Введите y/n"
+                ;;
+        esac
+    done
+}
+
+# --- z2k shared shell helpers (canonical; keep byte-identical in all 4 copies) ---
+#
+# КОПИИ, А НЕ ОБЩИЙ ФАЙЛ — по той же причине, что и у _z2k_curl_etag: z2k.sh
+# качается через `curl | sh` тогда, когда lib/utils.sh в системе ещё нет, а
+# files/z2k-update-lists.sh и files/z2k-geosite.sh запускаются из cron
+# самостоятельными скриптами и utils.sh не сорсят вовсе. Забор с этим же
+# словарём стоит вокруг awk-фильтра адресов в files/z2k-warp.sh — держим блок
+# байт в байт, расхождение стережёт тест.
+
+# z2k_uint ЗНАЧЕНИЕ ДЕФОЛТ [МИН] [МАКС] — печатает целое, годное для `test`.
+#
+# Ручки приходят из окружения (cron, install.sh, рука человека), и мусор в них
+# стоил целого слоя: Z2K_FETCH_VPS_TRIES=abc роняло `test` с «Illegal number» —
+# цикл не исполнялся ни разу; Z2K_FETCH_VPS_CONNECT_TIMEOUT="3s" заставляло curl
+# выйти с rc=2 и не напечатать ничего. В обоих случаях Layer 0 молча выключался
+# на весь прогон, а в поток установки сыпалась ошибка.
+#
+# Не-число заменяем дефолтом, а выход за границы ЗАЖИМАЕМ, а не сбрасываем в
+# дефолт: потолок обязан оставаться потолком, иначе TRIES=100000 вернулся бы к
+# двум попыткам вместо обещанных пяти. Ноль уезжает в пол по той же логике:
+# --connect-timeout 0 у curl означает «без ограничения вовсе».
+z2k_uint() {
+    local _zu_v="$1"
+    case "$_zu_v" in ''|*[!0-9]*) _zu_v="$2" ;; esac
+    if [ -n "${3:-}" ] && [ "$_zu_v" -lt "$3" ]; then _zu_v="$3"; fi
+    if [ -n "${4:-}" ] && [ "$_zu_v" -gt "$4" ]; then _zu_v="$4"; fi
+    printf '%s' "$_zu_v"
+}
+
+# z2k_connfail КОД_ВОЗВРАТА_CURL КОД_ОТВЕТА — истина, если запрос умер в ФАЗЕ
+# СОЕДИНЕНИЯ, то есть от сервера не пришло ничего. Только такой отказ имеет
+# смысл повторять: потерянный пакет рукопожатия — событие независимое.
+#
+# Раньше гейт повтора смотрел на %{time_connect}, и это ловило меньше, чем
+# обещало: time_connect считает ОДИН TCP-хендшейк, а --connect-timeout по
+# curl(1) ограничивает DNS+TCP+TLS целиком. Замер: коннект в чёрную дыру даёт
+# tc=0.000000 (повтор), а «TCP встал, TLS не ответил» — tc=0.032246, то есть
+# уходило в break, хотя это ровно тот же класс отказа, ради которого повтор и
+# заводился.
+#
+# Считаем по коду возврата curl В СВЯЗКЕ с кодом ответа: 6 (DNS), 7 (connect
+# refused), 28 (timeout), 35 (TLS) при пустом или 000 ответе означают, что
+# ответа не было. Тот же rc=28, но с кодом ответа 200 — это упор в --max-time
+# на УЖЕ идущей передаче, и повторять его нельзя: повтор просто удваивает цену
+# отказа. 5xx, 404, пустое тело и промах sha-гейта — тем более.
+z2k_connfail() {
+    case "$1" in
+        6|7|28|35) ;;
+        *) return 1 ;;
+    esac
+    case "$2" in
+        ''|000) return 0 ;;
+    esac
+    return 1
+}
+# --- end z2k shared shell helpers ---
+
+# ==============================================================================
+# z2k_fetch — загрузка файла с GitHub через цепочку зеркал.
+# ==============================================================================
+#
+# Российские провайдеры местами режут raw.githubusercontent.com (DNS
+# poisoning / SNI block), из-за чего первый curl при установке падает и
+# ничего дальше не работает. Обходим тремя зеркалами + DNS-override на
+# Keenetic как последним шансом:
+#
+#   1. raw.githubusercontent.com           — прямой путь, самый свежий
+#   2. cdn.jsdelivr.net/gh/<o>/<r>@<br>/<p> — CDN, 12h edge-кеш
+#                                            (purge: https://purge.jsdelivr.net/gh/<o>/<r>@<br>/<p>)
+#   3. gh-proxy.com/<raw-url>              — reverse-proxy без кеша
+# Четвёртого слоя больше нет: он писал постоянные записи в конфиг роутера,
+# см. комментарий в теле функции.
+#
+# Использование:
+#   z2k_fetch "https://raw.githubusercontent.com/owner/repo/branch/path" /tmp/dest
+#   z2k_fetch "relative/path"         /tmp/dest   # тогда префикс = $GITHUB_RAW
+#
+# Возвращает 0 при успехе (файл записан либо 304 Not Modified — кэш
+# валиден), 1 — все слои не сработали.
+#
+# ETag-aware: каждый слой отправляет `If-None-Match: <old_etag>` если
+# есть cached etag в `${dest}.etag`. На 304 тело не качается, файл
+# остаётся как был — типично ~500ms вместо ~5s на unchanged контент.
+_z2k_curl_etag() {
+    local url="$1" dest="$2" resolve_args="$3" conn_to="${4:-10}"
+    local etag_file="${dest}.etag"
+    local hdr_file="${dest}.hdr.$$"
+    local tmp_body="${dest}.new.$$"
+    local old_etag="" http_status curl_rc
+    if [ -f "$etag_file" ] && [ -s "$dest" ]; then
+        old_etag=$(cat "$etag_file" 2>/dev/null)
+    fi
+    # $resolve_args (unquoted, намеренный word-split — как в _z2k_curl_doh):
+    # пусто в обычных вызовах, `--resolve h:443:ip ...` в Layer 0 VPS-хопе.
+    # ОГРАНИЧИТЕЛЬ ЗАВИСШЕЙ ПЕРЕДАЧИ. --connect-timeout бюджетирует ТОЛЬКО
+    # рукопожатие; после него у передачи оставался один потолок — --max-time 180.
+    # Блокировка по SNI рвёт соединение сразу и стоит миллисекунды, а вот
+    # ЗАМЕДЛЕНИЕ выглядит как живой канал: байты идут, но по капле. Такой файл
+    # держал слой три минуты, и на полутора сотнях файлов обновления это часы
+    # вместо перехода к следующему зеркалу. --speed-limit/--speed-time обрывают
+    # передачу, если она пятнадцать секунд идёт медленнее килобайта в секунду:
+    # медленная, но живая загрузка не страдает, мёртвая отпускает за 15 с.
+    if [ -n "$old_etag" ]; then
+        http_status=$(curl -sSL --connect-timeout "$conn_to" --max-time 180 --speed-limit "${Z2K_FETCH_STALL_BYTES:-1024}" --speed-time "${Z2K_FETCH_STALL_SECONDS:-15}" $resolve_args \
+            -H "If-None-Match: $old_etag" -D "$hdr_file" -o "$tmp_body" \
+            -w "%{http_code} %{time_connect}" "$url" 2>/dev/null)
+        curl_rc=$?
+    else
+        http_status=$(curl -sSL --connect-timeout "$conn_to" --max-time 180 --speed-limit "${Z2K_FETCH_STALL_BYTES:-1024}" --speed-time "${Z2K_FETCH_STALL_SECONDS:-15}" $resolve_args \
+            -D "$hdr_file" -o "$tmp_body" \
+            -w "%{http_code} %{time_connect}" "$url" 2>/dev/null)
+        curl_rc=$?
+    fi
+    # Код ответа и время установления соединения приходят одной строкой — но
+    # только пока curl напечатал её целиком. На НЕПУСТОМ выводе без пробела
+    # `${x##* }` возвращает СТРОКУ ЦЕЛИКОМ: in=[200] давало CONNECT=[200], и
+    # гейт повтора принимал код ответа за время коннекта. Копия в geosite от
+    # этого страхуется подстановкой "000 0", здесь не страховало ничто.
+    # Нет пробела — значит времени коннекта нет.
+    case "$http_status" in
+        *' '*) Z2K_LAST_CONNECT="${http_status##* }" ;;
+        *)     Z2K_LAST_CONNECT=0 ;;
+    esac
+    http_status="${http_status%% *}"
+    # Отказ ФАЗЫ СОЕДИНЕНИЯ — единственный класс, который стоит повторять на
+    # Layer 0 (см. z2k_connfail). Считаем здесь и по СЫРОМУ коду ответа: ниже
+    # он местами подменяется на 000 для отчёта вызывающему, и гейт повтора
+    # принял бы оборванную на середине передачу за потерянное рукопожатие.
+    Z2K_LAST_CONNFAIL=0
+    if z2k_connfail "$curl_rc" "$http_status"; then Z2K_LAST_CONNFAIL=1; fi
+    [ "$curl_rc" -eq 0 ] || { rm -f "$hdr_file" "$tmp_body"; return 1; }
+    case "$http_status" in
+        304) rm -f "$hdr_file" "$tmp_body"; return 0 ;;
+        200)
+            [ ! -s "$tmp_body" ] && { rm -f "$hdr_file" "$tmp_body"; return 1; }
+            local new_etag
+            new_etag=$(grep -i '^etag:' "$hdr_file" 2>/dev/null | head -1 \
+                       | sed 's/^[^:]*:[[:space:]]*//; s/\r$//; s/[[:space:]]*$//')
+            mkdir -p "$(dirname "$dest")" 2>/dev/null
+            # Провалившийся mv оставил бы dest со СТАРЫМ телом при ETag от
+            # НОВОГО — следующий запрос получил бы 304 на это рассогласование и
+            # закрепил протухший файл как валидный. Копия в z2k-update-lists.sh
+            # делает так же; здесь сверху ещё и sha-гейт, но транспорт не должен
+            # зависеть от слоя над ним.
+            if ! mv -f "$tmp_body" "$dest"; then
+                rm -f "$hdr_file" "$tmp_body" "$etag_file"
+                return 1
+            fi
+            if [ -n "$new_etag" ]; then printf '%s\n' "$new_etag" > "$etag_file"
+            else rm -f "$etag_file"; fi
+            rm -f "$hdr_file"; return 0 ;;
+        *) rm -f "$hdr_file" "$tmp_body"; return 1 ;;
+    esac
+}
+
+# Layer 5: DoH (1.1.1.1) + захардкоженные edge-IP пины. Включается
+# когда все 4 предыдущих слоя зафейлились — сценарий MTS/мобайл RU
+# где TSPU после 31.03.2026 интермиттентно RST'ит TLS handshake'и
+# по SNI И отдельно глушит DNS recursive resolver. DoH идёт TLS на
+# 1.1.1.1 (Cloudflare DNS), TSPU не видит query payload. --resolve
+# пинит connect address на anycast edge IP — TSPU не успевает
+# enumerate все anycast endpoint'ы и часть проходит.
+#
+# IP'ы Fastly/GitHub Pages иногда меняются (~24h окно), поэтому
+# здесь несколько IP per host: curl попробует по очереди. Если
+# Fastly разом ротанул весь блок — этот слой деградирует, но
+# слои 1-4 не должны зафейлиться одновременно с этим (кроме MTS),
+# так что на стабильных провайдерах DoH-слой никогда и не вызовут.
+#
+# Curl ≥ 7.62 нужен для --doh-url. На Entware mips старый curl
+# (7.60-) не имеет — graceful: проверяем поддержку при первом вызове
+# и кэшируем результат.
+_z2k_doh_supported=""
+_z2k_doh_check() {
+    [ -n "$_z2k_doh_supported" ] && return 0
+    if curl --help all 2>/dev/null | grep -q -- "--doh-url"; then
+        _z2k_doh_supported=1
+    else
+        _z2k_doh_supported=0
+    fi
+    return 0
+}
+# Resolve a hostname's A records via 1.1.1.1's DoH JSON API. Result
+# cached per-host in env vars Z2K_POOL_<sanitized_host> for the rest
+# of the install run, so we hit the network at most once per host.
+# Returns space-separated IPs on stdout, or non-zero (with no stdout)
+# if 1.1.1.1 was unreachable / response unparseable.
+#
+# Why this exists: hardcoded Fastly/GitHub-Pages pools used to rotate
+# every ~24h, and a stale entry caused install fails when the canonical
+# anycast IP moved. DoH-resolved pools always reflect current state.
+# `1.1.1.1` itself is on Cloudflare-owned infrastructure and its IP
+# never rotates, so this layer doesn't recurse into the same problem.
+_z2k_resolve_doh_pool() {
+    local host="$1"
+    local cache_var
+    cache_var="Z2K_POOL_$(printf '%s' "$host" | tr -c '[:alnum:]' '_')"
+    eval "local cached=\${$cache_var:-}"
+    if [ -n "$cached" ]; then printf '%s' "$cached"; return 0; fi
+    local resp
+    resp=$(curl -sS --max-time 5 \
+        "https://1.1.1.1/dns-query?name=${host}&type=A" \
+        -H 'accept: application/dns-json' 2>/dev/null) || return 1
+    local ips
+    ips=$(printf '%s' "$resp" \
+          | sed 's/[{},]/\n/g' \
+          | sed -n 's/.*"data":"\([0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\)".*/\1/p' \
+          | tr '\n' ' ' \
+          | sed 's/ *$//')
+    [ -z "$ips" ] && return 1
+    eval "$cache_var=\"\$ips\"; export $cache_var"
+    printf '%s' "$ips"
+    return 0
+}
+
+_z2k_curl_doh() {
+    local url="$1" dest="$2"
+    _z2k_doh_check
+    [ "$_z2k_doh_supported" = "1" ] || return 1
+
+    # Anycast pools: prefer DoH-resolved (always fresh), fall through
+    # to hardcoded fallback if 1.1.1.1 itself is unreachable.
+    # Hardcoded pool is verified-working as of 2026-04-26 but rotates.
+    local gh_pool raw_pool jsd_pool obj_pool rel_pool api_pool
+    gh_pool=$(_z2k_resolve_doh_pool github.com) \
+        || gh_pool="140.82.112.3 140.82.113.3 140.82.114.3 140.82.121.3 140.82.116.3"
+    raw_pool=$(_z2k_resolve_doh_pool raw.githubusercontent.com) \
+        || raw_pool="185.199.108.133 185.199.109.133 185.199.110.133 185.199.111.133"
+    jsd_pool=$(_z2k_resolve_doh_pool cdn.jsdelivr.net) \
+        || jsd_pool="151.101.1.229 151.101.65.229 151.101.129.229 151.101.193.229"
+    obj_pool=$(_z2k_resolve_doh_pool objects.githubusercontent.com) \
+        || obj_pool="$raw_pool"
+    rel_pool=$(_z2k_resolve_doh_pool release-assets.githubusercontent.com) \
+        || rel_pool="$raw_pool"
+    api_pool=$(_z2k_resolve_doh_pool api.github.com) \
+        || api_pool="$gh_pool"
+
+    local resolve_args=""
+    add_resolve() {
+        local h=$1 ips=$2 ip
+        for ip in $ips; do
+            resolve_args="$resolve_args --resolve $h:443:$ip"
+        done
+    }
+
+    case "$url" in
+        *raw.githubusercontent.com*)
+            add_resolve raw.githubusercontent.com "$raw_pool" ;;
+        *cdn.jsdelivr.net*)
+            add_resolve cdn.jsdelivr.net "$jsd_pool" ;;
+        *gh-proxy.com*)
+            : ;;  # gh-proxy.com — small self-hosted, IP-пин нестабилен
+        *api.github.com*)
+            add_resolve api.github.com "$api_pool" ;;
+        https://github.com/*/releases/download/*)
+            # Release tarballs: 302 от github.com на release-assets.* или
+            # objects.* CDN. Пиним все домены редиректа — иначе TSPU/SNI/DNS
+            # блок на любом из них режет скачивание tarball.
+            add_resolve github.com "$gh_pool"
+            add_resolve objects.githubusercontent.com "$obj_pool"
+            add_resolve release-assets.githubusercontent.com "$rel_pool" ;;
+    esac
+
+    local hdr_file="${dest}.hdr.$$"
+    local tmp_body="${dest}.new.$$"
+    local http_status
+
+    # Retry с jitter: TSPU sliding-window после успешных flow часто
+    # начинает резaть следующие. Pause между attempt дает state-window
+    # expired; чем дальше попытка тем длиннее sleep (3s, 8s, 15s).
+    local attempt sleeps='0 3 8'
+    for attempt in $sleeps; do
+        [ "$attempt" -gt 0 ] && sleep "$attempt"
+        http_status=$(curl -sSL --connect-timeout 10 --max-time 180 --speed-limit "${Z2K_FETCH_STALL_BYTES:-1024}" --speed-time "${Z2K_FETCH_STALL_SECONDS:-15}" \
+            --doh-url https://1.1.1.1/dns-query $resolve_args \
+            -D "$hdr_file" -o "$tmp_body" \
+            -w "%{http_code}" "$url" 2>/dev/null)
+        local curl_rc=$?
+        if [ "$curl_rc" -ne 0 ]; then
+            rm -f "$hdr_file" "$tmp_body" 2>/dev/null
+            continue
+        fi
+        case "$http_status" in
+            200)
+                [ ! -s "$tmp_body" ] && { rm -f "$hdr_file" "$tmp_body"; continue; }
+                local new_etag
+                new_etag=$(grep -i '^etag:' "$hdr_file" 2>/dev/null | head -1 \
+                           | sed 's/^[^:]*:[[:space:]]*//; s/\r$//; s/[[:space:]]*$//')
+                mkdir -p "$(dirname "$dest")" 2>/dev/null
+                mv -f "$tmp_body" "$dest"
+                if [ -n "$new_etag" ]; then printf '%s\n' "$new_etag" > "${dest}.etag"
+                else rm -f "${dest}.etag"; fi
+                rm -f "$hdr_file"
+                return 0 ;;
+        esac
+        rm -f "$hdr_file" "$tmp_body" 2>/dev/null
+    done
+
+    # Если single-shot не пробил (самый частый случай — большой файл,
+    # TSPU режет посредине long transfer), fallback на chunked range
+    # download. Каждый chunk отдельный TLS handshake → TSPU sliding-
+    # window не накапливает state. 500 KB на чанк подобрано так чтобы
+    # большинство файлов в repo (~95% < 500 KB) уложились в один chunk
+    # и для big snapshot files (RKN/List.txt 1.9 MB) получилось ровно
+    # 4 чанка с разумными jitter паузами.
+    _z2k_curl_doh_chunked "$url" "$dest" "$resolve_args" && return 0
+
+    return 1
+}
+
+# Chunked range-download через DoH+pin. Используется для files >500KB
+# когда single-shot DoH через TSPU не доходит до конца.
+_z2k_curl_doh_chunked() {
+    local url="$1" dest="$2" resolve_args="$3"
+    local tmp_body="${dest}.new.$$"
+    : > "$tmp_body" || return 1
+
+    local chunk_size=500000
+    local offset=0 chunk_count=0 max_chunks=20
+    local rc http_status
+
+    while [ "$chunk_count" -lt "$max_chunks" ]; do
+        local end=$((offset + chunk_size - 1))
+        http_status=$(curl -sSL --connect-timeout 10 --max-time 60 \
+            --doh-url https://1.1.1.1/dns-query $resolve_args \
+            --range "${offset}-${end}" \
+            -o "${tmp_body}.chunk" \
+            -w "%{http_code}" "$url" 2>/dev/null)
+        local curl_rc=$?
+        if [ "$curl_rc" -ne 0 ]; then
+            rm -f "${tmp_body}.chunk"
+            rc=1
+            break
+        fi
+        case "$http_status" in
+            206|200)
+                cat "${tmp_body}.chunk" >> "$tmp_body"
+                local got
+                got=$(wc -c < "${tmp_body}.chunk" 2>/dev/null)
+                rm -f "${tmp_body}.chunk"
+                [ -z "$got" ] || [ "$got" -lt 1 ] && break
+                # Если меньше chunk_size получили — это последний chunk
+                if [ "$got" -lt "$chunk_size" ]; then
+                    rc=0
+                    break
+                fi
+                offset=$((offset + chunk_size))
+                chunk_count=$((chunk_count + 1))
+                # Jitter: TSPU sliding-window не накопит state если пауза
+                sleep 2
+                ;;
+            416)
+                # Range Not Satisfiable — мы прошли конец файла, всё OK
+                rc=0
+                rm -f "${tmp_body}.chunk"
+                break ;;
+            *)
+                rm -f "${tmp_body}.chunk"
+                rc=1
+                break ;;
+        esac
+    done
+
+    if [ "${rc:-1}" = "0" ] && [ -s "$tmp_body" ]; then
+        mkdir -p "$(dirname "$dest")" 2>/dev/null
+        mv -f "$tmp_body" "$dest"
+        rm -f "${dest}.etag"  # chunked download leaves no per-file etag
+        return 0
+    fi
+    rm -f "$tmp_body" "${tmp_body}.chunk" 2>/dev/null
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Дайджесты проверяльщика подписи (z2k-verify)
+# ---------------------------------------------------------------------------
+#
+# ПОЧЕМУ ЗДЕСЬ, А НЕ В install.sh. Проверяльщик — это то, чем проверяется
+# манифест. Манифестом же проверяется всё остальное, включая сам install.sh.
+# Положить пин туда значило бы замкнуть круг: чтобы доверять проверяльщику,
+# нужно доверять манифесту, а чтобы доверять манифесту — проверяльщику.
+#
+# z2k.sh круг разрывает, потому что он и есть корень доверия при первой
+# установке: его человек тянет сам командой из README. Дальше от этих байтов
+# всё и пляшет — поэтому дайджест живёт ровно здесь.
+#
+# Меняются они только при бампе Go-тулчейна: в бинарнике намеренно нет ничего
+# изменчивого — ни ключа, ни версии, всё приходит аргументами. Ротация ключа
+# пересборки НЕ требует.
+#
+# Сборка воспроизводима (-trimpath -buildvcs=false), так что один и тот же
+# исходник с тем же тулчейном даёт байт в байт тот же файл, и гейт
+# tests/test_verifier_pin.sh это сторожит.
+_z2k_verify_pin() {
+    case "$1" in
+        linux-386)       printf c4dd725afde508ea88443be95a743ff65576ab5b67b459cf56a6f84147d56a4a ;;
+        linux-amd64)     printf a6d464fa9558cde252df0343a65e384e728f36ada2ad13f484a40ca5f1d0f637 ;;
+        linux-arm)       printf c9a4b45a19e47b10519dea73e3deb4a73ec21d79c82509f8d301cac7e5835242 ;;
+        linux-arm64)     printf 17100b6758cca49b8cdfe37c96034aa58e2203c338debd8d32945cf477f0b3cf ;;
+        linux-mips)      printf a902128d670990730849959868df7af6cd47a379d4150ea5327c5ab426ad316c ;;
+        linux-mips64le)  printf 43301a645b3eb4a114a4e548684c365148d6287402002b3c949ccb8848b30935 ;;
+        linux-mipsle)    printf 2487675fbca54c9ef5873990d73feebae8cff4416620596d5da3f2b3d529d797 ;;
+        linux-ppc64)     printf c337b976fc61664720414a2f643491e5f05fbb6fe242dbfb193a6d58da1f4877 ;;
+        linux-riscv64)   printf 0bf0f6711b100fa3f5ddfde6ad3149ad394c9ea2d1615471da9cd8d97b00a9ac ;;
+        *) return 1 ;;
+    esac
+}
+
+# LEXRA: проверяльщика там не будет НИКОГДА, и это надо знать заранее.
+#
+# Go не умеет целиться в lexra (это MIPS-вариант без части инструкций), поэтому
+# ни один наш Go-бинарник под неё не собирается — ни z2k-detect, ни клиент
+# туннеля, ни этот проверяльщик. Движок zapret2 там работает: его собирает
+# апстрим своим тулчейном, у него lexra есть.
+#
+# Что это означает на практике: на lexra проверка подписи ложится целиком на
+# openssl. Если он там есть и умеет Ed25519 — подпись работает и храповик
+# защёлкивается как обычно. Если нет — au_manifest_verify честно вернёт «нечем
+# проверить», и пока храповик не защёлкнут, манифест принимается без подписи.
+#
+# Опасное сочетание одно: openssl отработал, храповик защёлкнулся, а потом
+# openssl обновили или снесли. Тогда обновления встанут, и вылечит только
+# ручная переустановка. Пишем это здесь, а не выясняем в поле.
+#
+# _z2k_check_verifier FILE ARCH -> 0 если файл совпал с пином для этой арки.
+# Пина нет (новая арка) — 1: молча принимать непроверенный проверяльщик нельзя,
+# иначе весь смысл адресации содержимым теряется.
+_z2k_check_verifier() {
+    local _f="$1" _arch="$2" _want _got
+    _want=$(_z2k_verify_pin "$_arch") || return 1
+    [ -s "$_f" ] || return 1
+    _got=$(z2k_sha256_file "$_f" 2>/dev/null)
+    [ -n "$_got" ] || return 1
+    [ "$_got" = "$_want" ]
+}
+
+# _z2k_manifest_sha REPO_PATH -> expected sha256 at HEAD, empty if unknown.
+#
+# Reads the files_sha256 map published in UPDATES.json (see
+# scripts/gen_file_hashes.sh). Empty answer = nothing to check against, which is
+# also what every manifest published before this existed will give.
+_z2k_manifest_sha() {
+    local _ms_path="$1" _ms_esc
+    [ -n "${Z2K_HASH_MANIFEST:-}" ] && [ -f "$Z2K_HASH_MANIFEST" ] || return 0
+    _ms_esc=$(printf '%s' "$_ms_path" | sed 's/[][\.*^$/]/\\&/g')
+    tr -d '\n' < "$Z2K_HASH_MANIFEST" 2>/dev/null \
+        | sed -n 's/.*"files_sha256"[[:space:]]*:[[:space:]]*{\([^}]*\)}.*/\1/p' \
+        | tr ',' '\n' \
+        | sed -n "s/^[[:space:]]*\"${_ms_esc}\"[[:space:]]*:[[:space:]]*\"\([0-9a-fA-F]\{64\}\)\".*/\1/p" \
+        | head -1
+}
+
+# Pull the manifest that every later download is checked against. It is the one
+# thing we cannot verify against anything else, so it is always fetched fresh:
+# its etag sidecar is dropped first, because a stale manifest would happily
+# vouch for stale files and put us right back where issue #26 started.
+#
+# Failure is not fatal — we simply install without content verification, exactly
+# as every release before this one did.
+z2k_fetch_manifest_hashes() {
+    local _hm_dest="${WORK_DIR}/UPDATES.json"
+    Z2K_HASH_MANIFEST=""
+    export Z2K_HASH_MANIFEST
+    mkdir -p "$WORK_DIR" 2>/dev/null || return 0
+    rm -f "$_hm_dest" "${_hm_dest}.etag" 2>/dev/null
+    if z2k_fetch "${GITHUB_RAW}/UPDATES.json" "$_hm_dest" 2>/dev/null && [ -s "$_hm_dest" ]; then
+        Z2K_HASH_MANIFEST="$_hm_dest"
+        export Z2K_HASH_MANIFEST
+        print_info "Манифест хешей загружен — содержимое файлов будет проверено" 2>/dev/null || true
+    else
+        print_warning "Манифест хешей недоступен — установка пойдёт без проверки содержимого" 2>/dev/null || true
+    fi
+    return 0
+}
+
+z2k_fetch() {
+    local src="$1"
+    local dest="$2"
+    local url
+
+    case "$src" in
+        http://*|https://*) url="$src" ;;
+        /*) url="${GITHUB_RAW}${src}" ;;
+        *)  url="${GITHUB_RAW}/${src}" ;;
+    esac
+
+    # Content gate. `local` so the lookup below cannot leak into the next call:
+    # a digest left set would be checked against a different file and reject it.
+    # An explicit Z2K_FETCH_SHA256 from the caller always wins; otherwise, for
+    # URLs inside our own repo, take the expected digest from the manifest. URLs
+    # pointing anywhere else (release assets, foreign list repos) get no digest
+    # and are fetched exactly as before. UPDATES.json itself is absent from the
+    # map by construction, so the trust root never tries to verify itself.
+    local Z2K_FETCH_SHA256="${Z2K_FETCH_SHA256:-}"
+    if [ -z "$Z2K_FETCH_SHA256" ] && [ -n "${Z2K_HASH_MANIFEST:-}" ]; then
+        case "$url" in
+            "${GITHUB_RAW}/"*) Z2K_FETCH_SHA256=$(_z2k_manifest_sha "${url#"${GITHUB_RAW}/"}") ;;
+        esac
+    fi
+
+    # Derive jsdelivr + gh-proxy mirror URLs. Coverage:
+    #   raw.githubusercontent.com — full mirroring via jsdelivr CDN +
+    #     gh-proxy reverse proxy.
+    #   github.com/<o>/<r>/releases/download/<tag>/<asset> — gh-proxy
+    #     handles release-asset downloads too (tarballs, binaries).
+    #     jsdelivr does NOT mirror release assets, only repo files.
+    #   api.github.com/* — no public mirrors; relies on layer 4 DNS
+    #     override only.
+    local jsdelivr="" gh_proxy=""
+    case "$url" in
+        https://raw.githubusercontent.com/*)
+            local _rest="${url#https://raw.githubusercontent.com/}"
+            local _owner="${_rest%%/*}";  _rest="${_rest#*/}"
+            local _repo="${_rest%%/*}";   _rest="${_rest#*/}"
+            local _branch="${_rest%%/*}"; _rest="${_rest#*/}"
+            jsdelivr="https://cdn.jsdelivr.net/gh/${_owner}/${_repo}@${_branch}/${_rest}"
+            gh_proxy="https://gh-proxy.com/${url}"
+            ;;
+        https://github.com/*/releases/download/*)
+            gh_proxy="https://gh-proxy.com/${url}"
+            ;;
+    esac
+
+    # gh-proxy — только там, где результат кто-то проверит.
+    #
+    # Разница между зеркалами не в надёжности, а в том, кто владеет ключом от
+    # TLS. jsdelivr и gh-proxy оба терминируют соединение у себя, но jsdelivr —
+    # Fastly с юрлицом, а gh-proxy анонимный сторонний прокси. Layer 0 (VPS)
+    # безопасен: там подменяется только адрес назначения, TLS остаётся
+    # сквозным до GitHub, и подделать его нельзя.
+    #
+    # Отключаем gh-proxy для файлов РЕПОЗИТОРИЯ без известного дайджеста. Это
+    # ровно один важный случай — сам манифест: он корень доверия и сверять его
+    # не с чем по построению. Подменённый манифест несёт ЧУЖИЕ хеши, и после
+    # него проверка каждого следующего файла подтверждает подмену вместо того,
+    # чтобы её ловить.
+    #
+    # Релиз-ассетам gh-proxy ОСТАВЛЯЕМ. Они не «непроверенные» — просто
+    # проверяются не здесь, а ниже по течению: бинарники движка против
+    # апстримного sha256sum.txt, install_bin.sh против нашего пина. И это
+    # единственное их запасное зеркало: jsdelivr релизы не зеркалит вовсе, так
+    # что отнять gh-proxy у тарбола значит оставить часть людей без движка.
+    case "$url" in
+        https://raw.githubusercontent.com/*)
+            [ -z "${Z2K_FETCH_SHA256:-}" ] && gh_proxy=""
+            ;;
+    esac
+
+    # Helper: any layer-1-4 success resets the DoH fail streak.
+    _z2k_fetch_ok() {
+        Z2K_FETCH_FAIL_STREAK=0
+        export Z2K_FETCH_FAIL_STREAK
+        return 0
+    }
+
+    # Helper: a layer only counts as successful if it delivered the bytes the
+    # caller asked for. $Z2K_FETCH_SHA256 unset (the common case) = accept.
+    #
+    # Every layer below either terminates TLS somewhere we do not control
+    # (jsdelivr, gh-proxy) or can answer 304 from a cache, leaving whatever is
+    # already on disk. Without this check the transport decides what gets
+    # installed and a merely STALE mirror is indistinguishable from a fresh one:
+    # the file silently stays old while the version tag moves forward. That is
+    # what pinned a user to a two-day-old revision across five releases with no
+    # error anywhere (issue #26).
+    #
+    # On mismatch the copy AND its etag are dropped — keeping the etag would let
+    # the next layer send If-None-Match, take a 304, and re-accept the bytes we
+    # just rejected. No digest tool => accept with a warning, because refusing
+    # every update on such a router is worse than the state it is already in.
+    _z2k_verify_fetched() {
+        local _vf_dest="$1" _vf_src="${2:-}" _vf_want="${Z2K_FETCH_SHA256:-}" _vf_got=""
+        [ -n "$_vf_want" ] || return 0
+        if command -v sha256sum >/dev/null 2>&1; then
+            _vf_got=$(sha256sum "$_vf_dest" 2>/dev/null | awk '{print $1}')
+        elif command -v openssl >/dev/null 2>&1; then
+            _vf_got=$(openssl dgst -sha256 "$_vf_dest" 2>/dev/null | awk '{print $NF}')
+        fi
+        if [ -z "$_vf_got" ]; then
+            printf '[z2k_fetch] нечем посчитать sha256 — проверка содержимого пропущена\n' >&2
+            return 0
+        fi
+        [ "$_vf_got" = "$_vf_want" ] && return 0
+        # ИМЯ СЛОЯ, А НЕ ТОЛЬКО ИМЯ ФАЙЛА. Слоёв пять, виноват всегда один, и
+        # без имени разбор упирается в догадки — ровно так и вышло с
+        # диагностикой 26.08.2026: установить зеркало по журналу было нельзя.
+        printf '[z2k_fetch] %s (%s): содержимое не то (ждали %.12s…, получили %.12s…) — источник отклонён\n' \
+            "${_vf_dest##*/}" "${_vf_src:-источник}" "$_vf_want" "$_vf_got" >&2
+        rm -f "$_vf_dest" "${_vf_dest}.etag" 2>/dev/null
+        return 1
+    }
+
+    # --- Layer 0: VPS SNI-passthrough egress (ПЕРВИЧНЫЙ путь для github) ---
+    # RU блокирует github Fastly anycast по IP → и прямой fetch, и DoH-пины на
+    # реальные github-IP валятся по всей стране. Наш VPS форвардит реальный
+    # github-хост через EU-egress с СЕРТификатом самого github (валидный TLS).
+    # Пробуем ПЕРВЫМ для github-URL; на ЛЮБОЙ сбой — ТИХО проваливаемся в
+    # цепочку direct→jsdelivr→gh-proxy→DoH ниже (значит отказ VPS
+    # деградирует до сегодняшнего поведения, а не в жёсткий фейл). Транзиентно:
+    # per-request --resolve, никаких постоянных записей в конфиг.
+    local _vps_resolve; _vps_resolve=$(_z2k_vps_gh_resolve "$url")
+    # ПРЯМОЙ GITHUB — ПЕРВЫМ, ПОКА ОН ОТВЕЧАЕТ.
+    #
+    # Раньше первым шёл наш VPS. Смысл в том, что часть провайдеров режет
+    # адреса GitHub, и таким людям прямой путь закрыт совсем. Но у этого
+    # порядка есть цена, которую видно только на масштабе: ВЕСЬ флот ходит к
+    # GitHub с ОДНОГО адреса — нашего узла, — а лимиты там считаются по адресу
+    # источника. Пока роутеров было немного, потолок не доставали; чем больше
+    # флот, тем чаще упираемся, и хуже всего в момент публикации, когда все
+    # идут разом. Замер 31.08.2026: в тишине узел получает ответ за 25 мс, под
+    # нагрузкой появляются зависания в три секунды и обрывы.
+    #
+    # Поэтому порядок обратный: сначала пробуем прямой путь — он идёт с адреса
+    # самого человека и ни с кем не делится, — и только если он не отвечает,
+    # уходим на узел.
+    #
+    # ВЕРДИКТ ВЫНОСИТСЯ ОДИН РАЗ ЗА ПРОГОН. Иначе человек с заблокированным
+    # GitHub платил бы таймаут на КАЖДОМ файле, а их в обновлении полсотни.
+    # Механизм тот же, что у размыкателя слоя VPS ниже: считаем подряд идущие
+    # отказы ФАЗЫ СОЕДИНЕНИЯ, после второго прямой путь выключается до конца
+    # прогона. Успех счётчик обнуляет.
+    #
+    # Бюджет короткий: три секунды на решение «жив или нет». Это не загрузка,
+    # это проба; здоровое соединение укладывается в десятки миллисекунд.
+    #
+    # Z2K_FETCH_DIRECT_FIRST=0 возвращает прежний порядок одной переменной.
+    if [ -n "$_vps_resolve" ] && [ "${Z2K_FETCH_DIRECT_FIRST:-1}" = "1" ] \
+       && [ "${Z2K_FETCH_DIRECT_OUT:-0}" != "1" ]; then
+        local _d_ct
+        _d_ct=$(z2k_uint "${Z2K_FETCH_DIRECT_CONNECT_TIMEOUT:-3}" 3 1 30)
+        if _z2k_curl_etag "$url" "$dest" "" "$_d_ct" \
+           && _z2k_verify_fetched "$dest" "GitHub напрямую"; then
+            Z2K_FETCH_DIRECT_CONNFAILS=0; export Z2K_FETCH_DIRECT_CONNFAILS
+            return 0
+        fi
+        # Отказ по СОДЕРЖИМОМУ сюда не идёт: там виноват не путь, и выключать
+        # его из-за одного расхождения значит терять быстрый путь на ровном
+        # месте. Считаем только отказы соединения — как и у слоя VPS.
+        if [ "${Z2K_LAST_CONNFAIL:-0}" = "1" ]; then
+            Z2K_FETCH_DIRECT_CONNFAILS=$(( ${Z2K_FETCH_DIRECT_CONNFAILS:-0} + 1 ))
+            export Z2K_FETCH_DIRECT_CONNFAILS
+            if [ "$Z2K_FETCH_DIRECT_CONNFAILS" -ge "$(z2k_uint "${Z2K_FETCH_DIRECT_GIVEUP:-2}" 2 1 20)" ]; then
+                Z2K_FETCH_DIRECT_OUT=1; export Z2K_FETCH_DIRECT_OUT
+                printf '[z2k_fetch] прямой GitHub не отвечает %s раз подряд — дальше через VPS\n' \
+                    "$Z2K_FETCH_DIRECT_CONNFAILS" >&2
+            fi
+        fi
+    fi
+
+    # Слой 0 отключён размыкателем ниже, если VPS не отвечал подряд.
+    if [ -n "$_vps_resolve" ] && [ "${Z2K_FETCH_VPS_OUT:-0}" != "1" ]; then
+        local _vps_tries _vps_ct
+        # --- z2k layer0 vps knobs (canonical; keep byte-identical in all 4 copies) ---
+        # Санитайз ручек — в z2k_uint: мусор → дефолт, выход за границы → зажим.
+        # Потолок в 5 попыток держит Layer 0 от превращения в многочасовой
+        # последовательный перебор ДО того, как будет испробован прямой путь.
+        # Вложенность у четвёртой копии своя — сравнивать без ведущих пробелов.
+        _vps_tries=$(z2k_uint "${Z2K_FETCH_VPS_TRIES:-2}" 2 1 5)
+        _vps_ct=$(z2k_uint "${Z2K_FETCH_VPS_CONNECT_TIMEOUT:-8}" 8 1)
+        # --- end z2k layer0 vps knobs ---
+        local _vps_try=0
+        while [ "$_vps_try" -lt "$_vps_tries" ]; do
+            _vps_try=$((_vps_try + 1))
+            if _z2k_curl_etag "$url" "$dest" "$_vps_resolve" \
+                   "$_vps_ct" \
+               && _z2k_verify_fetched "$dest" "VPS"; then
+                Z2K_FETCH_VPS_CONNFAILS=0; export Z2K_FETCH_VPS_CONNFAILS
+                _z2k_fetch_ok; return 0
+            fi
+            # --- z2k layer0 retry gate (canonical; keep byte-identical in all 4 copies) ---
+            # Повторяем ТОЛЬКО отказ фазы соединения (см. z2k_connfail).
+            # Вложенность у четвёртой копии своя — сравнивать без ведущих пробелов.
+            [ "${Z2K_LAST_CONNFAIL:-0}" = "1" ] || break
+            # --- end z2k layer0 retry gate ---
+        done
+        # --- z2k layer0 breaker (canonical; keep byte-identical in all 4 copies) ---
+        # Мёртвый VPS не должен стоить бюджета НА КАЖДОМ файле. Обновление тянет
+        # полторы сотни файлов, и при 8 с в две попытки это сорок минут чистого
+        # ожидания там, где ответ известен уже после первого. Считаем ПОДРЯД
+        # идущие отказы ФАЗЫ СОЕДИНЕНИЯ; после второго слой 0 отключается до
+        # конца прогона, любой его успех счётчик обнуляет.
+        #
+        # Отказ по СОДЕРЖИМОМУ сюда не идёт намеренно: там виноват не канал, и
+        # следующий файл с того же VPS может прийти целым. Отключать слой из-за
+        # одного расхождения значит терять первичный путь на ровном месте.
+        if [ "${Z2K_LAST_CONNFAIL:-0}" = "1" ]; then
+            # Считаем ПОПЫТКИ, а не вызовы: две подряд и есть исчерпанный
+            # бюджет слоя. По вызовам порог не взводился бы на первом файле,
+            # то есть ровно там, где ответ уже известен.
+            Z2K_FETCH_VPS_CONNFAILS=$(( ${Z2K_FETCH_VPS_CONNFAILS:-0} + _vps_try ))
+            export Z2K_FETCH_VPS_CONNFAILS
+            if [ "$Z2K_FETCH_VPS_CONNFAILS" -ge "$(z2k_uint "${Z2K_FETCH_VPS_GIVEUP:-2}" 2 1 20)" ]; then
+                Z2K_FETCH_VPS_OUT=1; export Z2K_FETCH_VPS_OUT
+                printf '[z2k_fetch] VPS не отвечает %s раз подряд — слой 0 отключён до конца прогона\n' \
+                    "$Z2K_FETCH_VPS_CONNFAILS" >&2
+            fi
+        fi
+        # --- end z2k layer0 breaker ---
+    fi
+
+    # Auto-promote DoH: only when we've fallen through to layer 5
+    # at least Z2K_FETCH_DOH_THRESHOLD times in a row (default 2).
+    # A single transient layer-1 fail used to flip the install into
+    # full-DoH mode for the rest of the run, even if the next file
+    # would have come down fine on raw — costing ~10× per file. The
+    # streak counter only promotes when DoH is the consistently-needed
+    # path, not when it just happened to win once.
+    : "${Z2K_FETCH_DOH_THRESHOLD:=2}"
+    if [ "${Z2K_FETCH_PREFER_DOH:-0}" = "1" ]; then
+        if _z2k_curl_doh "$url" "$dest" && _z2k_verify_fetched "$dest" "DoH"; then return 0; fi
+        [ -n "$jsdelivr" ] && _z2k_curl_doh "$jsdelivr" "$dest" && _z2k_verify_fetched "$dest" "DoH+jsdelivr" && return 0
+        [ -n "$gh_proxy" ] && _z2k_curl_doh "$gh_proxy" "$dest" && _z2k_verify_fetched "$dest" "DoH+gh-proxy" && return 0
+        # DoH тоже не сработал — на всякий case ещё попробуем normal layers
+    fi
+
+    # Каждый слой идёт через _z2k_curl_etag: на unchanged-контент 304 +
+    # пустое body ~10× быстрее чем полный GET. Etag sidecar ключован по
+    # $dest — переключение зеркала форсирует один full re-fetch
+    # (у raw.github и jsdelivr разные etag-ы), это приемлемо.
+    if _z2k_curl_etag "$url" "$dest" && _z2k_verify_fetched "$dest" "GitHub напрямую"; then _z2k_fetch_ok; return 0; fi
+    [ -n "$jsdelivr" ] && _z2k_curl_etag "$jsdelivr" "$dest" && _z2k_verify_fetched "$dest" "jsdelivr" && { _z2k_fetch_ok; return 0; }
+    [ -n "$gh_proxy" ] && _z2k_curl_etag "$gh_proxy" "$dest" && _z2k_verify_fetched "$dest" "gh-proxy" && { _z2k_fetch_ok; return 0; }
+
+    # All three normal mirrors fell through. This is the signal the user
+    # might have a poisoned/blocked channel — but ONE failure can also be
+    # transient (api.github.com rate limit, sporadic TCP RST). Bump the
+    # streak counter; the heavyweight fallback (Layer 5 DoH) fires after
+    # the streak crosses a threshold.
+    Z2K_FETCH_FAIL_STREAK=$((${Z2K_FETCH_FAIL_STREAK:-0} + 1))
+    export Z2K_FETCH_FAIL_STREAK
+
+    # ЧЕТВЁРТЫЙ СЛОЙ (ndmc "ip host") УБРАН 30.08.2026.
+    #
+    # Он писал ПОСТОЯННЫЕ записи в конфиг роутера пользователя. Приём был
+    # скопирован из стороннего проекта коммитом f4897e2 от 23.04,
+    # и в описании того коммита прямым текстом стоит «not tested».
+    #
+    # На поле это дало помойку: у GitHub много адресов, CDN отдаёт разные, и
+    # каждый неудачный заход добавлял ещё строку. У пользователя набралось по
+    # три-четыре записи на домен, при том что у Keenetic под статический DNS
+    # всего 256 слотов. Лезть в конфиг роутера ради ещё одной попытки
+    # скачивания мы права не имеем — тем более что первым ходом теперь идёт
+    # наш VPS, а за ним три зеркала.
+    #
+    # Накопленное вычищается z2k_ndmc_cleanup() — при установке, обновлении и
+    # удалении.
+
+    # --- Layer 5: DoH (Cloudflare 1.1.1.1) + pinned anycast edge IPs ---
+    # Last resort for MTS-style stateful TSPU (post-2026-03-31): RST'ит
+    # TLS handshake по SNI + интермиттентно глушит DNS resolver.
+    # DoH bypasses MTS resolver entirely; --resolve to anycast edge IP
+    # pool side-steps SNI-based connect blocks. Requires curl ≥ 7.62.
+    #
+    # The streak counter is now bumped at the Layer 1-3 fall-through
+    # site above, so by the time DoH succeeds we already know how many
+    # files have completely fallen through. Promote PREFER_DOH only when
+    # the threshold is met — same semantics as before, just without the
+    # extra bump that double-counted DoH wins.
+    _z2k_doh_won() {
+        if [ "${Z2K_FETCH_FAIL_STREAK:-0}" -ge "${Z2K_FETCH_DOH_THRESHOLD:-2}" ]; then
+            Z2K_FETCH_PREFER_DOH=1
+            export Z2K_FETCH_PREFER_DOH
+        fi
+    }
+    if _z2k_curl_doh "$url" "$dest" && _z2k_verify_fetched "$dest" "DoH (поздний)"; then _z2k_doh_won; return 0; fi
+    if [ -n "$jsdelivr" ] && _z2k_curl_doh "$jsdelivr" "$dest" && _z2k_verify_fetched "$dest" "jsdelivr через DoH"; then _z2k_doh_won; return 0; fi
+    if [ -n "$gh_proxy" ] && _z2k_curl_doh "$gh_proxy" "$dest" && _z2k_verify_fetched "$dest" "gh-proxy через DoH"; then _z2k_doh_won; return 0; fi
+
+    return 1
+}
+
+# ==============================================================================
+# ПРОВЕРКИ ОКРУЖЕНИЯ
+# ==============================================================================
+
+z2k_detect_entware_arch() {
+    local opkg_bin="opkg"
+    [ -x /opt/bin/opkg ] && opkg_bin="/opt/bin/opkg"
+    command -v "$opkg_bin" >/dev/null 2>&1 || return 1
+
+    "$opkg_bin" print-architecture 2>/dev/null | awk '
+        $1 == "arch" && $2 != "all" {
+            prio = ($3 ~ /^[0-9]+$/) ? $3 + 0 : 0
+            if (prio >= max) { max = prio; arch = $2 }
+        }
+        END { if (arch != "") print arch }
+    '
+}
+
+# ВНИМАНИЕ: эта функция дублирует map_arch_to_bin_arch из utils.sh
+# Дубликат необходим т.к. вызывается до загрузки модулей.
+# При изменении — синхронизировать с lib/utils.sh:map_arch_to_bin_arch()
+z2k_map_arch_to_bin_arch() {
+    case "$1" in
+        aarch64|arm64|*aarch64*|*arm64*) echo "linux-arm64" ;;
+        armv7l|armv6l|arm|*armv7*|*armv6*|arm*) echo "linux-arm" ;;
+        x86_64|amd64|*x86_64*|*amd64*) echo "linux-x86_64" ;;
+        i386|i486|i586|i686|x86) echo "linux-x86" ;;
+        *mipsel64*|*mips64el*) echo "linux-mipsel" ;;
+        *mips64*) echo "linux-mips64" ;;
+        *mipsel*) echo "linux-mipsel" ;;
+        *mips*) echo "linux-mips" ;;
+        *lexra*) echo "linux-lexra" ;;
+        *ppc*) echo "linux-ppc" ;;
+        *riscv64*) echo "linux-riscv64" ;;
+        *) return 1 ;;
+    esac
+}
+
+# Entware раскладывает команды busybox ссылками в /opt/bin. Если ссылки нет,
+# а busybox команду умеет и другой такой команды в системе нет, — возвращаем
+# ссылку. Печатает имена восстановленных. Копия функции из
+# files/S99zapret2.new: здесь модули ещё не загружены — менять вместе.
+z2k_restore_busybox_links()
+{
+    local bb="${Z2K_BUSYBOX:-/opt/bin/busybox}" list name d found nl='
+'
+    [ -x "$bb" ] || return 0
+    list=$("$bb" --list 2>/dev/null) || return 0
+    for name in awk sed grep egrep fgrep cut tr sort uniq head tail wc xargs \
+                find killall pidof pgrep readlink sha256sum md5sum mktemp stat \
+                tar gzip gunzip zcat cmp diff seq basename dirname expr usleep \
+                logger nslookup tee touch; do
+        case "$nl$list$nl" in *"$nl$name$nl"*) ;; *) continue ;; esac
+        found=
+        for d in "${bb%/*}" ${Z2K_BIN_DIRS:-/opt/bin /opt/sbin /opt/usr/bin /opt/usr/sbin /bin /sbin /usr/bin /usr/sbin}; do
+            [ -e "$d/$name" ] && { found=1; break; }
+        done
+        [ -n "$found" ] && continue
+        # Существующее не перезаписываем никогда: там может стоять GNU-версия
+        # из альтернатив opkg. Убираем только битую ссылку.
+        [ -L "${bb%/*}/$name" ] && rm -f "${bb%/*}/$name"
+        ln -s "$bb" "${bb%/*}/$name" 2>/dev/null && echo "$name"
+    done
+    return 0
+}
+
+check_environment() {
+    print_info "Проверка окружения..."
+
+    # Проверка Entware
+    if [ ! -d "/opt" ] || [ ! -x "/opt/bin/opkg" ]; then
+        die "Entware не установлен! Установите Entware перед запуском z2k."
+    fi
+
+    # Без ссылок busybox (awk, sed, killall…) установка обрывалась на первой
+    # же строке с awk, без объяснений.
+    local _bl _miss=""
+    for _bl in $(z2k_restore_busybox_links); do
+        print_info "Восстановлена пропавшая команда $_bl (ссылка на busybox)"
+    done
+    for _bl in awk sed grep; do
+        command -v "$_bl" >/dev/null 2>&1 || _miss="$_miss $_bl"
+    done
+    [ -z "$_miss" ] || die "В системе нет команд:$_miss. Выполните: opkg update && opkg install busybox — и запустите установку снова."
+
+    # Проверка curl
+    if ! command -v curl >/dev/null 2>&1; then
+        print_info "curl не найден, устанавливаю..."
+        /opt/bin/opkg update || die "Не удалось обновить opkg"
+        /opt/bin/opkg install curl || die "Не удалось установить curl"
+    fi
+
+    # Проверка архитектуры
+    local arch entware_arch bin_arch
+    entware_arch=$(z2k_detect_entware_arch)
+    arch="${entware_arch:-$(uname -m)}"
+    # uname -m returns "mips" for both mips and mipsel — detect endianness from ELF
+    if [ "$arch" = "mips" ]; then
+        local _ebin=""
+        for _f in /opt/bin/opkg /opt/bin/busybox; do [ -f "$_f" ] && _ebin="$_f" && break; done
+        if [ -n "$_ebin" ]; then
+            local _byte
+            _byte=$(dd if="$_ebin" bs=1 skip=5 count=1 2>/dev/null)
+            [ "$_byte" = "$(printf '\x01')" ] && arch="mipsel"
+        fi
+    fi
+    bin_arch=$(z2k_map_arch_to_bin_arch "$arch" 2>/dev/null || true)
+    [ -n "$bin_arch" ] && print_info "Detected architecture: $arch -> $bin_arch"
+
+    if [ -z "$bin_arch" ]; then
+        print_info "ВНИМАНИЕ: z2k разработан для ARM64 Keenetic"
+        print_info "Ваша архитектура: $arch"
+        # Non-interactive: пытаемся продолжить (вдруг bin совместим), при
+        # реальной несовместимости упадём ниже на запуске nfqws2 с понятной
+        # ошибкой. Auto-install policy — не abort'имся на prompt.
+        if [ ! -t 0 ] || [ ! -r /dev/tty ]; then
+            print_warning "Non-interactive — продолжаем на неизвестной арх (проверим работоспособность bin ниже)"
+        else
+            printf "Продолжить? [y/N]: "
+            read -r answer </dev/tty
+            [ "$answer" = "y" ] || [ "$answer" = "Y" ] || die "Отменено пользователем" 0
+        fi
+    fi
+
+    print_success "Окружение проверено"
+}
+
+# ==============================================================================
+# ЗАГРУЗКА МОДУЛЕЙ
+# ==============================================================================
+
+download_modules() {
+    print_info "Загрузка модулей z2k..."
+
+    # Создать директории
+    mkdir -p "$LIB_DIR" || die "Не удалось создать $LIB_DIR"
+
+    # Скачать каждый модуль
+    for module in $MODULES; do
+        local url="${GITHUB_RAW}/lib/${module}.sh"
+        local output="${LIB_DIR}/${module}.sh"
+
+        print_info "Загрузка lib/${module}.sh..."
+
+        if z2k_fetch "$url" "$output"; then
+            print_success "Загружен: ${module}.sh"
+        else
+            die "Ошибка загрузки модуля: ${module}.sh"
+        fi
+    done
+
+    print_success "Все модули загружены"
+}
+
+source_modules() {
+    print_info "Загрузка модулей в память..."
+
+    for module in $MODULES; do
+        local module_file="${LIB_DIR}/${module}.sh"
+
+        if [ -f "$module_file" ]; then
+            . "$module_file" || die "Ошибка загрузки модуля: ${module}.sh"
+        else
+            die "Модуль не найден: ${module}.sh"
+        fi
+    done
+
+    print_success "Модули загружены"
+}
+
+# ==============================================================================
+# ЗАГРУЗКА СТРАТЕГИЙ
+# ==============================================================================
+
+download_strategies_source() {
+    print_info "Загрузка файла стратегий (strats_new2.txt)..."
+
+    local url="${GITHUB_RAW}/strats_new2.txt"
+    local output="${WORK_DIR}/strats_new2.txt"
+
+    if z2k_fetch "$url" "$output"; then
+        local lines
+        lines=$(wc -l < "$output")
+        print_success "Загружено: strats_new2.txt ($lines строк)"
+    else
+        die "Ошибка загрузки strats_new2.txt"
+    fi
+
+    print_info "Загрузка QUIC стратегий (quic_strats.ini)..."
+    local quic_url="${GITHUB_RAW}/quic_strats.ini"
+    local quic_output="${WORK_DIR}/quic_strats.ini"
+
+    if z2k_fetch "$quic_url" "$quic_output"; then
+        local lines
+        lines=$(wc -l < "$quic_output")
+        print_success "Загружено: quic_strats.ini ($lines строк)"
+    else
+        die "Ошибка загрузки quic_strats.ini"
+    fi
+}
+
+download_fake_blobs() {
+    print_info "Загрузка fake blobs (TLS + QUIC)..."
+
+    local fake_dir="${WORK_DIR}/files/fake"
+    mkdir -p "$fake_dir" || die "Не удалось создать $fake_dir"
+
+    # Sync с фактическим files/fake/ — sberbank_ru и quic_initial_google_com
+    # удалены в audit-cleanup 2026-05-02 (commit bb80855), список выровнен.
+    local files="
+tls_clienthello_max_ru.bin
+tls_clienthello_14.bin
+tls_clienthello_www_google_com.bin
+tls_clienthello_www_sferum_ru.bin
+tls_clienthello_sochi_park.bin
+stun2.bin
+tls_clienthello_activated.bin
+tls_clienthello_4pda_to.bin
+tls_clienthello_vk_com.bin
+tls_clienthello_gosuslugi_ru.bin
+t2.bin
+rdp.bin
+syn_packet.bin
+stun.bin
+quic_initial_www_google_com.bin
+quic_initial_rutracker_org.bin
+quic_initial_steamcommunity_com.bin
+quic_1.bin
+quic_4.bin
+quic_5.bin
+quic_6.bin
+"
+
+    while read -r file; do
+        [ -z "$file" ] && continue
+        local url="${GITHUB_RAW}/files/fake/${file}"
+        local output="${fake_dir}/${file}"
+        if z2k_fetch "$url" "$output"; then
+            print_success "Загружено: files/fake/${file}"
+        else
+            die "Ошибка загрузки files/fake/${file}"
+        fi
+    done <<EOF
+$files
+EOF
+}
+
+download_init_script() {
+    print_info "Загрузка вспомогательных файлов (init + lua helpers)..."
+
+    local files_dir="${WORK_DIR}/files"
+    mkdir -p "$files_dir" || die "Не удалось создать $files_dir"
+
+    local url
+    local output
+
+    url="${GITHUB_RAW}/files/S99zapret2.new"
+    output="${files_dir}/S99zapret2.new"
+
+    if z2k_fetch "$url" "$output"; then
+        print_success "Загружено: files/S99zapret2.new"
+    else
+        die "Ошибка загрузки files/S99zapret2.new"
+    fi
+
+    url="${GITHUB_RAW}/files/000-zapret2.sh"
+    output="${files_dir}/000-zapret2.sh"
+    if z2k_fetch "$url" "$output"; then
+        print_success "Загружено: files/000-zapret2.sh"
+    else
+        die "Ошибка загрузки files/000-zapret2.sh"
+    fi
+
+    url="${GITHUB_RAW}/files/z2k-blocked-monitor.sh"
+    output="${files_dir}/z2k-blocked-monitor.sh"
+    if z2k_fetch "$url" "$output"; then
+        print_success "Загружено: files/z2k-blocked-monitor.sh"
+    else
+        die "Ошибка загрузки files/z2k-blocked-monitor.sh"
+    fi
+
+    # z2k tools (config validator, list updater, diagnostics, geosite, tg watchdog).
+    # NOTE: z2k-probe.sh / z2k-classify-* removed in r-15 (Phase 1 cleanup);
+    # z2k-healthcheck.sh removed in r-60 (per-strategy pass/fail false-negatives
+    # during rotation — use z2k-diag.sh instead).
+    for tool_name in z2k-config-validator.sh z2k-update-lists.sh z2k-diag.sh z2k-geosite.sh z2k-tg-watchdog.sh z2k-tg-redirect.sh z2k-auto-update.sh z2k-insta-ip-refresh.sh z2k-agh-sync.sh z2k-agh-rewrites.awk z2k-scheduler.sh z2k-warp.sh; do
+        url="${GITHUB_RAW}/files/${tool_name}"
+        output="${files_dir}/${tool_name}"
+        if z2k_fetch "$url" "$output"; then
+            print_success "Загружено: files/${tool_name}"
+        else
+            print_warning "Не удалось загрузить files/${tool_name} (необязательный)"
+        fi
+    done
+
+    # init scripts extracted from install.sh heredocs — tg-tunnel S98
+    # autostart gets installed into /opt/etc/init.d/ later by lib/install.sh
+    mkdir -p "${files_dir}/init.d"
+    url="${GITHUB_RAW}/files/init.d/S98tg-tunnel"
+    output="${files_dir}/init.d/S98tg-tunnel"
+    if z2k_fetch "$url" "$output"; then
+        print_success "Загружено: files/init.d/S98tg-tunnel"
+    else
+        print_warning "Не удалось загрузить files/init.d/S98tg-tunnel (TG tunnel не будет автостартовать после ребута)"
+    fi
+
+    # Keenetic NDM netfilter.d hook for auto-restoring TG REDIRECT rules.
+    mkdir -p "${files_dir}/ndm"
+    url="${GITHUB_RAW}/files/ndm/90-z2k-tg-redirect.sh"
+    output="${files_dir}/ndm/90-z2k-tg-redirect.sh"
+    if z2k_fetch "$url" "$output"; then
+        print_success "Загружено: files/ndm/90-z2k-tg-redirect.sh"
+    else
+        print_warning "Не удалось загрузить ndm hook (iptables не будут авто-восстанавливаться)"
+    fi
+
+    # Web panel source tree — downloaded only if user installs via menu [P].
+    # z2k.sh bootstraps files into /tmp/z2k/; install.sh copies from /tmp/z2k/webpanel.
+    local webpanel_dir="${WORK_DIR}/webpanel"
+    mkdir -p "$webpanel_dir/cgi" "$webpanel_dir/www" "$webpanel_dir/init.d" \
+             "$webpanel_dir/www/fonts" \
+             "$webpanel_dir/www/js/core" "$webpanel_dir/www/js/pages"
+    # Шрифты панели тянутся сюда же. Они не роскошь: без них панель рисуется
+    # системным шрифтом, и это ЗАМЕТНО. Из интернета их не берём принципиально —
+    # устройство стоит ради обхода блокировок, и ждать чужой CDN на первом
+    # экране нельзя (раньше index.html тянул их с fonts.googleapis.com
+    # блокирующим <link>). Каждый файл опционален: не доехал — панель работает.
+    #
+    # Список шрифтов обязан совпадать с @font-face в webpanel/www/style.css.
+    # Разойдётся — браузер молча откатится на системный шрифт.
+    #
+    # МОДУЛИ ПАНЕЛИ (www/js/**) — другое дело: пропущенный здесь модуль это не
+    # косметика, а мёртвая панель. Каталога у raw.githubusercontent нет, листинг
+    # взять неоткуда, поэтому список именной — но разойтись он не может:
+    # tests/test_panel_modules_delivered.sh сверяет его с деревом на диске и
+    # краснеет, если добавленный модуль сюда не вписан.
+    for wp_file in \
+        install.sh uninstall.sh lighttpd.conf \
+        init.d/S96z2k-webpanel \
+        cgi/api.sh cgi/auth.sh cgi/actions.sh \
+        www/index.html www/app.js www/style.css www/favicon.svg \
+        www/js/chrome.js \
+        www/js/core/api.js \
+        www/js/core/auth.js \
+        www/js/core/clipboard.js \
+        www/js/core/dom.js \
+        www/js/core/loadorder.js \
+        www/js/core/whitelist.js \
+        www/js/core/domain-list-editor.js \
+        www/js/core/toast.js \
+        www/js/job.js \
+        www/js/pages/credits.js \
+        www/js/pages/dashboard.js \
+        www/js/pages/diag.js \
+        www/js/pages/exclude.js \
+        www/js/pages/extra-domains.js \
+        www/js/pages/policy.js \
+        www/js/pages/strategies.js \
+        www/js/pages/strategy-pick.js \
+        www/js/pages/toggles.js \
+        www/js/pages/update.js \
+        www/js/pages/warp.js \
+        www/js/router.js \
+        www/js/state-model.js \
+        www/fonts/FiraCode-400-cyrillic.woff2 \
+        www/fonts/FiraCode-400-latin.woff2 \
+        www/fonts/FiraSans-400-cyrillic.woff2 \
+        www/fonts/FiraSans-400-latin.woff2 \
+        www/fonts/FiraSans-500-cyrillic.woff2 \
+        www/fonts/FiraSans-500-latin.woff2 \
+        www/fonts/FiraSans-600-cyrillic.woff2 \
+        www/fonts/FiraSans-600-latin.woff2 \
+        www/fonts/FiraSans-700-cyrillic.woff2 \
+        www/fonts/FiraSans-700-latin.woff2 \
+        ;
+    do
+        url="${GITHUB_RAW}/webpanel/${wp_file}"
+        output="${webpanel_dir}/${wp_file}"
+        if z2k_fetch "$url" "$output"; then
+            : # ok
+        else
+            # НЕ ВСЁ ЗДЕСЬ ОПЦИОНАЛЬНО, и раньше было наоборот.
+            #
+            # Отказ трактовался предупреждением для ЛЮБОГО файла — верно для
+            # шрифта (панель нарисуется системным) и для favicon, но не для
+            # модуля: точка входа падает на первом же import, и человек видит
+            # пустую страницу. В логе установки при этом одно предупреждение
+            # среди прочих, а сама установка рапортует успех.
+            #
+            # Слоёв у z2k_fetch несколько, и единичный сбой они обычно
+            # перекрывают. Но не гарантированно: сразу после публикации
+            # jsdelivr держит свой кеш и по НОВОМУ пути может отдавать 404,
+            # пока остальные зеркала уже актуальны. Тогда не доезжает ровно
+            # один файл из двадцати одного.
+            case "$wp_file" in
+                www/fonts/*|www/favicon.svg)
+                    print_warning "Не удалось загрузить webpanel/${wp_file} (опциональный компонент)" ;;
+                *)
+                    die "Не удалось загрузить webpanel/${wp_file} — без него панель не работает" ;;
+            esac
+        fi
+    done
+
+    # z2k Lua helpers (e.g., persistent autocircular strategy memory)
+    local lua_dir="${files_dir}/lua"
+    mkdir -p "$lua_dir" || die "Не удалось создать $lua_dir"
+
+    # z2k-tcp16.lua — рантайм обхода обрыва на 16 КБ: подстановка белого имени
+    # по карте «сеть → имя», которую готовит проба. Профиль rkn_tcp ссылается
+    # на функцию по имени (z2k_sni_pick), поэтому файл обязан приехать вместе
+    # с конфигом: без него движок падает в error() на каждом пакете профиля.
+    url="${GITHUB_RAW}/files/lua/z2k-tcp16.lua"
+    output="${lua_dir}/z2k-tcp16.lua"
+    if z2k_fetch "$url" "$output"; then
+        print_success "Загружено: files/lua/z2k-tcp16.lua"
+    else
+        die "Ошибка загрузки files/lua/z2k-tcp16.lua"
+    fi
+
+    # z2k-preflight.lua — проверка DPI отдельным соединением в профиле
+    # googlevideo. Профиль ссылается на функцию по имени (z2k_preflight),
+    # поэтому файл обязан приехать вместе с конфигом: без него движок падает
+    # в error() на каждом пакете профиля.
+    url="${GITHUB_RAW}/files/lua/z2k-preflight.lua"
+    output="${lua_dir}/z2k-preflight.lua"
+    if z2k_fetch "$url" "$output"; then
+        print_success "Загружено: files/lua/z2k-preflight.lua"
+    else
+        die "Ошибка загрузки files/lua/z2k-preflight.lua"
+    fi
+
+    # z2k-quic-reject.lua — отказ QUIC для «YouTube без QUIC» и «Весь QUIC через
+    # TCP». Профиль ссылается на функцию по имени (z2k_quic_reject); генератор
+    # ставит её только при наличии файла, но без него тумблеры вернутся к тихому
+    # drop, который ничего не ускоряет.
+    url="${GITHUB_RAW}/files/lua/z2k-quic-reject.lua"
+    output="${lua_dir}/z2k-quic-reject.lua"
+    if z2k_fetch "$url" "$output"; then
+        print_success "Загружено: files/lua/z2k-quic-reject.lua"
+    else
+        die "Ошибка загрузки files/lua/z2k-quic-reject.lua"
+    fi
+
+    # z2k-alert.lua и z2k-quic-silence.lua — поправки к штатному детектору
+    # неудач и детектор молчания QUIC. Профили ссылаются на функции по имени
+    # (failure_detector=z2k_fail_tls_alert / z2k_fail_quic_silence), поэтому
+    # файлы обязаны приехать вместе с конфигом: без них движок падает в error()
+    # на каждом пакете профиля.
+    url="${GITHUB_RAW}/files/lua/z2k-alert.lua"
+    output="${lua_dir}/z2k-alert.lua"
+    if z2k_fetch "$url" "$output"; then
+        print_success "Загружено: files/lua/z2k-alert.lua"
+    else
+        die "Ошибка загрузки files/lua/z2k-alert.lua"
+    fi
+
+    url="${GITHUB_RAW}/files/lua/z2k-quic-silence.lua"
+    output="${lua_dir}/z2k-quic-silence.lua"
+    if z2k_fetch "$url" "$output"; then
+        print_success "Загружено: files/lua/z2k-quic-silence.lua"
+    else
+        die "Ошибка загрузки files/lua/z2k-quic-silence.lua"
+    fi
+    # Снятый 11.09.2026 детектор молчания TCP: если он остался от прошлой
+    # версии, его надо убрать — иначе на диске лежит файл, который init
+    # загрузит, а конфиг на него больше не ссылается.
+    rm -f "${lua_dir}/z2k-silence.lua" 2>/dev/null
+
+    # Phase 6: anti-ТСПУ fool extensions (z2k_dynamic_ttl and friends).
+    # Strategies reference them by name via `fool=z2k_dynamic_ttl`, so the
+    # file must be downloaded before strategies load — он резолвится по имени
+    # так же, как детекторы, и обязан лежать раньше стратегий.
+    url="${GITHUB_RAW}/files/lua/z2k-fooling-ext.lua"
+    output="${lua_dir}/z2k-fooling-ext.lua"
+    if z2k_fetch "$url" "$output"; then
+        print_success "Загружено: files/lua/z2k-fooling-ext.lua"
+    else
+        die "Ошибка загрузки files/lua/z2k-fooling-ext.lua"
+    fi
+
+    # badseq-фулинг и hostfakesplit altorder=1 из winws; стратегии
+    # ссылаются на них аргументами, модуль обязан лечь до старта движка.
+    url="${GITHUB_RAW}/files/lua/z2k-nfqws1-compat.lua"
+    output="${lua_dir}/z2k-nfqws1-compat.lua"
+    if z2k_fetch "$url" "$output"; then
+        print_success "Загружено: files/lua/z2k-nfqws1-compat.lua"
+    else
+        die "Ошибка загрузки files/lua/z2k-nfqws1-compat.lua"
+    fi
+
+    # Phase 7: per-connection range randomisation for numeric strategy
+    # args. Wraps fake/multisplit/fakedsplit/fakeddisorder/hostfakesplit
+    # and resolves ranges like repeats=2-6 to sticky per-flow values.
+    url="${GITHUB_RAW}/files/lua/z2k-range-rand.lua"
+    output="${lua_dir}/z2k-range-rand.lua"
+    if z2k_fetch "$url" "$output"; then
+        print_success "Загружено: files/lua/z2k-range-rand.lua"
+    else
+        die "Ошибка загрузки files/lua/z2k-range-rand.lua"
+    fi
+
+    # z2k-autocircular.lua АРХИВИРОВАН 2026-05-28 — откат на нативный
+    # circular() bol-van. Больше НЕ качаем.
+
+    url="${GITHUB_RAW}/files/lua/z2k-modern-core.lua"
+    output="${lua_dir}/z2k-modern-core.lua"
+    if z2k_fetch "$url" "$output"; then
+        print_success "Загружено: files/lua/z2k-modern-core.lua"
+    else
+        die "Ошибка загрузки files/lua/z2k-modern-core.lua"
+    fi
+
+    # z2k-http-strats.lua здесь больше не качается — файл удалён из проекта.
+    # Комментарий на этом месте утверждал «без них daemon не парсит config и не
+    # стартует», и на этом основании стоял die. Верно это было до 2026-06-04:
+    # тогда 9f63a39 снял страты 8..40 из http_rkn, и с тех пор на функции файла
+    # не ссылалась ни одна стратегия. Но die остался, и установка могла упасть
+    # насмерть из-за недокачки файла, который никому не нужен.
+
+    # z2k-state-persist.lua: persist-only долгосрочный rotator-state
+    # (autostate[key][host].nstrategy в state.tsv). НЕ load-bearing для обхода
+    # — только сохранение/восстановление выбора стратегии + видимость в
+    # вебморде. На сбое загрузки warn, не die: S99 грузит через [ -f ] guard,
+    # без файла просто нет персистентности, обход работает.
+    url="${GITHUB_RAW}/files/lua/z2k-state-persist.lua"
+    output="${lua_dir}/z2k-state-persist.lua"
+    if z2k_fetch "$url" "$output"; then
+        print_success "Загружено: files/lua/z2k-state-persist.lua"
+    else
+        print_warning "Не удалось загрузить z2k-state-persist.lua — rotator-state не будет персиститься (не критично, обход работает)"
+    fi
+
+    # z2k-dynamic-strategy.lua removed in r-15 Phase 1 (slot in
+    # rkn_tcp removed alongside, see lib/config_official.sh).
+    # The handler depended on the dead z2k-classify producer; new
+    # Experimental background discovery has also been retired.
+
+    # Snapshot domain lists used by local install flow (no external list repos)
+    local list_file
+    local lists_dir="${files_dir}/lists"
+    mkdir -p "$lists_dir" || die "Не удалось создать $lists_dir"
+
+    local list_files="
+extra_strats/TCP/YT/List.txt
+extra_strats/TCP/YT_GV/List.txt
+extra_strats/TCP/RKN/List.txt
+extra_strats/TCP/RKN/Discord.txt
+extra_strats/UDP/YT/List.txt
+extra-domains.txt
+rkn-false-positive.txt
+meta-ranges.txt
+"
+
+    while read -r list_file; do
+        [ -z "$list_file" ] && continue
+        local list_url="${GITHUB_RAW}/files/lists/${list_file}"
+        local list_out="${lists_dir}/${list_file}"
+        mkdir -p "$(dirname "$list_out")"
+
+        if z2k_fetch "$list_url" "$list_out"; then
+            print_success "Загружено: files/lists/${list_file}"
+        else
+            die "Ошибка загрузки files/lists/${list_file}"
+        fi
+    done <<EOF
+$list_files
+EOF
+}
+
+generate_strategies_database() {
+    print_info "Генерация базы стратегий (strategies.conf)..."
+
+    # Эта функция определена в lib/strategies.sh
+    if command -v generate_strategies_conf >/dev/null 2>&1; then
+        generate_strategies_conf "${WORK_DIR}/strats_new2.txt" "${WORK_DIR}/strategies.conf" || \
+            die "Ошибка генерации strategies.conf"
+
+        local count
+        count=$(wc -l < "${WORK_DIR}/strategies.conf" | tr -d ' ')
+        print_success "Сгенерировано стратегий: $count"
+    else
+        die "Функция generate_strategies_conf не найдена"
+    fi
+
+    print_info "Генерация базы QUIC стратегий (quic_strategies.conf)..."
+    if command -v generate_quic_strategies_conf >/dev/null 2>&1; then
+        generate_quic_strategies_conf "${WORK_DIR}/quic_strats.ini" "${WORK_DIR}/quic_strategies.conf" || \
+            die "Ошибка генерации quic_strategies.conf"
+    else
+        die "Функция generate_quic_strategies_conf не найдена"
+    fi
+}
+
+# ==============================================================================
+# ГЛАВНОЕ МЕНЮ BOOTSTRAP
+# ==============================================================================
+
+show_welcome() {
+    clear_screen
+
+    # Center "Версия <tag>" inside the 51-col box. "Версия " is 7 display cols;
+    # the tag is ASCII so byte length == display width — pad numerically so the
+    # right border stays aligned regardless of tag length (2.0.1 vs p-59.1 etc).
+    local _ver _label _len _lpad _rpad
+    _ver="$(z2k_display_version)"
+    _label="Версия ${_ver}"
+    _len=$((7 + ${#_ver}))
+    [ "$_len" -gt 51 ] && _len=51
+    _lpad=$(( (51 - _len) / 2 ))
+    _rpad=$(( 51 - _len - _lpad ))
+    local _ver_line
+    _ver_line="$(printf '%*s%s%*s' "$_lpad" "" "$_label" "$_rpad" "")"
+
+    cat <<EOF
++===================================================+
+|          z2k - Zapret2 для Keenetic               |
+|${_ver_line}|
++===================================================+
+
+  GitHub: https://github.com/necronicle/z2k
+
+EOF
+
+    print_info "Инициализация..."
+}
+
+prompt_install_or_menu() {
+    printf "\n"
+
+    if is_zapret2_installed; then
+        print_info "Открываю меню управления..."
+        sleep 1
+        show_main_menu
+    else
+        print_info "zapret2 не установлен - запускаю установку..."
+        check_root || die "Требуются права root для установки"
+        run_full_install
+        print_info "Открываю меню управления..."
+        sleep 1
+        show_main_menu
+    fi
+}
+
+
+# ==============================================================================
+# ОБРАБОТКА АРГУМЕНТОВ КОМАНДНОЙ СТРОКИ
+# ==============================================================================
+
+handle_arguments() {
+    local command=$1
+
+    case "$command" in
+        install|i)
+            print_info "Запуск установки zapret2..."
+            run_full_install
+            # В auto-update контексте (Z2K_AUTO_UPDATE=1, выставляется в
+            # lib/auto_update.sh:au_apply_reinstall) или non-TTY запуске —
+            # НЕ открываем интерактивное меню после install: некому будет
+            # отвечать, процесс зависнет на read /dev/tty. См. репорт
+            # @vai73 2026-05-14 — auto-update повис именно тут.
+            if [ "$Z2K_AUTO_UPDATE" = "1" ] || [ ! -t 0 ]; then
+                print_info "Install завершён (non-interactive)."
+                return 0
+            fi
+            print_info "Открываю меню управления..."
+            sleep 1
+            show_main_menu
+            ;;
+        menu|m)
+            print_info "Открытие меню..."
+            show_main_menu
+            ;;
+        uninstall|remove)
+            print_info "Удаление zapret2..."
+            uninstall_zapret2
+            ;;
+        status|s)
+            show_system_info
+            ;;
+        update|u)
+            # update_z2k() удалён. Он самоперезаписывал сам z2k.sh, сверяя
+            # захардкоженный Z2K_VERSION со строкой в скачанной копии — то есть
+            # всегда с самим собой, и потому неизменно отвечал «у вас последняя
+            # версия». Человек, отставший на десяток релизов, получал ровно этот
+            # ответ. К релизам из UPDATES.json механизм отношения не имел вовсе.
+            print_info "Обновление ставится из меню: пункт [U], либо кнопкой в веб-панели."
+            print_info "Открыть меню: z2k menu"
+            ;;
+        version|v)
+            echo "z2k $(z2k_display_version)"
+            echo "zapret2: $(get_nfqws2_version)"
+            ;;
+        cleanup)
+            print_info "Очистка старых бэкапов..."
+            cleanup_backups "${INIT_SCRIPT:-/opt/etc/init.d/S99zapret2}" 5
+            ;;
+        check|info)
+            print_info "Проверка активной конфигурации..."
+            show_active_processing
+            ;;
+        rollback)
+            print_info "Откат конфигурации..."
+            rollback_to_snapshot
+            ;;
+        snapshot)
+            print_info "Создание snapshot конфигурации..."
+            create_rollback_snapshot "cli"
+            ;;
+        validate)
+            if [ -f "${ZAPRET2_DIR:-/opt/zapret2}/z2k-config-validator.sh" ]; then
+                sh "${ZAPRET2_DIR:-/opt/zapret2}/z2k-config-validator.sh"
+            else
+                print_error "Скрипт валидатора не найден"
+            fi
+            ;;
+        diag|d)
+            if [ -f "${ZAPRET2_DIR:-/opt/zapret2}/z2k-diag.sh" ]; then
+                sh "${ZAPRET2_DIR:-/opt/zapret2}/z2k-diag.sh"
+            else
+                print_error "Скрипт диагностики не найден"
+            fi
+            ;;
+        # probe / classify CLI handlers removed in r-15 (Phase 1 of the
+        # detection stack). Replaced by the server-active
+        # taxonomy жила в z2k-detectors.lua (удалён 2026-08-26)
+        # and, when Phase 3 lands, by the z2k-detect daemon's reactive
+        # discovery + cross-vantage probe. See lib/menu.sh notice for
+        # rationale.
+        help|h|-h|--help)
+            show_help
+            ;;
+        "")
+            # Без аргументов - показать welcome и предложить установку
+            prompt_install_or_menu
+            ;;
+        *)
+            print_error "Неизвестная команда: $command"
+            show_help
+            exit 1
+            ;;
+    esac
+}
+
+show_help() {
+    cat <<EOF
+Использование: sh z2k.sh [команда]
+
+Команды:
+  install, i       Установить zapret2
+  menu, m          Открыть интерактивное меню
+  uninstall        Удалить zapret2
+  status, s        Показать статус системы
+  check, info      Показать какие списки обрабатываются
+  update, u        Подсказка, где ставится обновление (меню [U] / веб-панель)
+  cleanup          Очистить старые бэкапы (оставить 5 последних)
+  rollback         Откатить конфигурацию к последнему snapshot
+  snapshot         Создать snapshot текущей конфигурации
+  validate         Валидация текущей конфигурации
+  diag, d          Сводка для траблшутинга (скопируй вывод и пришли в чат)
+  version, v       Показать версию
+  help, h          Показать эту справку
+
+Без аргументов:
+  - Если zapret2 не установлен: предложит установку
+  - Если zapret2 установлен: откроет меню
+
+Примеры:
+  sh -c 'tmp=/tmp/z2k.sh; rm -f "$tmp"; for url in "https://raw.githubusercontent.com/necronicle/z2k/z2k-enhanced/z2k.sh" "https://cdn.jsdelivr.net/gh/necronicle/z2k@z2k-enhanced/z2k.sh" "https://gh-proxy.com/https://raw.githubusercontent.com/necronicle/z2k/z2k-enhanced/z2k.sh"; do echo "[i] Пробую: $url" >&2; if curl -fsSL --connect-timeout 10 --max-time 180 "$url" -o "$tmp"; then exec sh "$tmp"; fi; done; echo "[FAIL] Не удалось скачать z2k.sh ни с одного зеркала" >&2; exit 1'
+  z2k menu
+  z2k diag
+  z2k check
+
+EOF
+}
+
+# ==============================================================================
+# ФУНКЦИЯ ОБНОВЛЕНИЯ Z2K
+# ==============================================================================
+
+# ==============================================================================
+# ГЛАВНАЯ ФУНКЦИЯ
+# ==============================================================================
+
+main() {
+    # Early-exit for help/version — no downloads needed
+    case "$1" in
+        help|h|-h|--help)
+            show_help
+            exit 0
+            ;;
+        version|v|--version)
+            echo "z2k $(z2k_display_version)"
+            exit 0
+            ;;
+    esac
+
+    # Показать приветствие
+    show_welcome
+
+    # Проверить окружение
+    check_environment
+
+    # Warm-cache fast-path: для non-install/update команд (menu, status,
+    # probe, diag, healthcheck, rollback, snapshot, etc.) кэш в /tmp/z2k
+    # переиспользуется между run'ами. ETag-свежесть все равно проверится
+    # z2k_fetch'ем на download_* если _need_fetch=1, но для интерактивных
+    # команд пропускаем fetch'и целиком — typical menu open ~1s вместо
+    # ~13s. Install/update/uninstall всегда режут /tmp/z2k для чистоты.
+    local _need_fetch=1
+    case "${1:-}" in
+        uninstall|remove)
+            # УДАЛЕНИЕ ОБЯЗАНО РАБОТАТЬ БЕЗ ИНТЕРНЕТА.
+            #
+            # Раньше `uninstall` стоял в одной ветке с install/update, то есть
+            # перед сносом z2k скачивал с GitHub всё дерево заново — модули,
+            # базы стратегий, fake-блобы, init-скрипт. На первом же неудачном
+            # фетче download_modules делает die, и до самого удаления дело не
+            # доходило вообще: ничего не снесено, в логе минуты попыток curl.
+            #
+            # А просят удалить чаще всего именно тогда, когда сеть не работает.
+            # То есть команда отказывала ровно в том случае, ради которого
+            # существует. Из панели это выглядело как «кнопка не работает».
+            #
+            # Скачивать при этом нечего: uninstall_zapret2 живёт в lib/install.sh,
+            # а все модули двадцатью строками ниже и так копируются в кэш из
+            # /opt/zapret2/lib — установленного дерева, которое мы и удаляем.
+            # Стратегии, блобы и init-скрипт удалению не нужны совсем.
+            #
+            # Фетч отключаем ТОЛЬКО если модули действительно на диске: если
+            # установленное дерево разрушено, старое поведение (скачать и
+            # попробовать) остаётся единственным шансом что-то доделать.
+            _need_fetch=0
+            for _um in $MODULES; do
+                [ -f "/opt/zapret2/lib/${_um}.sh" ] || _need_fetch=1
+            done
+            ;;
+        install|i|update|u)
+            # Чистая установка/обновление — обязательно свежие файлы.
+            rm -rf "$WORK_DIR"
+            # Defensive /tmp cleanup перед install. Field incident 2026-05-28:
+            # /tmp на Keenetic — tmpfs ~244M; если он забит (наши же stale
+            # артефакты прошлых прогонов, deleted-but-held логи, чужой софт)
+            # — curl возвращает error 23 "Failure writing output" на больших
+            # списках (RKN/List.txt = 125K строк), z2k.sh die'ит на загрузке,
+            # установка не встаёт. Чистим ТОЛЬКО известные z2k-temp артефакты
+            # — НЕ трогаем /tmp/mnt (USB), /tmp/nginx, /tmp/run и прочее
+            # системное Keenetic, чтобы не сломать роутер.
+            # ВАЖНО: НЕ трогаем /tmp/z2k_au — это рабочая директория
+            # auto-update (lib/auto_update.sh владеет ею). При reinstall'е
+            # из auto-update именно оттуда запускается скачанный installer и
+            # туда же пишется .install_rc; если снести её из дочернего
+            # z2k.sh install — родительский auto-updater потеряет rc, решит
+            # что reinstall провалился и пропустит health-check (Codex
+            # review 2026-05-28). Чистим только заведомо-stale артефакты.
+            # НЕ трогаем /tmp/z2k-job-*.log — webpanel update/apply
+            # перенаправляет вывод запущенного installer'а именно в этот
+            # job-лог и тейлит его через /job?id=. Если снести его из
+            # дочернего z2k.sh install — процесс продолжит писать в
+            # unlinked inode, а UI потеряет вывод и диагностику (Codex
+            # 2026-05-28). Их чистит webpanel по возрасту после завершения.
+            rm -rf /tmp/wpinst /tmp/nfqws2.bak /tmp/zapret2_build \
+                   /tmp/z2k-install.sh /tmp/z2k-au-manifest.json /tmp/S99_lib.sh \
+                   /tmp/cdnbase_test /tmp/config_official.sh 2>/dev/null
+            # Truncate наши растущие логи. Их держат открытыми живые daemon'ы
+            # (tg-mtproxy-client, lighttpd) — поэтому `rm` НЕ вернёт место
+            # (deleted-but-held-open, как было в инциденте). `: > file`
+            # обнуляет содержимое того же inode, который держит процесс, и
+            # место возвращается немедленно, не трогая работу демона. Это
+            # главный органический источник роста tmpfs у юзеров — чистим его
+            # перед измерением свободного места.
+            for _log in /tmp/z2k-log/tg-tunnel.log /tmp/z2k-log/z2k-http-tunnel.log \
+                        /tmp/z2k-log/z2k-webpanel-error.log /tmp/z2k-log/z2k-insta-refresh.log; do
+                # CWE-59: имена фиксированные в world-writable /tmp, install
+                # бежит root'ом. symlink на чужой файл (config/state) →
+                # `: >` обнулил бы цель. Если это symlink — удаляем сам линк
+                # (rm не идёт по ссылке), демон пересоздаст обычный файл.
+                if [ -L "$_log" ]; then
+                    rm -f "$_log" 2>/dev/null
+                elif [ -f "$_log" ]; then
+                    : > "$_log" 2>/dev/null
+                fi
+            done
+            # USB-fallback WORK_DIR: если после cleanup в /tmp всё равно мало
+            # места (<50MB) — переносим рабочую папку на /opt (USB, обычно
+            # гигабайты, туда же ставится zapret2). Так install/curl не зависят
+            # от переполненного tmpfs вообще, по ЛЮБОЙ причине (deleted-held,
+            # чужой софт, наши логи). Это покрывает случаи, которые cleanup
+            # выше НЕ чинит (например процесс держит удалённый файл). После
+            # установки эта папка удаляется (см. trap EXIT ниже).
+            # Выбор рабочей папки: СРАВНИВАЕМ обе площадки, а не уходим на /opt
+            # вслепую. Прежний код при нехватке в /tmp переносил работу на /opt,
+            # даже если там места ещё меньше — то есть менял тесное место на
+            # более тесное и падал уже дальше по установке.
+            #
+            # При достатке предпочитаем /tmp намеренно, а не «потому что так
+            # исторически»: это оперативка, она быстрее и не изнашивает флешку,
+            # а установка пишет туда десятки мегабайт каждый раз.
+            #
+            # Порог 50 МБ — распакованный релиз плюс запас. Если ни там, ни там
+            # его нет, берём то, где больше, и говорим цифры вслух: установка
+            # всё равно попробует пройти, а человек будет знать, что чистить.
+            _tmp_free_kb=$(df /tmp 2>/dev/null | awk 'NR==2{print $4}')
+            _opt_free_kb=$(df /opt 2>/dev/null | awk 'NR==2{print $4}')
+            case "$_tmp_free_kb" in ''|*[!0-9]*) _tmp_free_kb=0 ;; esac
+            case "$_opt_free_kb" in ''|*[!0-9]*) _opt_free_kb=0 ;; esac
+            _need_kb=51200
+
+            if [ "$_tmp_free_kb" -ge "$_need_kb" ]; then
+                :   # в оперативке достаточно — оставляем /tmp
+            elif [ "$_opt_free_kb" -gt "$_tmp_free_kb" ]; then
+                WORK_DIR="/opt/z2k-work"
+                LIB_DIR="${WORK_DIR}/lib"
+                export WORK_DIR LIB_DIR Z2K_WORKDIR_ON_OPT=1
+                rm -rf "$WORK_DIR"
+                printf '[i] В /tmp мало места (%s МБ), на /opt больше (%s МБ) — временные файлы туда, удалятся после установки.\n' \
+                    "$((_tmp_free_kb / 1024))" "$((_opt_free_kb / 1024))" >&2
+            else
+                printf '[!] Мало места везде: /tmp %s МБ, /opt %s МБ (нужно около %s МБ). Установка продолжится, но может прерваться.\n' \
+                    "$((_tmp_free_kb / 1024))" "$((_opt_free_kb / 1024))" "$((_need_kb / 1024))" >&2
+                printf '[i] Освободить: rm -rf /opt/zapret2.old.* — копии от прерванных установок.\n' >&2
+            fi
+            ;;
+        *)
+            # Для интерактивных команд: кэш валиден если ВСЕ модули из
+            # $MODULES присутствуют в $LIB_DIR и strats скачаны. Любой
+            # пропущенный модуль = старый кэш от предыдущей версии (как
+            # раз случай добавления нового модуля типа auto_update) →
+            # форсируем fetch чтобы source_modules не упал.
+            local _all_modules_cached=1
+            for _check_mod in $MODULES; do
+                if [ ! -f "$LIB_DIR/${_check_mod}.sh" ]; then
+                    _all_modules_cached=0
+                    break
+                fi
+            done
+            if [ "$_all_modules_cached" = "1" ] && [ -s "$WORK_DIR/strats_new2.txt" ]; then
+                _need_fetch=0
+            fi
+            ;;
+    esac
+    mkdir -p "$WORK_DIR" "$LIB_DIR"
+
+    # Sync persistent /opt/zapret2/lib/ → $LIB_DIR cache. Persistent копии
+    # обновляются install.sh'ом при reinstall и au_apply_patch'ем для lib/*
+    # — то есть всегда свежее или равно cache'у. Если CDN отдал stale
+    # модуль в /tmp/z2k/lib/ (3-5 мин cache window после нашего push'а)
+    # — persistent копия от последующего apply его перетрёт, и interactive
+    # `z2k menu` получит правильную версию без необходимости делать
+    # manual reinstall. Field-2026-05-24 user-filed: «обновился, новый
+    # пункт [M] не появился в z2k menu» — ровно этот сценарий, на тот
+    # момент sync'а не было.
+    # Используем `cp -f` (не `-u`) — mtime check ненадёжен, в типичном
+    # сценарии install.sh кладёт persistent с тем же mtime что fetch
+    # положил в cache. Unconditional copy from persistent гарантирует
+    # cache идентичен persistent (который — source of truth от последнего
+    # apply/install). Стоимость +5ms на interactive run, незначительно.
+    local _persistent_lib="/opt/zapret2/lib"
+    if [ -d "$_persistent_lib" ]; then
+        for _sync_mod in $MODULES; do
+            if [ -f "${_persistent_lib}/${_sync_mod}.sh" ]; then
+                cp -f "${_persistent_lib}/${_sync_mod}.sh" "${LIB_DIR}/${_sync_mod}.sh" 2>/dev/null
+            fi
+        done
+    fi
+
+    # Установить обработчики сигналов (будет переопределено после загрузки utils.sh)
+    # Note: trap раньше чистил $WORK_DIR при Ctrl+C, теперь оставляем
+    # кэш целым даже при прерывании — если install прервался, следующий
+    # `z2k install` сам пересоздаст чистую директорию.
+    # При выходе чистим build-temp, и если WORK_DIR был перенесён на /opt
+    # (USB-fallback при малом /tmp) — удаляем его за собой, чтобы не оставлять
+    # рабочую папку на USB после установки (Mark req 2026-05-28).
+    # build_dir теперь живёт под $WORK_DIR (=${WORK_DIR}/zapret2_build, step_
+    # build_zapret2 _stage_base). На success его чистит сам step (install.sh),
+    # но на фейле/прерывании до этого — он бы протёк в tmpfs, подрывая /tmp-
+    # устойчивость (Codex 2026-05-28). Чистим оба пути: legacy /tmp/zapret2_build
+    # и актуальный ${WORK_DIR}/zapret2_build (guard на пустой WORK_DIR чтобы не
+    # получить rm -rf /zapret2_build). Кэш $WORK_DIR в остальном сохраняем.
+    trap 'echo ""; print_error "Прервано пользователем"; rm -rf /tmp/zapret2_build ${WORK_DIR:+"$WORK_DIR/zapret2_build"}; [ "${Z2K_WORKDIR_ON_OPT:-0}" = "1" ] && rm -rf "$WORK_DIR"; exit 130' INT TERM
+    trap 'rm -rf /tmp/zapret2_build ${WORK_DIR:+"$WORK_DIR/zapret2_build"}; [ "${Z2K_WORKDIR_ON_OPT:-0}" = "1" ] && rm -rf "$WORK_DIR"' EXIT
+
+    # Скачать модули (если нужно — иначе используем кэшированные)
+    if [ "$_need_fetch" = "1" ]; then
+        # Manifest first: it is the trust root every download below is checked
+        # against, so it has to be on disk before the first of them.
+        z2k_fetch_manifest_hashes
+        download_modules
+    fi
+
+    # Загрузить модули в память
+    source_modules
+
+    # Теперь доступны все функции из модулей
+    # Переустановить обработчики сигналов с правильными функциями
+    setup_signal_handlers
+
+    # Инициализация (создание рабочей директории с проверками из utils.sh)
+    init_work_dir || die "Ошибка инициализации"
+
+    # Проверить права root (нужно для установки)
+    if [ "$1" = "install" ] || [ "$1" = "i" ]; then
+        check_root || die "Требуются права root для установки"
+    fi
+
+    # Скачать artifacts (strats / fake blobs / init script) — пропускаем
+    # на warm cache, kin keeps cached copies intact.
+    if [ "$_need_fetch" = "1" ]; then
+        download_strategies_source
+        download_fake_blobs
+        download_init_script
+        generate_strategies_database
+    fi
+
+    # Обработать аргументы командной строки
+    handle_arguments "$@"
+
+    # Очистка при выходе (если не удаляется автоматически)
+    # cleanup_work_dir
+}
+
+# ==============================================================================
+# ЗАПУСК
+# ==============================================================================
+
+main "$@"

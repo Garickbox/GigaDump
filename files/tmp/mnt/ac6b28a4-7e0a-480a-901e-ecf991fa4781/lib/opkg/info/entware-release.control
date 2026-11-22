@@ -1,0 +1,12 @@
+Package: entware-release
+Version: 2026.11-1
+Depends: libc, libssp, librt, libpthread
+Provides: entware-release-any
+Source: feeds/rtndev/entware-release
+SourceName: entware-release
+Section: base
+SourceDateEpoch: 1793982802
+Maintainer: Entware team, https://entware.net
+Architecture: all
+Installed-Size: 10240
+Description:  entware_release is a file in /opt/etc with entware info.

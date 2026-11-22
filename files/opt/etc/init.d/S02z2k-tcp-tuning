@@ -1,0 +1,13 @@
+#!/bin/sh
+# z2k TCP tuning — applied on every boot.
+# Without it tcp_wmem default stays at 16 KB and upload through the
+# WS tunnel caps at ~2 Mbit/s per TCP session with 65ms RTT to VPS.
+case "$1" in
+    start)
+        sysctl -w net.ipv4.tcp_rmem="4096 524288 4194304" 2>/dev/null
+        sysctl -w net.ipv4.tcp_wmem="4096 524288 4194304" 2>/dev/null
+        sysctl -w net.core.rmem_max=4194304 2>/dev/null
+        sysctl -w net.core.wmem_max=4194304 2>/dev/null
+        sysctl -w net.ipv4.tcp_congestion_control=bbr 2>/dev/null || true
+        ;;
+esac

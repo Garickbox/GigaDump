@@ -1,0 +1,14 @@
+Package: libc
+Version: 2.27-12
+Depends: libgcc
+Provides: libc-any
+Source: feeds/base/libs/toolchain
+SourceName: toolchain
+License: GPL-3.0-with-GCC-exception
+Section: libs
+SourceDateEpoch: 1793487135
+URL: http://www.gnu.org/software/libc/
+Maintainer: Felix Fietkau <nbd@nbd.name>
+Architecture: aarch64-3.10
+Installed-Size: 2867200
+Description:  C library

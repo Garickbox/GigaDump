@@ -1,0 +1,16 @@
+Package: tailscale
+Version: 1.104.4-1
+Depends: ca-bundle, coreutils-nohup
+Provides: tailscale-any
+Source: feeds/golang/tailscale
+SourceName: tailscale
+License: BSD-3-Clause
+LicenseFiles: LICENSE
+Section: net
+SourceDateEpoch: 1793141161
+URL: https://tailscale.com/
+Maintainer: Entware team, https://entware.net
+Architecture: aarch64-3.10
+Installed-Size: 49756160
+Description:  Zero config VPN. Installs on any device in minutes, manages
+ firewall rules for you, and works from anywhere

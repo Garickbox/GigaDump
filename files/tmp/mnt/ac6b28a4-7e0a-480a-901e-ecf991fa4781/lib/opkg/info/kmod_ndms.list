@@ -1,0 +1,4 @@
+/opt/etc/ndm/usb.d/000-kmod_loader.sh
+/opt/sbin/usbdev_get_class
+/opt/sbin/kmod_ndms
+/opt/etc/init.d/S00kmod_config

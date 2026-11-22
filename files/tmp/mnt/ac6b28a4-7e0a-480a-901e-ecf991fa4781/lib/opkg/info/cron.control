@@ -1,0 +1,14 @@
+Package: cron
+Version: 4.1-7
+Depends: libc, libssp, librt, libpthread
+Provides: cron-any
+Alternatives: 200:/opt/bin/crontab:/opt/bin/crontab-vixie, 200:/opt/bin/run-parts:/opt/bin/run-parts-vixie
+Source: feeds/rtndev/cron
+SourceName: cron
+Section: utils
+SourceDateEpoch: 1794055586
+URL: ftp://ftp.isc.org/isc/cron
+Maintainer: Entware team, https://entware.net
+Architecture: aarch64-3.10
+Installed-Size: 102400
+Description:  Standart Vixie cron, with cron.d addition.

@@ -1,0 +1,12 @@
+/opt/sbin/reboot.sh
+/opt/etc/init.d/rc.unslung
+/opt/etc/group
+/opt/etc/skel/.inputrc
+/opt/etc/ld.so.conf
+/opt/root/.inputrc
+/opt/etc/init.d/rc.func
+/opt/etc/profile
+/opt/etc/passwd
+/opt/etc/shells
+/opt/etc/skel/.profile
+/opt/root/.profile

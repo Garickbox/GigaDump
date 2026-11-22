@@ -1,0 +1,13 @@
+Package: ca-certificates
+Version: 20260816-2
+Depends: libc, libssp, librt, libpthread
+Provides: ca-certificates-any, ca-certs
+Source: feeds/base/system/ca-certificates
+SourceName: ca-certificates
+License: GPL-2.0-or-later MPL-2.0
+LicenseFiles: debian/copyright
+Section: base
+SourceDateEpoch: 1786914276
+Architecture: all
+Installed-Size: 337920
+Description:  System CA certificates

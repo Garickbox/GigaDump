@@ -1,0 +1,50 @@
+Package: iptables
+Version: 1.4.21-6
+Depends: libc, libssp, librt, libpthread
+Provides: iptables-any
+Alternatives: 200:/opt/bin/iptables-xml:/opt/sbin/xtables-multi, 200:/opt/sbin/iptables:/opt/sbin/xtables-multi, 200:/opt/sbin/iptables-restore:/opt/sbin/xtables-multi, 200:/opt/sbin/iptables-save:/opt/sbin/xtables-multi, 200:/opt/sbin/ip6tables:/opt/sbin/xtables-multi, 200:/opt/sbin/ip6tables-restore:/opt/sbin/xtables-multi, 200:/opt/sbin/ip6tables-save:/opt/sbin/xtables-multi
+Source: feeds/base/network/utils/iptables
+SourceName: iptables
+License: GPL-2.0
+Section: net
+SourceDateEpoch: 1385119573
+URL: https://netfilter.org/
+CPE-ID: cpe:/a:netfilter:iptables
+Architecture: aarch64-3.10_kn
+Installed-Size: 645120
+Description:  IP firewall administration tool.
+ 
+ Matches:
+ - icmp
+ - tcp
+ - udp
+ - comment
+ - conntrack
+ - limit
+ - mac
+ - mark
+ - multiport
+ - set
+ - state
+ - time
+ 
+ Targets:
+ - ACCEPT
+ - CT
+ - DNAT
+ - DROP
+ - REJECT
+ - LOG
+ - MARK
+ - MASQUERADE
+ - REDIRECT
+ - SET
+ - SNAT
+ - TCPMSS
+ 
+ Tables:
+ - filter
+ - mangle
+ - nat
+ - raw
+ 

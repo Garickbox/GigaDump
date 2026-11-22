@@ -1,0 +1,28 @@
+2026-11-22 04:00:03 ночной разброс: жду 3268с
+2026-11-22 04:54:31 --- Update lists started ---
+2026-11-22 04:54:31 Running z2k-geosite fetch (runetfreedom)...
+[geosite] fetch ru-blocked.txt
+[geosite]   ru-blocked.txt: HTTP 200, 1672594 bytes
+[geosite]   ru-blocked.txt: applied, 73590 lines
+[geosite] fetch youtube.txt
+[geosite]   youtube.txt: HTTP 200, 3643 bytes
+[geosite]   youtube.txt: applied, 176 lines
+[geosite]   youtube.txt: applied, 176 lines
+[geosite] fetch discord.txt
+[geosite]   discord.txt: HTTP 200, 683 bytes
+[geosite]   discord.txt: saved shipped backup → Discord.txt.shipped
+[geosite]   discord.txt: applied, 28 lines
+[geosite]   discord.txt: applied, 28 lines
+[geosite] fetch summary: 5 ok, 0 failed
+[geosite] YT: applied, removed 1 googlevideo/c.youtube.com overlap(s) (176 → 175 lines) — gv_tcp profile gets these via YT_GV/List.txt
+[geosite] YT login: injected 2 sign-in domain(s) into TCP/YT/List.txt
+[geosite] YT login: injected 2 sign-in domain(s) into UDP/YT/List.txt
+[geosite] RKN: removed 13 YT/googlevideo/c.youtube.com overlaps (73590 → 73577 lines)
+[geosite] RKN: removed 3 hand-curated false positives (73577 → 73574 lines)
+2026-11-22 04:54:49 geosite: applied changes detected
+2026-11-22 04:54:50 OK: cf_cidrs_v4 updated (15 lines)
+2026-11-22 04:55:04 OK: warp game lists refreshed (32 lists, 0 unavailable)
+2026-11-22 04:55:04 Changes detected (2 lists), restarting service...
+2026-11-22 04:55:14 Service restarted successfully
+2026-11-22 04:55:14 Running insta-ip refresh...
+2026-11-22 04:55:34 --- Update lists finished ---

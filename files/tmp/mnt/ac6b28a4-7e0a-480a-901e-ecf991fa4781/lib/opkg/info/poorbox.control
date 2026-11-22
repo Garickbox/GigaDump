@@ -1,0 +1,15 @@
+Package: poorbox
+Version: 1.38.0-1
+Provides: poorbox-any
+Source: feeds/keendev3x/poorbox
+SourceName: poorbox
+License: GPL-2.0
+LicenseFiles: LICENSE archival/libarchive/bz/LICENSE
+Section: base
+SourceDateEpoch: 1778638799
+URL: http://busybox.net/
+CPE-ID: cpe:/a:busybox:busybox
+Architecture: aarch64-3.10_kn
+Installed-Size: 952320
+Description:  The Swiss Army Knife of embedded Linux.
+ It slices, it dices, it makes Julian Fries.

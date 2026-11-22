@@ -1,0 +1,13 @@
+Package: libstdcpp
+Version: 8.4.0-12
+Provides: libstdcpp-any
+Source: feeds/base/libs/toolchain
+SourceName: toolchain
+License: GPL-3.0-with-GCC-exception
+Section: libs
+SourceDateEpoch: 1793487135
+URL: https://gcc.gnu.org/
+Maintainer: Felix Fietkau <nbd@nbd.name>
+Architecture: aarch64-3.10
+Installed-Size: 1413120
+Description:  GNU Standard C++ Library v3

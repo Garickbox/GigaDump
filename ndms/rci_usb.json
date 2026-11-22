@@ -1,0 +1,15 @@
+{
+  "device": {
+    "Media0": {
+      "DEVICE": "/devices/platform/11200000.xhci/usb1/1-1/1-1.2/1-1.2:1.0",
+      "DEVPATH": "/devices/platform/11200000.xhci/usb1/1-1/1-1.2/1-1.2:1.0/host0/target0:0:0/0:0:0:0/block/sda",
+      "manufacturer": "ASolid",
+      "port": "2",
+      "power-control": "yes",
+      "product": "USB_0114",
+      "serial": "72625305",
+      "subsystem": "media",
+      "usb-version": "2.10"
+    }
+  }
+}

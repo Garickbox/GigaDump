@@ -1,0 +1,550 @@
+{
+  "output": {
+    "domains_file": "medvedeff-game-list-all.txt",
+    "ips_file": "medvedeff-game-ipset.txt",
+    "games_dir": "games",
+    "write_ips_to_game_files": false,
+    "review_file": "_review/issue_candidates.md",
+    "production_writes": false
+  },
+  "limits": {
+    "http_timeout_seconds": 35,
+    "sleep_between_github_requests_seconds": 0.35,
+    "max_issue_pages_per_query": 1,
+    "max_comments_per_issue": 0,
+    "max_raw_files_per_repo": 80,
+    "max_raw_file_size_bytes": 450000,
+    "max_discovered_repositories_per_query": 0
+  },
+  "game_map": {
+    "ApexLegends_RocketLeague": [
+      "apex legends",
+      "apex",
+      "rocket league",
+      "rocketleague"
+    ],
+    "Arknights": [
+      "arknights",
+      "акнайтс"
+    ],
+    "ArmaReforger": [
+      "arma reforger",
+      "reforger"
+    ],
+    "Battlefield6": [
+      "battlefield",
+      "battlefield 6",
+      "bf6"
+    ],
+    "BattleNet": [
+      "battle.net",
+      "battlenet",
+      "blizzard",
+      "warcraft",
+      "diablo",
+      "overwatch",
+      "hearthstone"
+    ],
+    "BlueArchive": [
+      "blue archive",
+      "bluearchive"
+    ],
+    "DeadByDaylight": [
+      "dead by daylight",
+      "deadbydaylight",
+      "dbd"
+    ],
+    "EA_Origin": [
+      "ea origin",
+      "origin",
+      "electronic arts",
+      "ea.com"
+    ],
+    "EpicGames_Fortnite": [
+      "epic games",
+      "epicgames",
+      "fortnite",
+      "unreal tournament",
+      "unrealengine"
+    ],
+    "Fallout76_AWS": [
+      "fallout 76",
+      "fallout76"
+    ],
+    "GearsOfWar": [
+      "gears of war",
+      "gearsofwar"
+    ],
+    "GooseGooseDuck": [
+      "goose goose duck",
+      "goosegooseduck"
+    ],
+    "LeagueOfLegends": [
+      "league of legends",
+      "leagueoflegends",
+      "riot lol"
+    ],
+    "MagicTheGathering": [
+      "magic the gathering",
+      "mtga",
+      "mtg arena"
+    ],
+    "Minecraft_Extra": [
+      "minecraft",
+      "mojang",
+      "hypixel",
+      "mineplex"
+    ],
+    "MortalKombat1": [
+      "mortal kombat 1",
+      "mortalkombat1",
+      "mk1"
+    ],
+    "PhotonEngine": [
+      "photon engine",
+      "photonengine",
+      "exitgames"
+    ],
+    "RiotGames_Valorant": [
+      "riot games",
+      "riotgames",
+      "valorant",
+      "riot client"
+    ],
+    "Roblox": [
+      "roblox",
+      "роблокс"
+    ],
+    "Steam": [
+      "steam",
+      "steamworks",
+      "valve",
+      "counter-strike",
+      "cs2",
+      "dota",
+      "dota 2",
+      "steamdeck"
+    ],
+    "VRChat": [
+      "vrchat",
+      "vrcdn"
+    ],
+    "Warframe": [
+      "warframe"
+    ],
+    "WutheringWaves": [
+      "wuthering waves",
+      "wutheringwaves",
+      "kuro games"
+    ],
+    "Ubisoft_Rainbow_Six_Siege": [
+      "ubisoft",
+      "rainbow six",
+      "rainbow six siege",
+      "r6 siege",
+      "r6s"
+    ],
+    "Wardogs": [
+      "wardogs",
+      "wardogs bulkhead",
+      "pragma wardogs"
+    ],
+    "Cloudflare_AWS": [
+      "cloudflare",
+      "amazon aws",
+      "aws",
+      "amazonaws"
+    ],
+    "Darktide": [
+      "darktide",
+      "warhammer 40000 darktide",
+      "warhammer 40k darktide"
+    ],
+    "StreetFighter6": [
+      "street fighter 6",
+      "streetfighter 6",
+      "sf6"
+    ],
+    "CallOfDuty": [
+      "call of duty",
+      "callofduty",
+      "cod",
+      "warzone",
+      "black ops"
+    ],
+    "CompanyOfHeroes2": [
+      "company of heroes 2",
+      "companyofheroes2",
+      "coh2"
+    ],
+    "MortalKombat11": [
+      "mortal kombat 11",
+      "mortalkombat11",
+      "mk11"
+    ],
+    "OutlastTrials": [
+      "the outlast trials",
+      "outlast trials",
+      "outlasttrials"
+    ]
+  },
+  "domain_game_hints": {
+    "ApexLegends_RocketLeague": [
+      "apexlegends",
+      "rocketleague"
+    ],
+    "BattleNet": [
+      "battle.net",
+      "blizzard.com",
+      "battle.net",
+      "battlenet.com",
+      "worldofwarcraft",
+      "diablo",
+      "overwatch"
+    ],
+    "EA_Origin": [
+      "ea.com",
+      "origin.com",
+      "electronicarts"
+    ],
+    "EpicGames_Fortnite": [
+      "epicgames",
+      "fortnite",
+      "unrealengine",
+      "ol.epicgames"
+    ],
+    "LeagueOfLegends": [
+      "leagueoflegends",
+      "lolstatic",
+      "riotcdn"
+    ],
+    "Minecraft_Extra": [
+      "minecraft",
+      "mojang",
+      "hypixel",
+      "mineplex"
+    ],
+    "PhotonEngine": [
+      "photonengine",
+      "exitgames"
+    ],
+    "RiotGames_Valorant": [
+      "riotgames",
+      "valorant",
+      "riotcdn"
+    ],
+    "Roblox": [
+      "roblox",
+      "rbxcdn",
+      "rbx.com"
+    ],
+    "Steam": [
+      "steampowered",
+      "steamcommunity",
+      "steamstatic",
+      "steamserver",
+      "steamcontent",
+      "steamusercontent",
+      "valvesoftware",
+      "dota2"
+    ],
+    "VRChat": [
+      "vrchat",
+      "vrchat.cloud",
+      "vrcdn",
+      "vrcpm"
+    ],
+    "Warframe": [
+      "warframe"
+    ],
+    "WutheringWaves": [
+      "kurogames",
+      "wutheringwaves"
+    ],
+    "Ubisoft_Rainbow_Six_Siege": [
+      "ubisoft",
+      "ubi.com",
+      "rainbow6"
+    ],
+    "Wardogs": [
+      "wardogs",
+      "bulkhead.pragmaengine",
+      "firstlook.gg",
+      "elytra.ac"
+    ],
+    "Fallout76_AWS": [
+      "fallout.bethesda.net",
+      "api.bethesda.net",
+      "bethesda.net",
+      "p76prod.systems"
+    ],
+    "GearsOfWar": [
+      "gearsofwar.com",
+      "xboxlive.com",
+      "xbox.com"
+    ],
+    "MagicTheGathering": [
+      "mtgarena",
+      "magic-the-gathering-arena",
+      "wizards.com",
+      "api.platform.wizards.com",
+      "mtgarena.downloads.wizards.com"
+    ],
+    "Darktide": [
+      "playdarktide",
+      "fatshark"
+    ],
+    "BlueArchive": [
+      "x-update.ngs.nexon.com",
+      "x-init.ngs.nexon.com",
+      "public.api.nexon.com",
+      "d2vaidpni345rp.cloudfront.net"
+    ],
+    "Arknights": [
+      "ak.hypergryph.com",
+      "launcher.hypergryph.com",
+      "hypergryph.com"
+    ],
+    "StreetFighter6": [
+      "streetfighter.com",
+      "cid.capcom.com",
+      "auth.cid.capcom.com"
+    ],
+    "CallOfDuty": [
+      "callofduty.com",
+      "activision.com",
+      "demonware.net",
+      "prod.demonware.net",
+      "cod-assets.cdn.callofduty.com"
+    ],
+    "CompanyOfHeroes2": [
+      "coh2-api.reliclink.com",
+      "coh2-lobby.reliclink.com",
+      "reliclink.com",
+      "sso.relic.com",
+      "coh2.lobby.reliclink.com",
+      "companyofheroes.com",
+      "ingame.companyofheroes.com",
+      "garry.sgaas.net",
+      "compute-1.amazonaws.com",
+      "eu-central-1.compute.amazonaws.com"
+    ],
+    "OutlastTrials": [
+      "rbg-services.com",
+      "outlast"
+    ],
+    "MortalKombat11": [
+      "mk11-api.wbagora.com",
+      "us-east-1-mk11-realtime-1.wbagora.com",
+      "event.wbinsights.com",
+      "int-api.wbagora.com",
+      "next-api.wbagora.com",
+      "prod-network-api.wbagora.com",
+      "account.wbgames.com",
+      "wbagora.com",
+      "wbinsights.com",
+      "wbgames.com",
+      "mortalkombat.com"
+    ]
+  },
+  "issue_search_terms": [
+    "roblox",
+    "fortnite",
+    "epic games",
+    "vrchat",
+    "vrc",
+    "steam",
+    "dota",
+    "cs2",
+    "valorant",
+    "riot",
+    "league of legends",
+    "minecraft",
+    "battle.net",
+    "blizzard",
+    "warframe",
+    "ubisoft",
+    "rainbow six",
+    "battlefield",
+    "apex",
+    "rocket league",
+    "dead by daylight",
+    "wuthering waves",
+    "photonengine",
+    "game filter",
+    "ipset game",
+    "hostlist game",
+    "игра",
+    "игры",
+    "игровые",
+    "домены игры",
+    "ip игры",
+    "wardogs",
+    "pragmaengine",
+    "fallout 76",
+    "fallout76",
+    "gears of war",
+    "gearsofwar",
+    "mtg arena",
+    "mtga",
+    "darktide",
+    "playdarktide",
+    "p76prod",
+    "fallout 76 aws",
+    "fallout76 aws",
+    "as32590",
+    "as22697",
+    "as57976",
+    "6507:8001",
+    "6507:8002",
+    "street fighter 6",
+    "streetfighter 6",
+    "sf6",
+    "call of duty",
+    "callofduty",
+    "warzone",
+    "demonware",
+    "as60229",
+    "company of heroes 2",
+    "companyofheroes2",
+    "coh2",
+    "reliclink",
+    "ingame.companyofheroes.com",
+    "garry.sgaas.net",
+    "compute-1.amazonaws.com",
+    "eu-central-1.compute.amazonaws.com",
+    "mortal kombat 11",
+    "mortalkombat11",
+    "mk11",
+    "the outlast trials",
+    "outlast trials",
+    "outlasttrials",
+    "rbg-services",
+    "mk11-api.wbagora.com",
+    "us-east-1-mk11-realtime-1.wbagora.com",
+    "event.wbinsights.com",
+    "prod-network-api.wbagora.com"
+  ],
+  "repositories": [
+    {
+      "repo": "Flowseal/zapret-discord-youtube",
+      "scan_issues": true,
+      "scan_issue_comments": false,
+      "scan_raw_files": false,
+      "allow_review_candidates": true,
+      "max_issue_pages_per_query": 1,
+      "max_comments_per_issue": 0
+    },
+    {
+      "repo": "youtubediscord/zapret",
+      "scan_issues": true,
+      "scan_issue_comments": false,
+      "scan_raw_files": false,
+      "allow_review_candidates": true,
+      "max_issue_pages_per_query": 1,
+      "max_comments_per_issue": 0
+    },
+    {
+      "repo": "gexoty/vrc-ip-list",
+      "scan_issues": false,
+      "scan_issue_comments": false,
+      "scan_raw_files": true,
+      "trust_all_domains_as_gaming": true,
+      "default_game": "VRChat",
+      "allow_review_candidates": true,
+      "max_raw_files_per_repo": 20
+    }
+  ],
+  "raw_sources": [
+    {
+      "name": "gexoty VRChat domains",
+      "url": "https://raw.githubusercontent.com/gexoty/vrc-ip-list/main/domain-list",
+      "kind": "domains",
+      "trust_all_domains_as_gaming": true,
+      "default_game": "VRChat",
+      "allow_review_candidates": true
+    },
+    {
+      "name": "gexoty VRChat IPs",
+      "url": "https://raw.githubusercontent.com/gexoty/vrc-ip-list/main/ip-list",
+      "kind": "ips",
+      "trust_all_domains_as_gaming": true,
+      "default_game": "VRChat",
+      "allow_review_candidates": true
+    }
+  ],
+  "repository_discovery": {
+    "enabled": false,
+    "queries": [],
+    "ignore_repositories": [
+      "medvedeff-true/ru-gaming-blocklist",
+      "YOZH3G/ru-gaming-blocklist"
+    ],
+    "min_score": 999,
+    "scan_issues": false,
+    "scan_raw_files": false
+  },
+  "raw_file_filters": {
+    "extensions": [
+      ".txt",
+      ".list",
+      ".lst",
+      ".conf",
+      ".md",
+      ".bat",
+      ".cmd",
+      ".ps1",
+      ".sh",
+      ".lua",
+      ".json",
+      ".yaml",
+      ".yml"
+    ],
+    "path_keywords": [
+      "list",
+      "host",
+      "hosts",
+      "hostlist",
+      "domain",
+      "domains",
+      "ipset",
+      "ip-list",
+      "ips",
+      "cidr",
+      "game",
+      "gaming",
+      "roblox",
+      "fortnite",
+      "epic",
+      "vrchat",
+      "steam",
+      "riot",
+      "valorant",
+      "minecraft",
+      "photon",
+      "warframe",
+      "ubisoft",
+      "battlefield",
+      "wardogs",
+      "pragmaengine",
+      "fallout76",
+      "gearsofwar",
+      "mtga",
+      "darktide",
+      "playdarktide",
+      "p76prod",
+      "streetfighter",
+      "sf6",
+      "callofduty",
+      "demonware",
+      "warzone",
+      "companyofheroes",
+      "coh2",
+      "reliclink",
+      "sgaas",
+      "outlast",
+      "outlasttrials",
+      "rbg-services"
+    ]
+  }
+}

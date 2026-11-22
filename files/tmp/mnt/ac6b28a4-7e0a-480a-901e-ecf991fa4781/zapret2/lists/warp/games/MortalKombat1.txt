@@ -1,0 +1,13 @@
+account.wbgames.com
+datarouter.apps.netherrealm.com
+k1-api.wbagora.com
+mortalkombat.com
+prod-network-api.wbagora.com
+3.208.213.89/32
+3.218.246.218/32
+18.205.184.40/32
+23.23.22.141/32
+34.202.15.243/32
+44.214.204.133/32
+52.206.116.218/32
+98.88.245.30/32

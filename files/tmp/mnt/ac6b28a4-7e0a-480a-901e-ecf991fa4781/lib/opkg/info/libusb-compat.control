@@ -1,0 +1,16 @@
+Package: libusb-compat
+Version: 0.1.8-1
+Depends: libc, libssp, librt, libpthread, libusb-1.0
+Provides: libusb-compat-any
+Source: feeds/packages/libs/libusb-compat
+SourceName: libusb-compat
+License: LGPL-2.1-or-later
+LicenseFiles: COPYING
+Section: libs
+SourceDateEpoch: 1697108665
+URL: https://libusb.info/
+Maintainer: Felix Fietkau <nbd@nbd.name>
+Architecture: aarch64-3.10
+Installed-Size: 30720
+Description:  libusb is a C library that gives applications easy access to USB devices on
+ many different operating systems.

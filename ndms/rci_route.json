@@ -1,0 +1,35 @@
+[
+  {
+    "destination": "0.0.0.0/0",
+    "gateway": "10.16.20.1",
+    "interface": "GigabitEthernet1",
+    "metric": 1000,
+    "flags": "U",
+    "rejecting": false,
+    "proto": "boot",
+    "floating": false,
+    "static": false
+  },
+  {
+    "destination": "10.16.20.0/23",
+    "gateway": "0.0.0.0",
+    "interface": "GigabitEthernet1",
+    "metric": 1000,
+    "flags": "U",
+    "rejecting": false,
+    "proto": "kernel",
+    "floating": false,
+    "static": false
+  },
+  {
+    "destination": "192.168.1.0/24",
+    "gateway": "0.0.0.0",
+    "interface": "Bridge0",
+    "metric": 1000,
+    "flags": "U",
+    "rejecting": false,
+    "proto": "kernel",
+    "floating": false,
+    "static": false
+  }
+]

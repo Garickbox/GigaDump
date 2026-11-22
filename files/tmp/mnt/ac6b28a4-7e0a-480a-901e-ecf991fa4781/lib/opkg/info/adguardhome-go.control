@@ -1,0 +1,15 @@
+Package: adguardhome-go
+Version: v0.107.79-1
+Depends: ca-bundle
+Provides: adguardhome-go-any, adguardhome
+Source: feeds/golang/adguardhome-go
+SourceName: adguardhome
+License: GPL-3.0-only
+LicenseFiles: LICENSE.txt
+Section: net
+SourceDateEpoch: 1786960338
+URL: https://adguard.com/adguard-home.html
+Maintainer: Entware team, https://entware.net
+Architecture: aarch64-3.10
+Installed-Size: 34160640
+Description:  AdGuard Home is a network-wide software for blocking ads and tracking.

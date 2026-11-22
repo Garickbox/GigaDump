@@ -1,0 +1,18 @@
+{
+  "proxy-status": [
+    {
+      "proxy-name": "System",
+      "proxy-config": "rpc_port = 54321\nrpc_ttl = 10000\nrpc_wait = 10000\ntimeout = 7000\nproceed = 500\nstat_file = /var/ndnproxymain.stat\nstat_time = 10000\ndns_server = 77.88.8.8 .\ndns_server = 77.88.8.1 .\nstatic_a = my.netcraze.net 198.51.100.37 1\nstatic_aaaa = my.netcraze.net 2001:2::c633:6425 1\nrpc_const = on\nstatic_a = 80691c131aaab473f9e3b963.netcraze.io 198.51.100.37 1\nstatic_aaaa = 80691c131aaab473f9e3b963.netcraze.io 2001:2::c633:6425 1\nstatic_a = whatsapp.com 85.192.60.175 0\nstatic_a = whatsapp.net 85.192.60.175 0\nstatic_a = g.whatsapp.net 85.192.60.175 0\nstatic_a = static.whatsapp.net 85.192.60.175 0\nstatic_a = mmg.whatsapp.net 85.192.60.175 0\nstatic_a = pps.whatsapp.net 85.192.60.175 0\nstatic_a = dit.whatsapp.net 85.192.60.175 0\nstatic_a = v.whatsapp.net 85.192.60.175 0\nstatic_a = crashlogs.whatsapp.net 85.192.60.175 0\nstatic_a = api.instagram.com 57.144.248.192 0\nstatic_a = api.instagram.com 57.144.244.192 0\nstatic_a = web.whatsapp.com 57.144.245.32 0\nstatic_a = web.whatsapp.com 57.144.249.32 0\nstatic_a = www.whatsapp.com 57.144.245.32 0\nstatic_a = www.whatsapp.com 57.144.249.32 0\nstatic_a = graph.whatsapp.com 57.144.245.32 0\nstatic_a = graph.whatsapp.com 57.144.249.32 0\nstatic_a = v.whatsapp.com 57.144.249.32 0\nstatic_a = v.whatsapp.com 57.144.245.32 0\nstatic_a = raw.githubusercontent.com 185.199.108.133 0\nstatic_a = rutracker.org 10.171.171.171 0\nstatic_a = rutracker.wiki 10.171.171.171 0\nstatic_a = api.rutracker.cc 10.171.171.171 0\nstatic_a = rep.rutracker.cc 10.171.171.171 0\nstatic_a = static.rutracker.cc 10.171.171.171 0\nstatic_a = scontent.cdninstagram.com 57.144.248.192 0\nstatic_a = scontent.cdninstagram.com 157.240.0.63 0\nstatic_a = instagram.com 57.144.248.34 0\nstatic_a = instagram.com 57.144.244.34 0\nstatic_a = www.instagram.com 57.144.248.34 0\nstatic_a = www.instagram.com 157.240.0.174 0\nstatic_a = graph.instagram.com 57.144.248.192 0\nstatic_a = graph.instagram.com 157.240.0.63 0\nstatic_a = instagram.c10r.instagram.com 57.144.244.192 0\nstatic_a = instagram.c10r.instagram.com 57.144.248.192 0\nstatic_a = static.cdninstagram.com 57.144.248.192 0\nstatic_a = static.cdninstagram.com 57.144.244.192 0\nstatic_a = scontent.whatsapp.net 57.144.245.32 0\nstatic_a = scontent.whatsapp.net 57.144.249.32 0\nstatic_a = use-application-dns.net 0.0.0.0 0\nstatic_a = exampleadultsite.com 0.0.0.0 0\nnorebind_ctl = on\nnorebind_ip4net = 192.168.1.1:24\nnorebind_ip4net = 255.255.255.255:32\nhas_vpn_clients = off\nset-profile-ip 127.0.0.1 0\nset-profile-ip ::1 0\nrpc_only = on\n\n",
+      "proxy-stat": "# ndnproxy statistics file\n\nTotal incoming requests: 0\nProxy requests sent:     0\nCache hits ratio:        0.000 (0)\nMemory usage:            12.75K\n\nDNS Servers\n\n                      Ip   Port  R.Sent  A.Rcvd  NX.Rcvd  Med.Resp  Avg.Resp  Rank  \n               77.88.8.8     53       0       0        0       0ms       0ms     1  \n               77.88.8.1     53       0       0        0       0ms       0ms     1  \n",
+      "proxy-safe": "",
+      "proxy-tls": {
+      },
+      "proxy-tls-filters": {
+      },
+      "proxy-https": {
+      },
+      "proxy-https-filters": {
+      }
+    }
+  ]
+}

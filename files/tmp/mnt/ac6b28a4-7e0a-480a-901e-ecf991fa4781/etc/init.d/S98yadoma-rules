@@ -1,0 +1,41 @@
+#!/bin/sh
+PIDF="/var/run/yadoma-httpd.pid"
+WPIDF="/var/run/yadoma-watch.pid"
+PUB="/opt/zapret2/yadoma-pub"
+start() {
+  /opt/bin/yadoma-export-rules.sh >/dev/null 2>&1 || true
+  if [ ! -f "$PIDF" ] || ! kill -0 "$(cat "$PIDF" 2>/dev/null)" 2>/dev/null; then
+    (
+      i=0
+      while [ "$i" -lt 30 ]; do
+        if ifconfig tailscale0 2>/dev/null | grep -q "100\.81\.14\.2"; then
+          /opt/sbin/lighttpd -f "$PUB/lighttpd.conf"
+          break
+        fi
+        i=$((i+1))
+        sleep 1
+      done
+    ) >/dev/null 2>&1 &
+  fi
+  if [ ! -f "$WPIDF" ] || ! kill -0 "$(cat "$WPIDF" 2>/dev/null)" 2>/dev/null; then
+    (
+      while true; do
+        sleep 1800
+        if [ -n "$(find /opt/zapret2/lists /opt/zapret2/extra_strats -type f -name "*.txt" -newer "$PUB/yadoma-rules.json" 2>/dev/null | head -n1)" ]; then
+          /opt/bin/yadoma-export-rules.sh >/dev/null 2>&1 || true
+        fi
+      done
+    ) >/dev/null 2>&1 &
+    echo $! > "$WPIDF"
+  fi
+}
+stop() {
+  [ -f "$PIDF" ] && kill "$(cat "$PIDF" 2>/dev/null)" 2>/dev/null || true
+  [ -f "$WPIDF" ] && kill "$(cat "$WPIDF" 2>/dev/null)" 2>/dev/null || true
+  rm -f "$PIDF" "$WPIDF"
+}
+case "${1:-start}" in
+  start) start ;;
+  stop) stop ;;
+  restart) stop; sleep 1; start ;;
+esac

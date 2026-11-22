@@ -1,0 +1,569 @@
+Package: terminfo
+Version: 6.6.20260801-4a
+Depends: libc, libssp, librt, libpthread
+Provides: terminfo-any
+Status: install ok installed
+Architecture: aarch64-3.10
+Installed-Time: 1795280726
+Auto-Installed: yes
+
+Package: ldconfig
+Version: 2.27-12
+Provides: ldconfig-any
+Status: install user installed
+Architecture: aarch64-3.10
+Installed-Time: 1795280715
+
+Package: libc
+Version: 2.27-12
+Depends: libgcc
+Provides: libc-any
+Status: install user installed
+Architecture: aarch64-3.10
+Installed-Time: 1795280702
+
+Package: locales
+Version: 2.27-9
+Depends: libc, libssp, librt, libpthread, grep
+Provides: locales-any
+Status: install user installed
+Architecture: aarch64-3.10
+Installed-Time: 1795280717
+
+Package: opkg
+Version: 2025.11.05~80503d94-1
+Provides: opkg-any
+Status: install user installed
+Architecture: aarch64-3.10
+Installed-Time: 1795280719
+
+Package: libpthread
+Version: 2.27-12
+Depends: libgcc
+Provides: libpthread-any
+Status: install user installed
+Architecture: aarch64-3.10
+Installed-Time: 1795280704
+
+Package: zoneinfo-europe
+Version: 2026e-1
+Depends: libc, libssp, librt, libpthread, zoneinfo-core
+Provides: zoneinfo-europe-any
+Status: install user installed
+Architecture: aarch64-3.10
+Installed-Time: 1795280723
+
+Package: busybox
+Version: 1.38.0-5
+Depends: libc, libssp, librt, libpthread
+Provides: busybox-any
+Conflicts: busybox-selinux
+Status: install hold installed
+Essential: yes
+Architecture: aarch64-3.10
+Installed-Time: 1795280732
+
+Package: lighttpd-mod-cgi
+Version: 1.4.85-1
+Depends: libc, libssp, librt, libpthread, lighttpd
+Provides: lighttpd-mod-cgi-any
+Status: install user installed
+Architecture: aarch64-3.10
+Conffiles:
+ /opt/etc/lighttpd/conf.d/30-cgi.conf 18125857d3c71fb48ae35e24ad9da7e51d6cfc825f06d65d6578829b858f2231
+Installed-Time: 1795285881
+
+Package: xtables-addons_legacy
+Version: 1.47.1-2
+Depends: libc, libssp, librt, libpthread, iptables
+Provides: xtables-addons_legacy-any
+Status: install user installed
+Architecture: aarch64-3.10
+Installed-Time: 1795281631
+
+Package: libacl
+Version: 2.4.0-1
+Depends: libc, libssp, librt, libpthread
+Provides: libacl-any
+Status: install ok installed
+Architecture: aarch64-3.10
+Installed-Time: 1795340346
+Auto-Installed: yes
+
+Package: liblzma
+Version: 5.8.4-2
+Depends: libc, libssp, librt, libpthread, libpthread
+Provides: liblzma-any
+Status: install ok installed
+Architecture: aarch64-3.10
+Installed-Time: 1795340347
+Auto-Installed: yes
+
+Package: libcurl
+Version: 8.23.0-1
+Depends: libc, libssp, librt, libpthread, libopenssl, zlib, libnghttp2, ca-bundle
+Provides: libcurl-any
+Status: install ok installed
+Architecture: aarch64-3.10
+Installed-Time: 1795280774
+Auto-Installed: yes
+
+Package: openssl-util
+Version: 3.5.9-3
+Depends: libc, libssp, librt, libpthread, libopenssl, libopenssl-conf
+Provides: openssl-util-any
+Status: install user installed
+Architecture: aarch64-3.10
+Installed-Time: 1795281700
+
+Package: cron
+Version: 4.1-7
+Depends: libc, libssp, librt, libpthread
+Provides: cron-any
+Status: install user installed
+Architecture: aarch64-3.10
+Conffiles:
+ /opt/etc/crontab 8fe99361db0997e77db117044d41a3b64c87f26407e949b81c249f1fb3f8ce63
+Installed-Time: 1795284488
+Alternatives: 200:/opt/bin/crontab:/opt/bin/crontab-vixie, 200:/opt/bin/run-parts:/opt/bin/run-parts-vixie
+
+Package: libnetfilter-queue
+Version: 1.0.5-4
+Depends: libc, libssp, librt, libpthread, libmnl, libnfnetlink
+Provides: libnetfilter-queue-any
+Status: install user installed
+Architecture: aarch64-3.10
+Installed-Time: 1795281621
+
+Package: libcap
+Version: 2.69-1
+Depends: libc, libssp, librt, libpthread
+Provides: libcap-any
+Status: install user installed
+Architecture: aarch64-3.10
+Installed-Time: 1795281624
+
+Package: libnghttp2
+Version: 1.70.0-1
+Depends: libc, libssp, librt, libpthread
+Provides: libnghttp2-any
+Status: install ok installed
+Architecture: aarch64-3.10
+Installed-Time: 1795280773
+Auto-Installed: yes
+
+Package: grep
+Version: 3.12-2
+Depends: libc, libssp, librt, libpthread, libpcre2
+Provides: grep-any
+Status: install user installed
+Architecture: aarch64-3.10
+Installed-Time: 1795280713
+Alternatives: 300:/opt/bin/egrep:/opt/libexec/egrep-gnu, 300:/opt/bin/fgrep:/opt/libexec/fgrep-gnu, 300:/opt/bin/grep:/opt/libexec/grep-gnu
+
+Package: zoneinfo-asia
+Version: 2026e-1
+Depends: libc, libssp, librt, libpthread, zoneinfo-core
+Provides: zoneinfo-asia-any
+Status: install user installed
+Architecture: aarch64-3.10
+Installed-Time: 1795280721
+
+Package: coreutils
+Version: 9.11-1
+Depends: libc, libssp, librt, libpthread
+Provides: coreutils-any
+Status: install ok installed
+Architecture: aarch64-3.10
+Installed-Time: 1795281478
+Auto-Installed: yes
+
+Package: libzstd
+Version: 1.5.7-1
+Depends: libc, libssp, librt, libpthread
+Provides: libzstd-any
+Status: install ok installed
+Architecture: aarch64-3.10
+Installed-Time: 1795340347
+Auto-Installed: yes
+
+Package: libmnl
+Version: 1.0.5-2
+Depends: libc, libssp, librt, libpthread
+Provides: libmnl-any
+Status: install user installed
+Architecture: aarch64-3.10
+Installed-Time: 1795281619
+
+Package: libnettle
+Version: 3.10.2-1
+Depends: libc, libssp, librt, libpthread, libgmp
+Provides: libnettle-any
+Status: install ok installed
+Architecture: aarch64-3.10
+Installed-Time: 1795285880
+Auto-Installed: yes
+
+Package: bzip2
+Version: 1.0.8-2
+Depends: libc, libssp, librt, libpthread, libbz2
+Provides: bzip2-any
+Status: install ok installed
+Architecture: aarch64-3.10
+Installed-Time: 1795340346
+Auto-Installed: yes
+
+Package: adguardhome-go
+Version: v0.107.79-1
+Depends: ca-bundle
+Provides: adguardhome-go-any, adguardhome
+Status: install user installed
+Architecture: aarch64-3.10
+Conffiles:
+ /opt/etc/AdGuardHome/adguardhome.conf 43e92d02f8274a52c220a15a59df3c875e2f85518d9ce17010c832056cfb409c
+Installed-Time: 1795284512
+
+Package: tar
+Version: 1.35-2
+Depends: libc, libssp, librt, libpthread, bzip2, libacl, libattr, libzstd, xz
+Provides: tar-any
+Status: install user installed
+Architecture: aarch64-3.10
+Installed-Time: 1795340348
+Alternatives: 300:/opt/bin/tar:/opt/libexec/tar-gnu
+
+Package: lighttpd
+Version: 1.4.85-1
+Depends: libc, libssp, librt, libpthread, libpthread, libpcre2, libnettle
+Provides: lighttpd-any
+Status: install user installed
+Architecture: aarch64-3.10
+Conffiles:
+ /opt/etc/lighttpd/lighttpd.conf a445465f0e6193ca32af65c9b9939ae05323bf6d2e1a23e6b73c451ec5962308
+Installed-Time: 1795285880
+
+Package: unzip
+Version: 6.0-9
+Depends: libc, libssp, librt, libpthread
+Provides: unzip-any
+Status: install user installed
+Architecture: aarch64-3.10
+Installed-Time: 1795281627
+Alternatives: 300:/opt/bin/unzip:/opt/libexec/unzip
+
+Package: dropbear
+Version: 2026.94-4
+Depends: libc, libssp, librt, libpthread
+Provides: dropbear-any
+Status: install user installed
+Architecture: aarch64-3.10
+Conffiles:
+ /opt/etc/config/dropbear.conf a57675b9ed8482faa5732af7ba770945a39bdad3dc42888c1b2e6fcf6123c117
+Installed-Time: 1795280728
+Alternatives: 100:/opt/bin/ssh-keygen:/opt/sbin/dropbear, 100:/opt/bin/scp:/opt/sbin/dropbear, 100:/opt/bin/ssh:/opt/sbin/dropbear
+
+Package: flock
+Version: 2.42.2-1
+Depends: libc, libssp, librt, libpthread, librt
+Provides: flock-any
+Status: install user installed
+Architecture: aarch64-3.10
+Installed-Time: 1795281625
+Alternatives: 200:/opt/bin/flock:/opt/bin/util-linux-flock
+
+Package: tailscale
+Version: 1.104.4-1
+Depends: ca-bundle, coreutils-nohup
+Provides: tailscale-any
+Status: install user installed
+Architecture: aarch64-3.10
+Installed-Time: 1795286133
+
+Package: libpcre2
+Version: 10.49-2
+Depends: libc, libssp, librt, libpthread
+Provides: libpcre2-any
+Status: install ok installed
+Architecture: aarch64-3.10
+Installed-Time: 1795280712
+Auto-Installed: yes
+
+Package: curl
+Version: 8.23.0-1
+Depends: libc, libssp, librt, libpthread, libcurl
+Provides: curl-any
+Status: install user installed
+Architecture: aarch64-3.10
+Installed-Time: 1795280774
+
+Package: kmod_ndms
+Version: 30-1
+Depends: libc, libssp, librt, libpthread, libusb-compat
+Provides: kmod_ndms-any
+Conflicts: kmod
+Status: install user installed
+Architecture: aarch64-3.10_kn
+Installed-Time: 1795281663
+Alternatives: 200:/opt/sbin/depmod:/opt/sbin/kmod_ndms, 200:/opt/sbin/insmod:/opt/sbin/kmod_ndms, 200:/opt/sbin/lsmod:/opt/sbin/kmod_ndms, 200:/opt/sbin/modinfo:/opt/sbin/kmod_ndms, 200:/opt/sbin/modprobe:/opt/sbin/kmod_ndms, 200:/opt/sbin/rmmod:/opt/sbin/kmod_ndms
+
+Package: zoneinfo-core
+Version: 2026e-1
+Depends: libc, libssp, librt, libpthread
+Provides: zoneinfo-core-any
+Status: install ok installed
+Architecture: aarch64-3.10
+Installed-Time: 1795280721
+Auto-Installed: yes
+
+Package: libstdcpp
+Version: 8.4.0-12
+Provides: libstdcpp-any
+Status: install ok installed
+Architecture: aarch64-3.10
+Installed-Time: 1795280726
+Auto-Installed: yes
+
+Package: coreutils-sort
+Version: 9.11-1
+Depends: libc, libssp, librt, libpthread, coreutils, libpthread
+Provides: coreutils-sort-any
+Status: install user installed
+Architecture: aarch64-3.10
+Installed-Time: 1795281478
+Alternatives: 300:/opt/bin/sort:/opt/libexec/sort-coreutils
+
+Package: libgcc
+Version: 8.4.0-12
+Provides: libgcc-any
+Status: install user installed
+Architecture: aarch64-3.10
+Installed-Time: 1795280700
+
+Package: ipset
+Version: 7.24-1
+Depends: libc, libssp, librt, libpthread, libmnl, libipset
+Provides: ipset-any
+Status: install user installed
+Architecture: aarch64-3.10
+Installed-Time: 1795281696
+
+Package: xz
+Version: 5.8.4-2
+Depends: libc, libssp, librt, libpthread, xz-utils, liblzma
+Provides: xz-any
+Status: install ok installed
+Architecture: aarch64-3.10
+Installed-Time: 1795340348
+Auto-Installed: yes
+Alternatives: 300:/opt/bin/xz:/opt/libexec/xz-lzmautils, 300:/opt/bin/lzcat:/opt/libexec/xz-lzmautils, 300:/opt/bin/lzma:/opt/libexec/xz-lzmautils, 300:/opt/bin/unlzma:/opt/libexec/xz-lzmautils, 300:/opt/bin/unxz:/opt/libexec/xz-lzmautils, 300:/opt/bin/xzcat:/opt/libexec/xz-lzmautils
+
+Package: libusb-1.0
+Version: 1.0.29-2
+Depends: libc, libssp, librt, libpthread, libpthread, librt
+Provides: libusb-1.0-any
+Status: install ok installed
+Architecture: aarch64-3.10
+Installed-Time: 1795281663
+Auto-Installed: yes
+
+Package: opt-ndmsv2
+Version: 1.0-17
+Depends: libc, libssp, librt, libpthread, libgcc, libstdcpp, ldconfig, findutils, terminfo, opkg, entware-release, locales, zoneinfo-asia, zoneinfo-europe
+Provides: opt-ndmsv2-any
+Status: install user installed
+Essential: yes
+Architecture: aarch64-3.10_kn
+Conffiles:
+ /opt/etc/group b71abe3c768d53dcb6109d125c1c44d3b705217bcda665c797f773502f6c5e6d
+ /opt/etc/passwd 51f28bc4f23398131fac87e065825e7349621ea1b5d3f141bb1570b28e0f250b
+ /opt/etc/profile d9c6b7905a632e3e891049188760771e32754f416a515903ed7fb0b1bdaccbc8
+ /opt/etc/shells 7df7c50fd241dfc02eb241f1329af355af4209bcbe13c5fa754a2c2cfa653b64
+ /opt/root/.profile fc11c5f49d35d8db8528872b7d24b258ab87e9e3c1d2832ee6410a7c727edd11
+Installed-Time: 1795280726
+
+Package: librt
+Version: 2.27-12
+Depends: libpthread
+Provides: librt-any
+Status: install user installed
+Architecture: aarch64-3.10
+Installed-Time: 1795280706
+
+Package: poorbox
+Version: 1.38.0-1
+Provides: poorbox-any
+Status: install user installed
+Architecture: aarch64-3.10_kn
+Installed-Time: 1795280730
+
+Package: entware-release
+Version: 2026.11-1
+Depends: libc, libssp, librt, libpthread
+Provides: entware-release-any
+Status: install user installed
+Architecture: all
+Installed-Time: 1795280708
+
+Package: iptables
+Version: 1.4.21-6
+Depends: libc, libssp, librt, libpthread
+Provides: iptables-any
+Status: install user installed
+Architecture: aarch64-3.10_kn
+Installed-Time: 1795281629
+Alternatives: 200:/opt/bin/iptables-xml:/opt/sbin/xtables-multi, 200:/opt/sbin/iptables:/opt/sbin/xtables-multi, 200:/opt/sbin/iptables-restore:/opt/sbin/xtables-multi, 200:/opt/sbin/iptables-save:/opt/sbin/xtables-multi, 200:/opt/sbin/ip6tables:/opt/sbin/xtables-multi, 200:/opt/sbin/ip6tables-restore:/opt/sbin/xtables-multi, 200:/opt/sbin/ip6tables-save:/opt/sbin/xtables-multi
+
+Package: ca-certificates
+Version: 20260816-2
+Depends: libc, libssp, librt, libpthread
+Provides: ca-certificates-any, ca-certs
+Status: install user installed
+Architecture: all
+Installed-Time: 1795280779
+
+Package: libopenssl-conf
+Version: 3.5.9-3
+Depends: libc, libssp, librt, libpthread, libopenssl
+Provides: libopenssl-conf-any
+Status: install ok installed
+Architecture: aarch64-3.10
+Conffiles:
+ /opt/etc/ssl/openssl.cnf d5c7a5478d777bfad36ef83ca1afcacb79b21db6dfafd8c0650aa478c48696a2
+Installed-Time: 1795281700
+Auto-Installed: yes
+
+Package: libnfnetlink
+Version: 1.0.2-1
+Depends: libc, libssp, librt, libpthread
+Provides: libnfnetlink-any
+Status: install ok installed
+Architecture: aarch64-3.10
+Installed-Time: 1795281621
+Auto-Installed: yes
+
+Package: zlib
+Version: 2.3.3-2
+Depends: libc, libssp, librt, libpthread
+Provides: zlib-any
+Status: install ok installed
+Architecture: aarch64-3.10
+Installed-Time: 1795280754
+Auto-Installed: yes
+
+Package: findutils
+Version: 4.10.0-1
+Depends: libc, libssp, librt, libpthread
+Provides: findutils-any
+Status: install user installed
+Architecture: aarch64-3.10
+Installed-Time: 1795280710
+Alternatives: 300:/opt/bin/find:/opt/libexec/find-gnu, 300:/opt/bin/xargs:/opt/libexec/xargs-gnu
+
+Package: ca-bundle
+Version: 20260816-2
+Depends: libc, libssp, librt, libpthread
+Provides: ca-bundle-any, ca-certs, ca-certificates-any
+Status: install ok installed
+Architecture: all
+Installed-Time: 1795280774
+Auto-Installed: yes
+
+Package: libssp
+Version: 8.4.0-12
+Provides: libssp-any
+Status: install ok installed
+Architecture: aarch64-3.10
+Installed-Time: 1795280708
+Auto-Installed: yes
+
+Package: libgmp
+Version: 6.3.0-2
+Depends: libc, libssp, librt, libpthread
+Provides: libgmp-any
+Status: install ok installed
+Architecture: aarch64-3.10
+Installed-Time: 1795285878
+Auto-Installed: yes
+
+Package: gzip
+Version: 1.15-1
+Depends: libc, libssp, librt, libpthread
+Provides: gzip-any
+Status: install user installed
+Architecture: aarch64-3.10
+Installed-Time: 1795281475
+Alternatives: 300:/opt/bin/gunzip:/opt/libexec/gunzip-gnu, 300:/opt/bin/gzip:/opt/libexec/gzip-gnu, 300:/opt/bin/zcat:/opt/libexec/zcat-gnu
+
+Package: libbz2
+Version: 1.0.8-2
+Depends: libc, libssp, librt, libpthread
+Provides: libbz2-any
+Status: install ok installed
+Architecture: aarch64-3.10
+Installed-Time: 1795340346
+Auto-Installed: yes
+
+Package: xz-utils
+Version: 5.8.4-2
+Depends: libc, libssp, librt, libpthread
+Provides: xz-utils-any
+Status: install ok installed
+Architecture: aarch64-3.10
+Installed-Time: 1795340347
+Auto-Installed: yes
+
+Package: libusb-compat
+Version: 0.1.8-1
+Depends: libc, libssp, librt, libpthread, libusb-1.0
+Provides: libusb-compat-any
+Status: install ok installed
+Architecture: aarch64-3.10
+Installed-Time: 1795281663
+Auto-Installed: yes
+
+Package: wget-ssl
+Version: 1.25.0-5
+Depends: libc, libssp, librt, libpthread, libpcre2, zlib, libopenssl, librt
+Provides: wget-ssl-any, wget, wget-any
+Status: install user installed
+Architecture: aarch64-3.10
+Installed-Time: 1795280780
+Alternatives: 400:/opt/bin/wget:/opt/libexec/wget-ssl
+
+Package: libipset
+Version: 7.24-1
+Depends: libc, libssp, librt, libpthread, libmnl
+Provides: libipset-any
+Status: install ok installed
+Architecture: aarch64-3.10
+Installed-Time: 1795281696
+Auto-Installed: yes
+
+Package: libattr
+Version: 2.6.0-1
+Depends: libc, libssp, librt, libpthread
+Provides: libattr-any
+Status: install ok installed
+Architecture: aarch64-3.10
+Installed-Time: 1795340346
+Auto-Installed: yes
+
+Package: libopenssl
+Version: 3.5.9-3
+Depends: libc, libssp, librt, libpthread, zlib
+Provides: libopenssl-any
+Status: install ok installed
+Architecture: aarch64-3.10
+Installed-Time: 1795280773
+Auto-Installed: yes
+
+Package: coreutils-nohup
+Version: 9.11-1
+Depends: libc, libssp, librt, libpthread, coreutils
+Provides: coreutils-nohup-any
+Status: install ok installed
+Architecture: aarch64-3.10
+Installed-Time: 1795286127
+Auto-Installed: yes
+Alternatives: 300:/opt/bin/nohup:/opt/libexec/nohup-coreutils
+

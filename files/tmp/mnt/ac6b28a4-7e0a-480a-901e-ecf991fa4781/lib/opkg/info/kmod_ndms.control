@@ -1,0 +1,16 @@
+Package: kmod_ndms
+Version: 30-1
+Depends: libc, libssp, librt, libpthread, libusb-compat
+Conflicts: kmod
+Provides: kmod_ndms-any
+Alternatives: 200:/opt/sbin/depmod:/opt/sbin/kmod_ndms, 200:/opt/sbin/insmod:/opt/sbin/kmod_ndms, 200:/opt/sbin/lsmod:/opt/sbin/kmod_ndms, 200:/opt/sbin/modinfo:/opt/sbin/kmod_ndms, 200:/opt/sbin/modprobe:/opt/sbin/kmod_ndms, 200:/opt/sbin/rmmod:/opt/sbin/kmod_ndms
+Source: feeds/dvb/kmod_ndms
+SourceName: kmod_ndms
+Section: utils
+SourceDateEpoch: 1656602404
+URL: https://www.kernel.org/pub/linux/utils/kernel/kmod/
+Architecture: aarch64-3.10_kn
+Installed-Size: 829440
+Description:  Linux kernel module handling.
+ kmod is a set of tools to handle common tasks with Linux kernel modules like
+ insert, remove, list, check properties, resolve dependencies and aliases.

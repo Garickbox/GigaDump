@@ -1,0 +1,5 @@
+/opt/etc/crontab
+/opt/bin/crontab-vixie
+/opt/sbin/cron
+/opt/bin/run-parts-vixie
+/opt/etc/init.d/S10cron

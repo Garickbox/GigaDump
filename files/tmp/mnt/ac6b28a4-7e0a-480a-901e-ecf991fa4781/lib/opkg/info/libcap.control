@@ -1,0 +1,16 @@
+Package: libcap
+Version: 2.69-1
+Depends: libc, libssp, librt, libpthread
+Provides: libcap-any
+Source: feeds/base/libs/libcap
+SourceName: libcap
+License: GPL-2.0-only
+LicenseFiles: License
+Section: libs
+SourceDateEpoch: 1683989073
+URL: https://www.kernel.org/pub/linux/libs/security/linux-privs/libcap2/
+CPE-ID: cpe:/a:libcap_project:libcap
+Maintainer: Paul Wassi <p.wassi@gmx.at>
+Architecture: aarch64-3.10
+Installed-Size: 51200
+Description:  Linux capabilities library library
